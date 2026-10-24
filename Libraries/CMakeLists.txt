@@ -41,6 +41,8 @@ if (ENABLE_GUI_TARGETS)
     add_subdirectory(LibCompositing)
     add_subdirectory(LibWeb)
     add_subdirectory(LibWebView)
+    # The C ABI a non-C++ UI links against (see Libraries/LibPort/ladybird_port.h).
+    add_subdirectory(LibPort)
 endif()
 
 # FIXME: Increase support for building targets on Windows
