@@ -44,12 +44,17 @@ public:
     {
     }
 
-    virtual void create_platform_options(WebView::BrowserOptions& browser_options, WebView::RequestServerOptions&, WebView::WebContentOptions& web_content_options) override
+    virtual void create_platform_options(WebView::BrowserOptions& browser_options, WebView::RequestServerOptions&, WebView::WebContentOptions&) override
     {
         // The host owns the event loop and the window, so the engine must not run headless or coordinate a browser.
         browser_options.headless_mode.clear();
         browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
-        web_content_options.is_test_mode = WebView::IsTestMode::Yes;
+
+        // NOT test mode, which the probes use. Test mode is a layout-test switch, not a sandbox: it makes
+        // FontPlugin::generic_font_name() return "SerenitySans" for every generic family, skipping font matching
+        // entirely, so every page renders in the bundled fallback. That is correct for a probe that must produce
+        // identical pixels everywhere and wrong for a browser — it was the reason this app ignored system fonts.
+        // Left at the default (No).
     }
 
     virtual bool should_coordinate_browser_process() const override { return false; }
