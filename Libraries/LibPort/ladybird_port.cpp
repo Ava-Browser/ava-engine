@@ -27,6 +27,7 @@
 #include <LibWebCommon/UIEvents/MouseButton.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/HeadlessWebView.h>
+#include <LibWebView/Menu.h>
 #include <LibWebView/Utilities.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -372,6 +373,29 @@ void LbTabSetViewport(LbApp* app, uint64_t tab, int32_t width, int32_t height, d
         });
         return;
     }
+}
+
+void LbTabTraverseHistory(LbApp* app, uint64_t tab_id, int32_t delta)
+{
+    auto* tab = find_tab(app, tab_id);
+    if (!tab)
+        return;
+
+    // The ABI is the two buttons a browser has, so anything else is one of them rather than an arbitrary jump.
+    auto direction = delta < 0 ? -1 : 1;
+    tab->view->traverse_the_history_by_delta(direction);
+}
+
+int LbTabCanTraverseHistory(LbApp* app, uint64_t tab_id, int32_t delta)
+{
+    auto* tab = find_tab(app, tab_id);
+    if (!tab)
+        return 0;
+
+    // The engine's actions already encode whether there is anywhere to go, and LibWebView keeps them current as
+    // navigation happens. Deriving this from history step counts instead would duplicate a rule that can drift.
+    auto& action = delta < 0 ? tab->view->navigate_back_action() : tab->view->navigate_forward_action();
+    return action.enabled() ? 1 : 0;
 }
 
 void LbTabSendMouse(LbApp* app, uint64_t tab_id, LbMouseEventType type, double x, double y, LbMouseButton button, LbMouseButton buttons, int32_t click_count, double wheel_delta_y)

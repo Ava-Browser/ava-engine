@@ -84,6 +84,22 @@ int LbTabGetSurface(LbApp* app, uint64_t tab, LbSurface* out);
 void LbTabSetViewport(LbApp* app, uint64_t tab, int32_t width, int32_t height, double device_pixel_ratio);
 
 //
+// Session history.
+//
+// `delta` is -1 for back and +1 for forward. Any other value is clamped to those two: the ABI exposes the two buttons a
+// browser has, not the engine's arbitrary-step traversal, so a host cannot ask for a jump it has no UI for.
+//
+// Both are safe on a closed tab (they no-op) and safe to call before the first navigation.
+void LbTabTraverseHistory(LbApp* app, uint64_t tab, int32_t delta);
+
+// Whether `LbTabTraverseHistory` would do anything right now: 1 if yes, 0 if no. Use it to enable or disable the button.
+//
+// This reads the engine's own `navigate_back_action` / `navigate_forward_action`, which LibWebView maintains, rather
+// than deriving "is there anything behind us" from step counters. Reimplementing that rule in a host is exactly the
+// kind of logic that silently drifts from the engine on an upstream change.
+int LbTabCanTraverseHistory(LbApp* app, uint64_t tab, int32_t delta);
+
+//
 // Input.
 //
 // Positions are in CSS pixels relative to the tab's top-left, which is the same space as the viewport. The shim scales
