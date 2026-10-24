@@ -289,6 +289,20 @@ uint64_t LbTabCreate(LbApp* app)
     return id;
 }
 
+void LbTabDestroy(LbApp* app, uint64_t tab)
+{
+    if (!app)
+        return;
+    // Unlinking from the vector is what stops callbacks and lookups from finding it; the tab's own view is destroyed by
+    // the OwnPtr going away, before the application that owns its WebContent client does.
+    for (auto& candidate : app->tabs) {
+        if (candidate->id != tab)
+            continue;
+        app->tabs.remove_first_matching([&](auto const& entry) { return entry.ptr() == candidate.ptr(); });
+        return;
+    }
+}
+
 void LbTabLoad(LbApp* app, uint64_t tab, char const* url, size_t len)
 {
     if (!app || !url)

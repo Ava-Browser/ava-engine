@@ -69,6 +69,12 @@ void LbAppStopPump(LbApp* app);
 void LbAppDestroy(LbApp* app);
 
 uint64_t LbTabCreate(LbApp* app);
+
+// Destroys one tab and its engine page. The host must stop asking for its surface first: a get-surface after this
+// returns 0 rather than a stale frame, but presenting a frame that arrived before the call would be a use-after-free.
+// Every other tab is unaffected, and the app outlives all of them.
+void LbTabDestroy(LbApp* app, uint64_t tab);
+
 void LbTabLoad(LbApp* app, uint64_t tab, const char* url, size_t len);
 
 // Fills `out` with the tab's current frame. Returns 1 if a frame was written, 0 if the tab has none yet.
