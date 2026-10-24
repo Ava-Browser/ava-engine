@@ -155,7 +155,9 @@ if (NOT WIN32)
 
     add_executable(TestNativeInput TestNativeInput.cpp)
     add_dependencies(TestNativeInput ladybird_build_resource_files ${ladybird_helper_processes})
-    target_link_libraries(TestNativeInput PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
+    # LibPort is linked so the probe exercises the shipped shim rather than a reimplementation of it -- the whole point
+    # of asserting the ABI's behaviour here is that it is the same code the host calls.
+    target_link_libraries(TestNativeInput PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView LibPort)
     if (APPLE)
         target_compile_definitions(TestNativeInput PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()

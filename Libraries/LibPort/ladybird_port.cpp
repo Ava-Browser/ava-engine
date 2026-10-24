@@ -28,6 +28,9 @@
 #include <LibWebView/Application.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Menu.h>
+#include <LibWebView/SearchEngine.h>
+#include <LibWebView/Settings.h>
+#include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -419,6 +422,46 @@ void LbTabLoad(LbApp* app, uint64_t tab, char const* url, size_t len)
         candidate->view->load(parsed.release_value());
         return;
     }
+}
+
+int LbResolveUserInput(char const* utf8, size_t len, char** out_url, size_t* out_len)
+{
+    if (!utf8 || !out_url || !out_len)
+        return 0;
+    *out_url = nullptr;
+    *out_len = 0;
+
+    // The settings engine is only populated from Settings.json, which this host has no UI to write, and which a fresh
+    // profile does not contain at all -- so a new user would type a search and get nothing. Falling back to the first
+    // builtin keeps search working out of the box; once a settings UI exists, the configured engine wins and this
+    // branch stops being taken.
+    auto search_engine = WebView::Application::settings().search_engine_settings().engine;
+    if (!search_engine.has_value()) {
+        if (auto builtins = WebView::builtin_search_engines(); !builtins.is_empty())
+            search_engine = builtins[0];
+    }
+
+    auto url = WebView::sanitize_url(StringView { utf8, len }, search_engine);
+    if (!url.has_value())
+        return 0;
+
+    auto serialized = url->serialize();
+    auto bytes = serialized.bytes();
+    // malloc, not the engine's allocator: the host is a different toolchain and frees with LbStringFree, which must not
+    // reach into an allocator it does not share.
+    auto* buffer = static_cast<char*>(malloc(bytes.size()));
+    if (!buffer)
+        return 0;
+    memcpy(buffer, bytes.data(), bytes.size());
+
+    *out_url = buffer;
+    *out_len = bytes.size();
+    return 1;
+}
+
+void LbStringFree(char* string)
+{
+    free(string);
 }
 
 int LbTabGetSurface(LbApp* app, uint64_t tab, LbSurface* out)

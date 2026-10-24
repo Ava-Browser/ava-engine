@@ -104,6 +104,21 @@ void LbTabDestroy(LbApp* app, uint64_t tab);
 
 void LbTabLoad(LbApp* app, uint64_t tab, const char* url, size_t len);
 
+// What the address bar's text means, resolved by the engine rather than the host.
+//
+// A host cannot do this correctly on its own: deciding whether "ladybird" is a host or a search term needs the public
+// suffix list and the user's configured search engine, and a second implementation would drift from the browser's real
+// behaviour on the next upstream sync. This is WebView::sanitize_url -- the same call the Qt frontend makes -- so both
+// frontends agree on what a given input navigates to.
+//
+// Returns 1 and fills the out parameters with an allocated UTF-8 URL on success, 0 if the input could be resolved
+// neither as a URL nor as a search. The caller owns the buffer and must release it with LbStringFree. An empty search
+// engine means a bare word that is not a URL returns 0, which is how a host detects "no engine configured".
+int LbResolveUserInput(const char* utf8, size_t len, char** out_url, size_t* out_len);
+
+// Releases a buffer returned by LbResolveUserInput. Null-safe, and does nothing for a null pointer.
+void LbStringFree(char* string);
+
 // Fills `out` with the tab's current frame. Returns 1 if a frame was written, 0 if the tab has none yet.
 int LbTabGetSurface(LbApp* app, uint64_t tab, LbSurface* out);
 

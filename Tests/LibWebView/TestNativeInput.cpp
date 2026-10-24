@@ -21,6 +21,8 @@
 #include <LibWebView/Application.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Utilities.h>
+
+#include "../../Libraries/LibPort/ladybird_port.h"
 #include <stdlib.h>
 
 namespace {
@@ -125,6 +127,50 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #else
     auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
 #endif
+
+    // Address-bar classification, before any page exists. This is the seam the host used to fake by prefixing
+    // "https://", so the cases that matter are the ones that prefixing got wrong: prose became a bogus host, and a
+    // bare host with a port parsed as a scheme.
+    {
+        struct Case {
+            StringView input;
+            bool expect_url;
+            StringView expect_contains;
+        };
+        // XDG_CONFIG_HOME points at a fresh temp directory, so no Settings.json exists and no search engine is
+        // configured. That is exactly the first-run state a new user is in, and the shim must still search -- the
+        // fallback to a builtin engine is what makes that true, and this is the test that pins it.
+        Case const cases[] = {
+            { "https://example.com/path?q=1"sv, true, "https://example.com/path?q=1"sv },
+            { "example.com"sv, true, "example.com"sv },
+            { "localhost:8080"sv, true, ":8080"sv },
+            // Prose must become a search URL, not a bogus host. The scheme is the assertion that matters: a query goes
+            // to the engine's search endpoint, and "https://ladybird browser/" would be a navigation to garbage.
+            { "ladybird browser"sv, true, "?q="sv },
+            { "hello world"sv, true, "hello%20world"sv },
+        };
+
+        for (auto const& test : cases) {
+            char* resolved = nullptr;
+            size_t resolved_len = 0;
+            auto ok = LbResolveUserInput(test.input.characters_without_null_termination(), test.input.length(), &resolved, &resolved_len);
+            StringView got = resolved ? StringView { resolved, resolved_len } : StringView {};
+            outln("RESOLVE: '{}' -> {}", test.input, got);
+
+            if (ok != (test.expect_url ? 1 : 0)) {
+                outln("FAIL: '{}' resolved={} expected={}", test.input, ok, test.expect_url ? 1 : 0);
+                LbStringFree(resolved);
+                return 1;
+            }
+            if (test.expect_url && !got.contains(test.expect_contains)) {
+                outln("FAIL: '{}' resolved to '{}', expected it to contain '{}'", test.input, got, test.expect_contains);
+                LbStringFree(resolved);
+                return 1;
+            }
+            LbStringFree(resolved);
+        }
+        outln("PASS: address-bar input is classified by the engine");
+    }
 
     auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv);
     auto theme = TRY(Gfx::load_system_theme(theme_path.string()));
