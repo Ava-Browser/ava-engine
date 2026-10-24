@@ -193,6 +193,10 @@ addEventListener("scroll", () => { document.title = "scrolled to " + scrollY; })
     auto scroll_y_before = evaluate("window.scrollY"sv);
     outln("SCROLLY BEFORE: {}", scroll_y_before.has_value() ? scroll_y_before->serialized() : "unreadable"_string);
 
+    // POSITIVE delta_y means "scroll the content up", i.e. later content enters the viewport from the bottom and
+    // scrollY INCREASES. This is the unit the UI must convert into: AppKit reports a scroll-down gesture as a NEGATIVE
+    // deltaY under natural scrolling (content follows the fingers), so the ship must negate it. Recorded here so the
+    // sign is ground truth from the engine, not inferred from a screenshot.
     scroll_wheel_at(*view, wheel_position, 120);
 
     // Wheel is routed through the compositor, which may scroll asynchronously and consume the event. Waiting on the
@@ -208,6 +212,26 @@ addEventListener("scroll", () => { document.title = "scrolled to " + scrollY; })
     if (!scrolled || scroll_y <= 0) {
         outln("FAIL: the wheel event did not scroll the page");
         return 1;
+    }
+
+    // State the sign explicitly: a positive wheel delta_y must increase scrollY (later content comes into view).
+    outln("SIGN: wheel delta_y=+120 -> scrollY={} (positive delta scrolls the content up, scrollY increases)", scroll_y);
+
+    // And the converse, so the conversion is pinned in both directions rather than by one sample.
+    {
+        auto before_negative = evaluate("window.scrollY"sv);
+        auto before_value = before_negative.has_value() ? before_negative->get_double_with_precision_loss().value_or(0) : 0;
+        last_title = {};
+        scroll_wheel_at(*view, wheel_position, -60);
+        auto backed = spin_until_or_timeout([&] { return last_title.starts_with("scrolled to "sv); }, AK::Duration::from_seconds(20));
+        spin_until_or_timeout([&] { return view->pending_input_event_count_for_testing() == 0; }, AK::Duration::from_seconds(20));
+        auto after_negative = evaluate("window.scrollY"sv);
+        auto after_value = after_negative.has_value() ? after_negative->get_double_with_precision_loss().value_or(0) : 0;
+        outln("SIGN: wheel delta_y=-60 -> scrollY {} -> {} (negative delta scrolls down)", before_value, after_value);
+        if (!backed || after_value >= before_value) {
+            outln("FAIL: a negative wheel delta did not decrease scrollY");
+            return 1;
+        }
     }
 
     // A link filling the viewport, so the click position need not be measured.
