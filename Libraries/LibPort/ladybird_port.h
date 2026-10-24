@@ -18,6 +18,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Reserved so a host does not have to guess: ordinal 0 in Web::UIEvents::KeyCode is the invalid key.
+#define LbKeyInvalid 0
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -73,6 +76,49 @@ int LbTabGetSurface(LbApp* app, uint64_t tab, LbSurface* out);
 
 // The viewport in CSS pixels plus the display's device pixel ratio. Call on creation and whenever the window resizes.
 void LbTabSetViewport(LbApp* app, uint64_t tab, int32_t width, int32_t height, double device_pixel_ratio);
+
+//
+// Input.
+//
+// Positions are in CSS pixels relative to the tab's top-left, which is the same space as the viewport. The shim scales
+// them by the device pixel ratio, because the engine works in device pixels.
+//
+// These deliberately mirror the small set of fields a browser actually sets, rather than exposing Web::MouseEvent. That
+// struct has designated-default fields a host would silently leave unset: `should_insert_text` is the documented one —
+// omit it and the key is delivered, handled, and inserts nothing, with no error anywhere. Filling those in is the shim's
+// job, so the host states intent ("a left click at x,y") and not transport.
+
+// Matches Web::UIEvents::MouseButton, which is a bitmask. `Primary` is the left button.
+typedef enum LbMouseButton {
+    LbMouseButtonNone = 0,
+    LbMouseButtonPrimary = 1,
+    LbMouseButtonSecondary = 2,
+    LbMouseButtonMiddle = 4,
+} LbMouseButton;
+
+typedef enum LbMouseEventType {
+    LbMouseEventDown = 0,
+    LbMouseEventUp = 1,
+    LbMouseEventMove = 2,
+    LbMouseEventWheel = 3,
+} LbMouseEventType;
+
+// `button` is the button this event concerns; `buttons` is every button held during it. A button-up carries the still-held
+// set, which is why they are separate arguments. For a wheel event the buttons are ignored and `wheel_delta_y` is the
+// pixel delta (positive scrolls down).
+void LbTabSendMouse(LbApp* app, uint64_t tab, LbMouseEventType type, double x, double y, LbMouseButton button, LbMouseButton buttons, int32_t click_count, double wheel_delta_y);
+
+// A single key transition. `key` is a Web::UIEvents::KeyCode ordinal; the host passes `LbKeyInvalid` (0) when it only has
+// text, and the shim then leaves the key unresolved. `code_point` is the character to insert (0 for a non-text key such
+// as Tab or an arrow). `modifiers` is the Web::UIEvents::KeyModifier bitmask.
+//
+// Note the engine dispatches keys asynchronously, through the compositor. Returning from this function means the event was
+// queued, NOT that the page handled it; there is no completion callback yet (see Documentation/Traps.md).
+void LbTabSendKey(LbApp* app, uint64_t tab, int32_t key, uint32_t code_point, uint32_t modifiers, int is_key_down);
+
+// Convenience for the common case: types `utf8` as text, one key transition pair per code point. This is what an address
+// bar or a `<input>` needs; use LbTabSendKey directly for keys that are not text.
+void LbTabTypeText(LbApp* app, uint64_t tab, const char* utf8, size_t len);
 
 #ifdef __cplusplus
 }

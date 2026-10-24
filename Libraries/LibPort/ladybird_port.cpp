@@ -12,6 +12,7 @@
 #include <AK/LexicalPath.h>
 #include <AK/ScopeGuard.h>
 #include <AK/String.h>
+#include <AK/Utf8View.h>
 #include <LibCore/Directory.h>
 #include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
@@ -21,6 +22,9 @@
 #include <LibGfx/SystemTheme.h>
 #include <LibMain/Main.h>
 #include <LibURL/Parser.h>
+#include <LibWebCommon/Page/InputEvent.h>
+#include <LibWebCommon/UIEvents/KeyCode.h>
+#include <LibWebCommon/UIEvents/MouseButton.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Utilities.h>
@@ -99,6 +103,11 @@ struct Tab {
 
     uint64_t id { 0 };
     NonnullOwnPtr<PortWebView> view;
+
+    // The engine's input positions are in device pixels and the host speaks CSS pixels, so the ratio has to be kept
+    // alongside the tab. LbTabSetViewport is the only thing that sets it.
+    double device_pixel_ratio { 1.0 };
+    int32_t click_count { 0 };
 };
 
 }
@@ -137,6 +146,22 @@ void dispatch_url(LbApp& app, uint64_t tab, auto const& url, void (*callback)(vo
     // it has to be narrowed before it can cross a char* boundary.
     auto serialized = url.serialize().to_byte_string();
     callback(app.callbacks.context, tab, serialized.characters(), serialized.length());
+}
+
+}
+
+namespace {
+
+// Shared lookup: every input entry point needs the same tab, and every one of them must tolerate a stale id.
+Tab* find_tab(LbApp* app, uint64_t tab)
+{
+    if (!app)
+        return nullptr;
+    for (auto const& candidate : app->tabs) {
+        if (candidate->id == tab)
+            return candidate.ptr();
+    }
+    return nullptr;
 }
 
 }
@@ -318,6 +343,8 @@ void LbTabSetViewport(LbApp* app, uint64_t tab, int32_t width, int32_t height, d
         // The ratio has to be in place before the resize, because the resize is what pushes the viewport. This is the
         // only public way to set it without touching Libraries/; a real port wants a non-testing setter here.
         candidate->view->set_device_pixel_ratio_for_testing(candidate->view->page(), device_pixel_ratio);
+        // Kept for input: positions arrive in CSS pixels and the engine wants device pixels.
+        candidate->device_pixel_ratio = device_pixel_ratio;
 
         // A headless viewport is in device pixels, the same way Qt's update_viewport_size() scales by the ratio.
         candidate->view->reset_viewport_size({
@@ -325,6 +352,104 @@ void LbTabSetViewport(LbApp* app, uint64_t tab, int32_t width, int32_t height, d
             static_cast<double>(height) * device_pixel_ratio,
         });
         return;
+    }
+}
+
+void LbTabSendMouse(LbApp* app, uint64_t tab_id, LbMouseEventType type, double x, double y, LbMouseButton button, LbMouseButton buttons, int32_t click_count, double wheel_delta_y)
+{
+    auto* tab = find_tab(app, tab_id);
+    if (!tab)
+        return;
+
+    // CSS pixels in, device pixels out: the same conversion LbTabSetViewport applies to the viewport, so a click lands
+    // where the user sees the cursor regardless of the display's scale.
+    auto const ratio = tab->device_pixel_ratio;
+    Web::DevicePixelPoint position {
+        static_cast<double>(x) * ratio,
+        static_cast<double>(y) * ratio,
+    };
+
+    Web::MouseEvent event {
+        .type = [&] {
+            switch (type) {
+            case LbMouseEventDown:
+                return Web::MouseEvent::Type::MouseDown;
+            case LbMouseEventUp:
+                return Web::MouseEvent::Type::MouseUp;
+            case LbMouseEventMove:
+                return Web::MouseEvent::Type::MouseMove;
+            case LbMouseEventWheel:
+                return Web::MouseEvent::Type::MouseWheel;
+            }
+            return Web::MouseEvent::Type::MouseMove;
+        }(),
+        .position = position,
+        // The engine uses this only for synthesizing events it delivers itself, so mirroring position is correct here.
+        .screen_position = position,
+        .button = static_cast<Web::UIEvents::MouseButton>(button),
+        .buttons = static_cast<Web::UIEvents::MouseButton>(buttons),
+        .wheel_delta_y = wheel_delta_y,
+        .browser_data = nullptr,
+    };
+
+    if (type == LbMouseEventWheel) {
+        // There is no WheelEvent: a wheel is a MouseEvent, and the tick fields are derived exactly the way the platform
+        // backends derive them. Leaving them zero makes the compositor treat the scroll as something other than precise.
+        event.wheel_tick_120ths_y = Web::wheel_tick_120ths_from_pixel_delta(wheel_delta_y, Web::WheelDeltaPrecision::Precise);
+        event.wheel_delta_precision = Web::WheelDeltaPrecision::Precise;
+    } else {
+        event.click_count = click_count;
+        // A down/up pair with no movement is what the engine reads as a click; the second click of a double-click
+        // reuses click_count = 2, which the host counts because the engine does not.
+        if (type == LbMouseEventDown)
+            tab->click_count = click_count;
+    }
+
+    tab->view->enqueue_input_event(move(event));
+}
+
+void LbTabSendKey(LbApp* app, uint64_t tab_id, int32_t key, uint32_t code_point, uint32_t modifiers, int is_key_down)
+{
+    auto* tab = find_tab(app, tab_id);
+    if (!tab)
+        return;
+
+    auto type = is_key_down ? Web::KeyEvent::Type::KeyDown : Web::KeyEvent::Type::KeyUp;
+    Web::KeyEvent event {
+        .type = type,
+        .key = static_cast<Web::UIEvents::KeyCode>(key),
+        .modifiers = static_cast<Web::UIEvents::KeyModifier>(modifiers),
+        .code_point = code_point,
+        .repeat = false,
+        // The one field a host would never set by accident and cannot omit without a silent no-op: without it the key is
+        // delivered, handled, and inserts nothing. Text goes in on keydown, never on keyup.
+        .should_insert_text = is_key_down && code_point != 0,
+        .browser_data = nullptr,
+    };
+
+    tab->view->enqueue_input_event(move(event));
+}
+
+void LbTabTypeText(LbApp* app, uint64_t tab_id, char const* utf8, size_t len)
+{
+    auto* tab = find_tab(app, tab_id);
+    if (!tab || !utf8)
+        return;
+
+    // Decode UTF-8 to code points here rather than in the host: the ABI is C, and a Swift caller passing a Swift String
+    // is handing over exactly these bytes anyway.
+    auto view = Utf8View { StringView { utf8, len } };
+    for (auto cp : view) {
+        Web::KeyEvent event {
+            .type = Web::KeyEvent::Type::KeyDown,
+            .key = Web::UIEvents::KeyCode::Key_Invalid,
+            .modifiers = Web::UIEvents::KeyModifier::Mod_None,
+            .code_point = cp,
+            .repeat = false,
+            .should_insert_text = true,
+            .browser_data = nullptr,
+        };
+        tab->view->enqueue_input_event(move(event));
     }
 }
 
