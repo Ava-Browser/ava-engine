@@ -80,6 +80,25 @@ void click_at(WebView::ViewImplementation& view, Web::DevicePixelPoint position)
     });
 }
 
+// A text field is the only way to observe this: the engine reports no callback for "a character was inserted", so the
+// assertion has to read page state, exactly like the wheel case.
+void press_key(WebView::ViewImplementation& view, Web::UIEvents::KeyCode key, u32 code_point, Web::UIEvents::KeyModifier modifiers = Web::UIEvents::Mod_None)
+{
+    // `should_insert_text` is what actually inserts the character. Without it the event is delivered, the key is
+    // handled, and nothing appears: a silent no-op. Platforms set it to "KeyDown and we have text".
+    for (auto type : { Web::KeyEvent::Type::KeyDown, Web::KeyEvent::Type::KeyUp }) {
+        view.enqueue_input_event(Web::KeyEvent {
+            .type = type,
+            .key = key,
+            .modifiers = modifiers,
+            .code_point = code_point,
+            .repeat = false,
+            .should_insert_text = type == Web::KeyEvent::Type::KeyDown,
+            .browser_data = nullptr,
+        });
+    }
+}
+
 // A blocked spin would hang the probe, so every wait is bounded.
 bool spin_until_or_timeout(Function<bool()> condition, AK::Duration timeout)
 {
@@ -112,6 +131,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto view = WebView::HeadlessWebView::create(theme, { 1200, 800 });
 
     size_t loads_finished = 0;
+    size_t paints_since_keyboard_page = 0;
     Optional<URL::URL> last_loaded_url;
     Utf16String last_title;
 
@@ -121,6 +141,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         last_loaded_url = url;
     };
     view->on_title_change = [&](auto const& title) { last_title = title; };
+    // A paint is what builds an <input>'s shadow tree, so the keyboard phase has to wait for one.
+    view->on_ready_to_paint = [&] { ++paints_since_keyboard_page; };
 
     // Reads a value out of the page. The alert round-trip is the pattern TestCrashOverlay uses.
     auto evaluate = [&](StringView source) -> Optional<JsonValue> {
@@ -213,5 +235,75 @@ addEventListener("scroll", () => { document.title = "scrolled to " + scrollY; })
     }
 
     outln("PASS: wheel scrolls the page and a click on a link navigates");
+
+    // -----------------------------------------------------------------------------------------
+    // Keyboard. The last engine input path that had never crossed this boundary.
+    //
+    // A text field is the observable: the engine reports no callback for "a character was inserted", so page state is
+    // the only witness. Same lesson as wheel, which the compositor consumes without telling WebContent.
+    // -----------------------------------------------------------------------------------------
+    outln("");
+    outln("PHASE 2: typing into a text field");
+
+    auto loads_before_keyboard = loads_finished;
+    paints_since_keyboard_page = 0;
+    view->load(URL::Parser::basic_parse("data:text/html,%3Cbody%20style%3D%27margin%3A0%27%3E%3Cinput%20id%3Df%20style%3D%27width%3A300px%3Bheight%3A30px%27%3E%3Cscript%3Ewindow.log%3D%5B%5D%3BaddEventListener%28%27keydown%27%2Cfunction%28e%29%7Bwindow.log.push%28%27down%3A%27%2Be.key%29%7D%29%3BaddEventListener%28%27beforeinput%27%2Cfunction%28e%29%7Bwindow.log.push%28%27beforeinput%3A%27%2Be.data%29%7D%29%3C%2Fscript%3E"sv).release_value());
+
+    if (!spin_until_or_timeout([&] { return loads_finished > loads_before_keyboard; }, AK::Duration::from_seconds(30))) {
+        outln("FAIL: the text-field page never finished loading");
+        return 1;
+    }
+
+    // The page MUST be painted before typing can be observed. An <input>'s text node lives in its shadow tree, which
+    // is built during layout; an unpainted view never generates a box, so `handle_insert` returns at its first guard
+    // (`!text_node`) and the character is silently dropped. The keystrokes still reach the DOM - keydown, keypress and
+    // beforeinput all fire - which makes this look like an engine bug when it is a missing paint. Wait for a frame.
+    if (!spin_until_or_timeout([&] { return paints_since_keyboard_page > 0; }, AK::Duration::from_seconds(30))) {
+        outln("FAIL: the text-field page never painted, so typing cannot be observed");
+        return 1;
+    }
+    outln("PAINTED: the field has a box, so it has a text node");
+
+    // Focus through the DOM, not a click: a headless view has never had system focus, and a click that misses the
+    // input produces a diagnostic about focus instead of about keyboards.
+    click_at(*view, { 60, 12 });
+
+    auto read_value = [&]() -> String {
+        Optional<String> value;
+        view->on_request_alert = [&](Utf16String const& text) {
+            value = text.to_utf8();
+            view->alert_closed();
+        };
+        view->run_javascript("alert(document.getElementById('f').value)"_string);
+        spin_until_or_timeout([&] { return value.has_value(); }, AK::Duration::from_seconds(10));
+        view->on_request_alert = nullptr;
+        return value.value_or(""_string);
+    };
+
+    outln("VALUE BEFORE: '{}'", read_value());
+
+    // Send the keys immediately, with nothing intervening: no JS-driven focus, no value assignment. Every diagnostic
+    // step above this line was itself a JS evaluation, and a JS evaluation is a chance for the page to diverge from
+    // what the ABI path sees.
+    press_key(*view, Web::UIEvents::KeyCode::Key_H, 'h');
+    press_key(*view, Web::UIEvents::KeyCode::Key_I, 'i');
+
+    // A key event is async: UI -> Compositor -> WebContent -> page. Reading the value immediately reads before the
+    // round trip finishes, which looks exactly like "the key never arrived". Wait for the queue to drain.
+    spin_until_or_timeout([&] { return view->pending_input_event_count_for_testing() == 0; }, AK::Duration::from_seconds(10));
+    // The queue draining only means the events were sent; give the page a few turns to run its default action.
+    for (int turn = 0; turn < 20; ++turn)
+        spin_until_or_timeout([] { return false; }, AK::Duration::from_milliseconds(50));
+
+    auto typed = read_value();
+    outln("VALUE AFTER:  '{}'", typed);
+
+
+    if (typed != "hi"_string) {
+        outln("FAIL: keyboard input did not reach the page (expected 'hi', got '{}')", typed);
+        return 1;
+    }
+
+    outln("PASS: keyboard input reaches a focused text field");
     return 0;
 }
