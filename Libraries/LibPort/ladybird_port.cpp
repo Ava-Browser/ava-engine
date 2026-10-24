@@ -435,7 +435,10 @@ int LbResolveUserInput(char const* utf8, size_t len, char** out_url, size_t* out
     // profile does not contain at all -- so a new user would type a search and get nothing. Falling back to the first
     // builtin keeps search working out of the box; once a settings UI exists, the configured engine wins and this
     // branch stops being taken.
-    auto search_engine = WebView::Application::settings().search_engine_settings().engine;
+    Optional<WebView::SearchEngine> search_engine;
+    if (WebView::Application::is_initialized()) {
+        search_engine = WebView::Application::settings().search_engine_settings().engine;
+    }
     if (!search_engine.has_value()) {
         if (auto builtins = WebView::builtin_search_engines(); !builtins.is_empty())
             search_engine = builtins[0];
