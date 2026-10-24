@@ -39,6 +39,33 @@ typedef struct LbCallbacks {
 
     // A navigation in `tab` finished loading. Same `url`/`len` lifetime rules as above.
     void (*on_load_finish)(void* context, uint64_t tab, const char* url, size_t len);
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Modal dialogs. These are the only callbacks the engine BLOCKS on: the page's script stops until one is answered,
+    // and the freeze is in WebContent, so a host that renders correctly but never answers looks alive while the page is
+    // wedged. Every one of these MUST be answered, with the matching LbTabAnswer* call.
+    //
+    // All four are optional, and absent is safe: with no callback installed the engine answers itself (alert closes,
+    // confirm declines, prompt cancels, before_unload allows). The danger is present-but-silent — installing a callback
+    // and not answering it hangs the page. So a host should install all four or none.
+    //
+    // `message` is not NUL-terminated; `len` gives its length and is valid for this call only.
+    // `default_text` on the prompt is the value the field starts with, same lifetime rules.
+    // ---------------------------------------------------------------------------------------------------------------
+
+    // alert(). Answer with LbTabAnswerAlert.
+    void (*on_request_alert)(void* context, uint64_t tab, const char* message, size_t len);
+
+    // confirm(). Answer with LbTabAnswerConfirm. Declining is the safe default.
+    void (*on_request_confirm)(void* context, uint64_t tab, const char* message, size_t len);
+
+    // prompt(). Answer with LbTabAnswerPrompt.
+    void (*on_request_prompt)(void* context, uint64_t tab, const char* message, size_t len, const char* default_text, size_t default_len);
+
+    // beforeunload. Answer with LbTabAnswerBeforeUnload. NOTE THE INVERTED SENSE: `accept` of 1 means ALLOW the
+    // navigation, not block it — the opposite of what the word suggests, and the bool has already misled one careful
+    // reader. A page that returns false from its beforeunload handler should be answered 0.
+    void (*on_request_before_unload)(void* context, uint64_t tab, const char* source, size_t len);
 } LbCallbacks;
 
 // A frame that is ready to display. The handle is a borrowed IOSurfaceRef: the caller must CFRetain it to keep it
@@ -141,6 +168,21 @@ void LbTabSendKey(LbApp* app, uint64_t tab, int32_t key, uint32_t code_point, ui
 // Convenience for the common case: types `utf8` as text, one key transition pair per code point. This is what an address
 // bar or a `<input>` needs; use LbTabSendKey directly for keys that are not text.
 void LbTabTypeText(LbApp* app, uint64_t tab, const char* utf8, size_t len);
+
+// Dialogs: the answers to the four blocking callbacks above. Each MUST be called exactly once for the dialog it
+// answers, or the page stays wedged. Answering a tab that has no dialog pending is a no-op, so a host that closes a tab
+// with a dialog up can simply answer and then close.
+void LbTabAnswerAlert(LbApp* app, uint64_t tab);
+
+// `accept` of 0 declines, which is the safe default.
+void LbTabAnswerConfirm(LbApp* app, uint64_t tab, int accept);
+
+// `response` of NULL is Cancel (equivalent to dismissing the prompt). An empty string is "accepted with no text", which
+// is a different outcome, so the two are kept distinct rather than folded together.
+void LbTabAnswerPrompt(LbApp* app, uint64_t tab, const char* response, size_t len);
+
+// `accept` of 1 ALLOWS the navigation. See the inverted-sense note on on_request_before_unload.
+void LbTabAnswerBeforeUnload(LbApp* app, uint64_t tab, int accept);
 
 #ifdef __cplusplus
 }

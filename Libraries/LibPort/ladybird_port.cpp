@@ -114,6 +114,11 @@ struct Tab {
     // alongside the tab. LbTabSetViewport is the only thing that sets it.
     double device_pixel_ratio { 1.0 };
     int32_t click_count { 0 };
+
+    // before_unload is the one dialog the engine answers through a closure it hands us, not through a ViewImplementation
+    // method, so the completion has to be stored until the host replies. Every other dialog is answered by calling into
+    // the view, which keeps its own pending state.
+    Function<void(bool)> pending_before_unload;
 };
 
 }
@@ -136,6 +141,16 @@ void set_up_isolation(ByteString& scratch_directory)
     scratch_directory = ByteString::formatted("{}/Ladybird-Port-{}", Core::StandardPaths::tempfile_directory(), getpid());
     MUST(Core::Directory::create(scratch_directory, Core::Directory::CreateDirectories::Yes));
     VERIFY(setenv("XDG_CONFIG_HOME", scratch_directory.characters(), 1) == 0);
+}
+
+// Utf16String -> the ABI's char*/len. Narrowed here because the header speaks bytes and the engine speaks UTF-16;
+// `to_byte_string()` is the only correct narrowing and getting it wrong compiles either way (see Traps.md).
+void dispatch_dialog_text(void (*callback)(void*, uint64_t, char const*, size_t), void* context, uint64_t tab, Utf16String const& text)
+{
+    if (!callback)
+        return;
+    auto narrow = text.to_byte_string();
+    callback(context, tab, narrow.characters(), narrow.length());
 }
 
 void dispatch_paint(LbApp& app, uint64_t tab)
@@ -286,8 +301,93 @@ uint64_t LbTabCreate(LbApp* app)
         dispatch_url(*app, id, url, app->callbacks.on_load_finish);
     };
 
-    app->tabs.append(adopt_own(*new Tab { id, move(view) }));
+    // The four blocking dialogs. Installed only when the host supplied the matching callback: an absent callback makes
+    // the engine auto-answer, which is safe, whereas present-but-silent hangs the page. That asymmetry is why these are
+    // guarded rather than always installed.
+    if (app->callbacks.on_request_alert) {
+        view->on_request_alert = [app, id](Utf16String const& message) {
+            dispatch_dialog_text(app->callbacks.on_request_alert, app->callbacks.context, id, message);
+        };
+    }
+    if (app->callbacks.on_request_confirm) {
+        view->on_request_confirm = [app, id](Utf16String const& message) {
+            dispatch_dialog_text(app->callbacks.on_request_confirm, app->callbacks.context, id, message);
+        };
+    }
+    if (app->callbacks.on_request_prompt) {
+        view->on_request_prompt = [app, id](Utf16String const& message, Utf16String const& default_text) {
+            if (!app->callbacks.on_request_prompt)
+                return;
+            auto narrow_message = message.to_byte_string();
+            auto narrow_default = default_text.to_byte_string();
+            app->callbacks.on_request_prompt(
+                app->callbacks.context, id,
+                narrow_message.characters(), narrow_message.length(),
+                narrow_default.characters(), narrow_default.length());
+        };
+    }
+    if (app->callbacks.on_request_before_unload) {
+        view->on_request_before_unload = [app, id](String const& source, Function<void(bool)> on_complete) {
+            // The closure is the engine's own completion; store it so LbTabAnswerBeforeUnload can invoke it. A second
+            // request replaces the first, which is what the engine does too (one pending dialog per page).
+            for (auto const& candidate : app->tabs) {
+                if (candidate->id == id) {
+                    candidate->pending_before_unload = move(on_complete);
+                    break;
+                }
+            }
+            auto narrow_source = source.to_byte_string();
+            if (app->callbacks.on_request_before_unload)
+                app->callbacks.on_request_before_unload(app->callbacks.context, id, narrow_source.characters(), narrow_source.length());
+        };
+    }
+
+    app->tabs.append(adopt_own(*new Tab { id, move(view), 1.0, 0, nullptr }));
     return id;
+}
+
+void LbTabAnswerAlert(LbApp* app, uint64_t tab)
+{
+    auto* target = find_tab(app, tab);
+    if (!target)
+        return;
+    target->view->alert_closed();
+}
+
+void LbTabAnswerConfirm(LbApp* app, uint64_t tab, int accept)
+{
+    auto* target = find_tab(app, tab);
+    if (!target)
+        return;
+    target->view->confirm_closed(accept != 0);
+}
+
+void LbTabAnswerPrompt(LbApp* app, uint64_t tab, char const* response, size_t len)
+{
+    auto* target = find_tab(app, tab);
+    if (!target)
+        return;
+    // NULL means Cancel. An empty string means "accepted with no text" — a different outcome the engine distinguishes,
+    // so it is not folded into the null case.
+    if (!response) {
+        target->view->prompt_closed(OptionalNone {});
+        return;
+    }
+    auto text = Utf16String::from_utf8(StringView { response, len });
+    target->view->prompt_closed(text);
+}
+
+void LbTabAnswerBeforeUnload(LbApp* app, uint64_t tab, int accept)
+{
+    auto* target = find_tab(app, tab);
+    if (!target)
+        return;
+    // Take the completion before invoking it: the engine may issue another request from inside the callback, and
+    // leaving a stale copy here would answer that one with this outcome.
+    auto completion = move(target->pending_before_unload);
+    target->pending_before_unload = nullptr;
+    if (completion)
+        completion(accept != 0);
 }
 
 void LbTabDestroy(LbApp* app, uint64_t tab)
