@@ -1177,16 +1177,41 @@ Web::HTML::CrossProcessId Application::allocate_ui_process_cross_process_id()
     return m_ui_process_cross_process_id_allocator.allocate();
 }
 
-NonnullRefPtr<BrowsingSession> Application::session_for_new_view(IsPrivate is_private)
+NonnullRefPtr<BrowsingSession> Application::session_for_new_view(IsPrivate is_private, Optional<ByteString> const& container_name)
 {
-    if (is_private == IsPrivate::No)
-        return *the().m_default_session;
+    if (is_private == IsPrivate::Yes) {
+        if (auto session = the().m_private_session.strong_ref())
+            return *session;
 
-    if (auto session = the().m_private_session.strong_ref())
-        return *session;
+        auto session = BrowsingSession::create(IsPrivate::Yes);
+        the().m_private_session = session;
+        return session;
+    }
 
-    auto session = BrowsingSession::create(IsPrivate::Yes);
-    the().m_private_session = session;
+    if (container_name.has_value() && !container_name->is_empty()) {
+        auto container_session = the().get_or_create_container_session(*container_name);
+        if (!container_session.is_error())
+            return container_session.release_value();
+        warnln("Failed to create container session for '{}': {}, falling back to default session", *container_name, container_session.error());
+    }
+
+    return *the().m_default_session;
+}
+
+ErrorOr<NonnullRefPtr<BrowsingSession>> Application::get_or_create_container_session(ByteString const& name)
+{
+    if (auto existing = m_container_sessions.get(name); existing.has_value())
+        return *existing.value();
+
+    auto database_path = profile().paths().data;
+    auto db_name = ByteString::formatted("Container_{}", name);
+    auto database = TRY(Database::Database::create(database_path, db_name));
+
+    TRY(CookieJar::migrate_schema(database));
+    TRY(StorageJar::migrate_schema(database));
+
+    auto session = TRY(BrowsingSession::create_container(name, database));
+    m_container_sessions.set(name, session);
     return session;
 }
 

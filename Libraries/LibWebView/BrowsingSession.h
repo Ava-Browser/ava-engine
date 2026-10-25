@@ -14,6 +14,10 @@
 #include <LibWebView/Export.h>
 #include <LibWebView/Forward.h>
 
+namespace Database {
+class Database;
+}
+
 namespace WebView {
 
 enum class IsPrivate : u8 {
@@ -28,9 +32,11 @@ class WEBVIEW_API BrowsingSession
     , public Weakable<BrowsingSession> {
 public:
     static NonnullRefPtr<BrowsingSession> create(IsPrivate);
+    static ErrorOr<NonnullRefPtr<BrowsingSession>> create_container(ByteString name, Database::Database&);
     ~BrowsingSession();
 
     IsPrivate is_private() const { return m_is_private; }
+    Optional<ByteString> const& container_name() const { return m_container_name; }
 
     // NB: Null for the ordinary session until Application fills these in during startup.
     OwnPtr<CookieJar> cookie_jar;
@@ -42,9 +48,10 @@ public:
     OwnPtr<SessionStore> session_store;
 
 private:
-    explicit BrowsingSession(IsPrivate);
+    explicit BrowsingSession(IsPrivate, Optional<ByteString> container_name = {});
 
     IsPrivate m_is_private { IsPrivate::No };
+    Optional<ByteString> m_container_name;
 };
 
 }

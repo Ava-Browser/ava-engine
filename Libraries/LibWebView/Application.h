@@ -191,7 +191,8 @@ public:
 
     static BrowsingSession& default_session() { return *the().m_default_session; }
 
-    static NonnullRefPtr<BrowsingSession> session_for_new_view(IsPrivate);
+    static NonnullRefPtr<BrowsingSession> session_for_new_view(IsPrivate, Optional<ByteString> const& container_name = {});
+    ErrorOr<NonnullRefPtr<BrowsingSession>> get_or_create_container_session(ByteString const& name);
 
     static RefPtr<BrowsingSession> existing_session(IsPrivate);
 
@@ -645,6 +646,7 @@ private:
     OwnPtr<DownloadStore> m_download_store;
     RefPtr<BrowsingSession> m_default_session;
     WeakPtr<BrowsingSession> m_private_session;
+    HashMap<ByteString, NonnullRefPtr<BrowsingSession>> m_container_sessions;
     HashMap<int, WeakPtr<BrowsingSession>> m_request_server_client_sessions;
 
     // The RequestServer clients of the UI process itself, which may use the cookies of any site.

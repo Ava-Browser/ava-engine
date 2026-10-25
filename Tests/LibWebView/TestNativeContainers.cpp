@@ -128,60 +128,39 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     outln("PROBE Q(b) - Cookie isolation between simultaneous sessions: {}", isolation_passed ? "PASS" : "FAIL");
 
     // Question (c): Persistence of non-default session jars
-    outln("--- Phase 2: Persistence analysis of multiple sessions ---");
+    outln("--- Phase 2: Persistence via upstream-shaped container session API ---");
     auto database_path = app->profile().paths().data;
     outln("Default profile data path: {}", database_path);
 
-    // Attempt to create a distinct named container database and cookie jar
-    auto container_db_result = Database::Database::create(database_path, "Container_Work"sv);
-    if (container_db_result.is_error()) {
-        outln("PROBE Q(c) - Creating container database failed: {}", container_db_result.error());
-        outln("PROBE Q(c) VERDICT: RED");
-    } else {
-        auto container_db = container_db_result.release_value();
-        auto migrate_result = WebView::CookieJar::migrate_schema(container_db);
-        if (migrate_result.is_error()) {
-            outln("PROBE Q(c) - Schema migration failed: {}", migrate_result.error());
-            outln("PROBE Q(c) VERDICT: RED");
-        } else {
-            auto container_jar_result = WebView::CookieJar::create(container_db);
-            if (container_jar_result.is_error()) {
-                outln("PROBE Q(c) - Creating persisted cookie jar failed: {}", container_jar_result.error());
-                outln("PROBE Q(c) VERDICT: RED");
-            } else {
-                auto container_jar = container_jar_result.release_value();
-                HTTP::Cookie::ParsedCookie cookie_c {};
-                cookie_c.name = "work_token"_string;
-                cookie_c.value = "work_secret"_string;
-                cookie_c.domain = "example.com"_string;
-                cookie_c.path = "/"_string;
-                cookie_c.expiry_time_from_max_age_attribute = UnixDateTime::now() + AK::Duration::from_seconds(3600);
-                container_jar->set_cookie(test_url, cookie_c, HTTP::Cookie::Source::Http, {});
+    // Exercise the new Application::get_or_create_container_session API
+    auto work_session = TRY(app->get_or_create_container_session("Work"sv));
+    VERIFY(work_session->container_name().has_value() && *work_session->container_name() == "Work"sv);
+    VERIFY(work_session->cookie_jar);
+    VERIFY(work_session->storage_jar);
 
-                // Destroy the jar object so it flushes to disk upon destruction
-                {
-                    auto temp = move(container_jar);
-                    (void)temp;
-                }
+    HTTP::Cookie::ParsedCookie cookie_c {
+        .name = "work_token"_string,
+        .value = "work_secret"_string,
+        .expiry_time_from_expires_attribute = UnixDateTime::now() + AK::Duration::from_seconds(3600),
+    };
+    work_session->cookie_jar->set_cookie(test_url, cookie_c, HTTP::Cookie::Source::Http, {});
 
-                auto reopened_db = MUST(Database::Database::create(database_path, "Container_Work"sv));
-                auto reopened_jar = MUST(WebView::CookieJar::create(reopened_db));
-                auto retrieved_cookie = reopened_jar->get_cookie(test_url, HTTP::Cookie::Source::Http, {});
-                outln("Reopened container cookie: '{}'", retrieved_cookie);
+    // Ensure session retrieval is idempotent
+    auto work_session_again = TRY(app->get_or_create_container_session("Work"sv));
+    VERIFY(work_session.ptr() == work_session_again.ptr());
 
-                bool persistence_passed = retrieved_cookie.contains("work_token=work_secret"sv);
-                outln("PROBE Q(c) - Distinct database cookie survival across relaunch: {}",
-                    persistence_passed ? "PASS" : "FAIL");
+    // Flush dirty cookies to disk explicitly (simulating shutdown/timer flush)
+    // Destroying the session flushes its cookie_jar destructor
+    work_session->cookie_jar = nullptr;
 
-                // Check structural engine limitations:
-                outln("Engine Structural Analysis for Containers:");
-                outln("1. BrowsingSession::create(IsPrivate) only supports IsPrivate::No (in-memory uninitialized) or IsPrivate::Yes (in-memory transient stores).");
-                outln("2. Application::session_for_new_view(IsPrivate) only branches on is_private. It only knows m_default_session and m_private_session.");
-                outln("3. ViewImplementation::ViewImplementation(IsPrivate) only accepts IsPrivate and derives m_session from Application::session_for_new_view(is_private).");
-                outln("4. RequestServer connections are mapped by Application::did_connect_request_server_client(int, BrowsingSession&, SiteBinding).");
-            }
-        }
-    }
+    auto reopened_db = MUST(Database::Database::create(database_path, "Container_Work"sv));
+    auto reopened_jar = MUST(WebView::CookieJar::create(reopened_db));
+    auto retrieved_cookie = reopened_jar->get_cookie(test_url, HTTP::Cookie::Source::Http, {});
+    outln("Reopened container cookie via container database: '{}'", retrieved_cookie);
+
+    bool persistence_passed = retrieved_cookie.contains("work_token=work_secret"sv);
+    outln("PROBE Q(c) - Named container session persistence: {}",
+        persistence_passed ? "PASS" : "FAIL");
 
     outln("=== Milestone 5.5: Containers Probe Complete ===");
     return 0;
