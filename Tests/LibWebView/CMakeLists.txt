@@ -162,6 +162,13 @@ if (NOT WIN32)
         target_compile_definitions(TestNativeInput PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
+    add_executable(TestNativeSettingsSearch TestNativeSettingsSearch.cpp)
+    add_dependencies(TestNativeSettingsSearch ladybird_build_resource_files ${ladybird_helper_processes})
+    target_link_libraries(TestNativeSettingsSearch PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView LibPort)
+    if (APPLE)
+        target_compile_definitions(TestNativeSettingsSearch PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
     if (APPLE)
         add_executable(TestNativeEventLoop TestNativeEventLoop.mm)
         add_dependencies(TestNativeEventLoop ladybird_build_resource_files ${ladybird_helper_processes})

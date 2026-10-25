@@ -16,6 +16,7 @@
 #include <LibCore/Directory.h>
 #include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibGfx/SharedImageBuffer.h>
@@ -133,14 +134,137 @@ struct LbApp {
     LbCallbacks callbacks {};
     CFRunLoopTimerRef pump_timer { nullptr };
 
+    LbSearchPolicy search_policy { LbSearchPolicyUnconfiguredFallback };
+    Optional<String> chosen_provider_name;
+    LbSearchMigrationSnapshot migration_snapshot {};
+
     // Tabs are declared AFTER the application, so they are destroyed BEFORE it: each tab's HeadlessWebView has to go
     // away while the application owning its WebContent client is still alive.
 };
 
 namespace {
 
+static LbApp* s_active_app = nullptr;
+
+static bool is_valid_live_app(LbApp* app)
+{
+    return app != nullptr && app == s_active_app;
+}
+
+static bool is_valid_utf8_without_embedded_nul(char const* str, size_t len)
+{
+    if (!str && len > 0)
+        return false;
+    if (len == 0)
+        return true;
+    if (memchr(str, '\0', len) != nullptr)
+        return false;
+    Utf8View view { StringView { str, len } };
+    return view.validate();
+}
+
+static void capture_migration_snapshot(LbApp& app)
+{
+    app.migration_snapshot.struct_size = sizeof(LbSearchMigrationSnapshot);
+    app.migration_snapshot.api_version = LB_PORT_API_VERSION;
+    app.migration_snapshot.provenance = LbSearchProvenanceUnconfiguredAbsent;
+    app.migration_snapshot.selected_provider_name = nullptr;
+    app.migration_snapshot.selected_provider_name_len = 0;
+    app.migration_snapshot.suggestions_enabled = 0;
+    app.migration_snapshot.has_legacy_autocomplete = 0;
+
+    if (!WebView::Application::is_initialized())
+        return;
+
+    auto settings_path = LexicalPath::join(WebView::Application::the().profile().paths().config, "Settings.json"sv).string();
+    auto file_result = Core::File::open(settings_path.view(), Core::File::OpenMode::Read);
+    if (file_result.is_error()) {
+        app.migration_snapshot.provenance = LbSearchProvenanceUnconfiguredAbsent;
+        return;
+    }
+
+    auto content_result = file_result.value()->read_until_eof();
+    if (content_result.is_error()) {
+        app.migration_snapshot.provenance = LbSearchProvenanceUnconfiguredAbsent;
+        return;
+    }
+
+    auto json_result = JsonValue::from_string(StringView { content_result.value().bytes() });
+    if (json_result.is_error()) {
+        app.migration_snapshot.provenance = LbSearchProvenanceMalformed;
+        return;
+    }
+
+    if (!json_result.value().is_object()) {
+        app.migration_snapshot.provenance = LbSearchProvenanceMalformed;
+        return;
+    }
+
+    auto const& obj = json_result.value().as_object();
+    auto search_engine_val = obj.get("search_engine"sv);
+    if (!search_engine_val.has_value()) {
+        app.migration_snapshot.provenance = LbSearchProvenanceUnconfiguredAbsent;
+        return;
+    }
+
+    if (!search_engine_val->is_object()) {
+        app.migration_snapshot.provenance = LbSearchProvenanceMalformed;
+        return;
+    }
+
+    auto const& search_obj = search_engine_val->as_object();
+
+    if (auto auto_val = obj.get("autocompleteEngine"sv); auto_val.has_value() && auto_val->is_object()) {
+        if (auto name_val = auto_val->as_object().get_string("name"sv); name_val.has_value() && !name_val->is_empty())
+            app.migration_snapshot.has_legacy_autocomplete = 1;
+    }
+
+    if (auto sugg_val = search_obj.get("search_suggestions_enabled"sv); sugg_val.has_value() && sugg_val->is_bool()) {
+        app.migration_snapshot.suggestions_enabled = sugg_val->as_bool() ? 1 : 0;
+    }
+
+    auto selected_engine = search_obj.get("engine"sv);
+    if (selected_engine.has_value()) {
+        if (selected_engine->is_null()) {
+            app.migration_snapshot.provenance = LbSearchProvenanceAmbiguousNull;
+            return;
+        }
+        if (selected_engine->is_string()) {
+            auto name = selected_engine->as_string();
+            if (!name.is_empty()) {
+                app.migration_snapshot.provenance = LbSearchProvenanceConfiguredCurrent;
+                auto bytes = name.bytes();
+                auto* buf = static_cast<char*>(malloc(bytes.size()));
+                if (buf) {
+                    memcpy(buf, bytes.data(), bytes.size());
+                    app.migration_snapshot.selected_provider_name = buf;
+                    app.migration_snapshot.selected_provider_name_len = bytes.size();
+                }
+                return;
+            }
+        }
+    }
+
+    auto legacy_name = search_obj.get_string("name"sv);
+    if (legacy_name.has_value() && !legacy_name->is_empty()) {
+        app.migration_snapshot.provenance = LbSearchProvenanceConfiguredLegacy;
+        auto bytes = legacy_name->bytes();
+        auto* buf = static_cast<char*>(malloc(bytes.size()));
+        if (buf) {
+            memcpy(buf, bytes.data(), bytes.size());
+            app.migration_snapshot.selected_provider_name = buf;
+            app.migration_snapshot.selected_provider_name_len = bytes.size();
+        }
+        return;
+    }
+
+    app.migration_snapshot.provenance = LbSearchProvenanceUnconfiguredAbsent;
+}
+
 void set_up_isolation(ByteString& scratch_directory)
 {
+    if (Core::Environment::has("XDG_CONFIG_HOME"sv))
+        return;
     scratch_directory = ByteString::formatted("{}/Ladybird-Port-{}", Core::StandardPaths::tempfile_directory(), getpid());
     MUST(Core::Directory::create(scratch_directory, Core::Directory::CreateDirectories::Yes));
     VERIFY(setenv("XDG_CONFIG_HOME", scratch_directory.characters(), 1) == 0);
@@ -227,6 +351,9 @@ LbApp* LbAppCreate(char const* argv0, LbCallbacks const* callbacks)
     app->application = application.release_value();
     if (callbacks)
         app->callbacks = *callbacks;
+
+    capture_migration_snapshot(*app);
+    s_active_app = app;
     return app;
 }
 
@@ -277,7 +404,14 @@ void LbAppDestroy(LbApp* app)
 {
     if (!app)
         return;
+    if (s_active_app == app)
+        s_active_app = nullptr;
     LbAppStopPump(app);
+    if (app->migration_snapshot.selected_provider_name) {
+        free(app->migration_snapshot.selected_provider_name);
+        app->migration_snapshot.selected_provider_name = nullptr;
+        app->migration_snapshot.selected_provider_name_len = 0;
+    }
     delete app;
 }
 
@@ -431,17 +565,40 @@ int LbResolveUserInput(char const* utf8, size_t len, char** out_url, size_t* out
     *out_url = nullptr;
     *out_len = 0;
 
-    // The settings engine is only populated from Settings.json, which this host has no UI to write, and which a fresh
-    // profile does not contain at all -- so a new user would type a search and get nothing. Falling back to the first
-    // builtin keeps search working out of the box; once a settings UI exists, the configured engine wins and this
-    // branch stops being taken.
     Optional<WebView::SearchEngine> search_engine;
-    if (WebView::Application::is_initialized()) {
-        search_engine = WebView::Application::settings().search_engine_settings().engine;
-    }
-    if (!search_engine.has_value()) {
-        if (auto builtins = WebView::builtin_search_engines(); !builtins.is_empty())
-            search_engine = builtins[0];
+    if (s_active_app != nullptr) {
+        switch (s_active_app->search_policy) {
+        case LbSearchPolicyDisabled:
+        case LbSearchPolicyUnavailable:
+            search_engine = OptionalNone {};
+            break;
+        case LbSearchPolicyEnabled:
+            if (s_active_app->chosen_provider_name.has_value() && WebView::Application::is_initialized()) {
+                search_engine = WebView::Application::settings().find_search_engine_by_name(*s_active_app->chosen_provider_name);
+                if (!search_engine.has_value()) {
+                    s_active_app->search_policy = LbSearchPolicyUnavailable;
+                    search_engine = OptionalNone {};
+                }
+            } else {
+                search_engine = OptionalNone {};
+            }
+            break;
+        case LbSearchPolicyUnconfiguredFallback:
+            if (WebView::Application::is_initialized())
+                search_engine = WebView::Application::settings().search_engine_settings().engine;
+            if (!search_engine.has_value()) {
+                if (auto builtins = WebView::builtin_search_engines(); !builtins.is_empty())
+                    search_engine = builtins[0];
+            }
+            break;
+        }
+    } else {
+        if (WebView::Application::is_initialized())
+            search_engine = WebView::Application::settings().search_engine_settings().engine;
+        if (!search_engine.has_value()) {
+            if (auto builtins = WebView::builtin_search_engines(); !builtins.is_empty())
+                search_engine = builtins[0];
+        }
     }
 
     auto url = WebView::sanitize_url(StringView { utf8, len }, search_engine);
@@ -639,6 +796,199 @@ void LbTabTypeText(LbApp* app, uint64_t tab_id, char const* utf8, size_t len)
             .browser_data = nullptr,
         };
         tab->view->enqueue_input_event(move(event));
+    }
+}
+
+LbResult LbSearchVisitCatalog(LbApp* app, void* context, LbSearchCatalogVisitor visitor)
+{
+    if (!is_valid_live_app(app))
+        return LbResultErrorEngineUnavailable;
+    if (!visitor)
+        return LbResultErrorNullArg;
+
+    for (auto const& builtin : WebView::builtin_search_engines()) {
+        auto name_bytes = builtin.name.bytes();
+        auto query_bytes = builtin.query_url.bytes();
+        ReadonlyBytes suggest_bytes {};
+        if (builtin.suggestions.has_value())
+            suggest_bytes = builtin.suggestions->query_url.bytes();
+
+        LbSearchEngineDescriptor descriptor {
+            .struct_size = sizeof(LbSearchEngineDescriptor),
+            .api_version = LB_PORT_API_VERSION,
+            .is_custom = 0,
+            .name = reinterpret_cast<char const*>(name_bytes.data()),
+            .name_len = name_bytes.size(),
+            .query_url = reinterpret_cast<char const*>(query_bytes.data()),
+            .query_url_len = query_bytes.size(),
+            .suggestions_url = suggest_bytes.is_empty() ? nullptr : reinterpret_cast<char const*>(suggest_bytes.data()),
+            .suggestions_url_len = suggest_bytes.size(),
+        };
+
+        if (visitor(context, &descriptor) != 0)
+            return LbResultOk;
+    }
+
+    if (WebView::Application::is_initialized()) {
+        auto serialized = WebView::Application::settings().serialize_json();
+        if (serialized.is_object()) {
+            if (auto se_val = serialized.as_object().get("search_engine"sv); se_val.has_value() && se_val->is_object()) {
+                if (auto customs = se_val->as_object().get_array("custom_search_engines"sv); customs.has_value()) {
+                    for (size_t i = 0; i < customs->size(); ++i) {
+                        auto const& custom_val = customs->at(i);
+                        if (!custom_val.is_object())
+                            continue;
+                        auto const& custom_obj = custom_val.as_object();
+                        auto name = custom_obj.get_string("name"sv).value_or({});
+                        auto url = custom_obj.get_string("url"sv).value_or({});
+                        auto sugg = custom_obj.get_string("suggestions_url"sv).value_or({});
+
+                        auto name_bytes = name.bytes();
+                        auto url_bytes = url.bytes();
+                        auto sugg_bytes = sugg.bytes();
+
+                        LbSearchEngineDescriptor descriptor {
+                            .struct_size = sizeof(LbSearchEngineDescriptor),
+                            .api_version = LB_PORT_API_VERSION,
+                            .is_custom = 1,
+                            .name = reinterpret_cast<char const*>(name_bytes.data()),
+                            .name_len = name_bytes.size(),
+                            .query_url = reinterpret_cast<char const*>(url_bytes.data()),
+                            .query_url_len = url_bytes.size(),
+                            .suggestions_url = sugg_bytes.is_empty() ? nullptr : reinterpret_cast<char const*>(sugg_bytes.data()),
+                            .suggestions_url_len = sugg_bytes.size(),
+                        };
+
+                        if (visitor(context, &descriptor) != 0)
+                            return LbResultOk;
+                    }
+                }
+            }
+        }
+    }
+
+    return LbResultOk;
+}
+
+LbResult LbSearchSetProvider(LbApp* app, char const* name, size_t name_len)
+{
+    if (!is_valid_live_app(app))
+        return LbResultErrorEngineUnavailable;
+    if (!name)
+        return LbResultErrorNullArg;
+    if (!is_valid_utf8_without_embedded_nul(name, name_len) || name_len == 0)
+        return LbResultErrorInvalidArg;
+
+    if (!WebView::Application::is_initialized())
+        return LbResultErrorEngineUnavailable;
+
+    StringView name_view { name, name_len };
+    auto engine = WebView::Application::settings().find_search_engine_by_name(name_view);
+    if (!engine.has_value()) {
+        app->search_policy = LbSearchPolicyUnavailable;
+        app->chosen_provider_name = {};
+        return LbResultErrorNotFound;
+    }
+
+    app->search_policy = LbSearchPolicyEnabled;
+    app->chosen_provider_name = engine->name;
+    auto suggestions_enabled = WebView::Application::settings().search_engine_settings().suggestions;
+    WebView::Application::settings().set_search_engine_settings({ .engine = move(engine), .suggestions = suggestions_enabled });
+    return LbResultOk;
+}
+
+LbResult LbSearchSetDisabled(LbApp* app)
+{
+    if (!is_valid_live_app(app))
+        return LbResultErrorEngineUnavailable;
+
+    app->search_policy = LbSearchPolicyDisabled;
+    app->chosen_provider_name = {};
+    if (WebView::Application::is_initialized())
+        WebView::Application::settings().set_search_engine_settings({ .engine = {}, .suggestions = false });
+    return LbResultOk;
+}
+
+LbResult LbSearchSetUnconfiguredFallback(LbApp* app)
+{
+    if (!is_valid_live_app(app))
+        return LbResultErrorEngineUnavailable;
+
+    app->search_policy = LbSearchPolicyUnconfiguredFallback;
+    app->chosen_provider_name = {};
+    return LbResultOk;
+}
+
+LbResult LbSearchGetStatus(LbApp* app, LbSearchPolicy* out_policy, char** out_name, size_t* out_len)
+{
+    if (out_name)
+        *out_name = nullptr;
+    if (out_len)
+        *out_len = 0;
+
+    if (!is_valid_live_app(app))
+        return LbResultErrorEngineUnavailable;
+    if (!out_policy)
+        return LbResultErrorNullArg;
+
+    *out_policy = app->search_policy;
+
+    if (app->chosen_provider_name.has_value() && out_name && out_len) {
+        auto bytes = app->chosen_provider_name->bytes();
+        auto* buf = static_cast<char*>(malloc(bytes.size()));
+        if (!buf)
+            return LbResultOk;
+        memcpy(buf, bytes.data(), bytes.size());
+        *out_name = buf;
+        *out_len = bytes.size();
+    }
+
+    return LbResultOk;
+}
+
+LbResult LbSearchReadMigrationSnapshot(LbApp* app, LbSearchMigrationSnapshot* out_snapshot)
+{
+    if (!out_snapshot)
+        return LbResultErrorNullArg;
+
+    if (out_snapshot->struct_size < sizeof(LbSearchMigrationSnapshot))
+        return LbResultErrorInvalidArg;
+    if (out_snapshot->api_version != LB_PORT_API_VERSION)
+        return LbResultErrorUnsupportedVersion;
+
+    out_snapshot->provenance = LbSearchProvenanceUnconfiguredAbsent;
+    out_snapshot->selected_provider_name = nullptr;
+    out_snapshot->selected_provider_name_len = 0;
+    out_snapshot->suggestions_enabled = 0;
+    out_snapshot->has_legacy_autocomplete = 0;
+
+    if (!is_valid_live_app(app))
+        return LbResultErrorEngineUnavailable;
+
+    out_snapshot->provenance = app->migration_snapshot.provenance;
+    out_snapshot->suggestions_enabled = app->migration_snapshot.suggestions_enabled;
+    out_snapshot->has_legacy_autocomplete = app->migration_snapshot.has_legacy_autocomplete;
+
+    if (app->migration_snapshot.selected_provider_name && app->migration_snapshot.selected_provider_name_len > 0) {
+        auto* buf = static_cast<char*>(malloc(app->migration_snapshot.selected_provider_name_len));
+        if (buf) {
+            memcpy(buf, app->migration_snapshot.selected_provider_name, app->migration_snapshot.selected_provider_name_len);
+            out_snapshot->selected_provider_name = buf;
+            out_snapshot->selected_provider_name_len = app->migration_snapshot.selected_provider_name_len;
+        }
+    }
+
+    return LbResultOk;
+}
+
+void LbSearchFreeMigrationSnapshot(LbSearchMigrationSnapshot* snapshot)
+{
+    if (!snapshot)
+        return;
+    if (snapshot->selected_provider_name) {
+        free(snapshot->selected_provider_name);
+        snapshot->selected_provider_name = nullptr;
+        snapshot->selected_provider_name_len = 0;
     }
 }
 

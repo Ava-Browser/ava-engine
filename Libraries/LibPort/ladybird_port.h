@@ -199,6 +199,94 @@ void LbTabAnswerPrompt(LbApp* app, uint64_t tab, const char* response, size_t le
 // `accept` of 1 ALLOWS the navigation. See the inverted-sense note on on_request_before_unload.
 void LbTabAnswerBeforeUnload(LbApp* app, uint64_t tab, int accept);
 
+// -------------------------------------------------------------------------------------------------------------------
+// Search Settings & Migration ABI (API Version 2)
+// -------------------------------------------------------------------------------------------------------------------
+
+#define LB_PORT_API_VERSION 2
+
+// Typed operation status enum (no void setters, no phantom error buffers).
+typedef enum LbResult {
+    LbResultOk = 0,
+    LbResultErrorNullArg = -1,
+    LbResultErrorInvalidArg = -2,
+    LbResultErrorNotFound = -3,
+    LbResultErrorEngineUnavailable = -4,
+    LbResultErrorUnsupportedVersion = -5,
+} LbResult;
+
+// Search policy enum representing the four states in TDD §4.
+typedef enum LbSearchPolicy {
+    LbSearchPolicyUnconfiguredFallback = 0, // No original choice; fallback to builtins[0] (Bing)
+    LbSearchPolicyEnabled = 1,              // Configured provider active
+    LbSearchPolicyDisabled = 2,             // Explicitly disabled; prose queries return 0
+    LbSearchPolicyUnavailable = 3,          // Selected provider missing/removed; blocked, no fallback
+} LbSearchPolicy;
+
+// Search engine descriptor passed to catalog visitor callback.
+typedef struct LbSearchEngineDescriptor {
+    uint32_t struct_size;       // sizeof(LbSearchEngineDescriptor)
+    uint32_t api_version;       // LB_PORT_API_VERSION
+    int is_custom;              // 0 for built-in, 1 for custom
+    const char* name;           // Borrowed UTF-8 string, valid only during callback
+    size_t name_len;
+    const char* query_url;      // Borrowed UTF-8 template containing "%s"
+    size_t query_url_len;
+    const char* suggestions_url;// Borrowed UTF-8 template or NULL
+    size_t suggestions_url_len;
+} LbSearchEngineDescriptor;
+
+// Callback signature for visiting search catalog. Return 0 to continue, non-zero to stop early.
+typedef int (*LbSearchCatalogVisitor)(void* context, const LbSearchEngineDescriptor* descriptor);
+
+// Visits all search engines in the engine catalog (built-in first, then custom).
+// Descriptors and their string pointers are borrowed strictly until the callback returns.
+// Caller/Bridge must copy any desired data synchronously.
+LbResult LbSearchVisitCatalog(LbApp* app, void* context, LbSearchCatalogVisitor visitor);
+
+// Sets the active provider by name. Transitions policy to LbSearchPolicyEnabled.
+// If provider name is not found in builtins or custom catalog, returns LbResultErrorNotFound
+// and transitions policy to LbSearchPolicyUnavailable (fail closed: blocking prose queries, no fallback).
+LbResult LbSearchSetProvider(LbApp* app, const char* name, size_t name_len);
+
+// Explicitly disables search from the address bar. Transitions policy to LbSearchPolicyDisabled.
+// Prose queries to LbResolveUserInput return 0; valid URLs and host:port navigate normally.
+LbResult LbSearchSetDisabled(LbApp* app);
+
+// Resets search policy to LbSearchPolicyUnconfiguredFallback (first-run Bing fallback).
+LbResult LbSearchSetUnconfiguredFallback(LbApp* app);
+
+// Gets the current search policy and active provider name.
+// If policy is Enabled, fills *out_name with a malloc-allocated string (caller frees with LbStringFree).
+// Output pointers are reset to NULL/0 on entry.
+LbResult LbSearchGetStatus(LbApp* app, LbSearchPolicy* out_policy, char** out_name, size_t* out_len);
+
+// Migration snapshot provenance of raw Settings.json
+typedef enum LbSearchProvenance {
+    LbSearchProvenanceUnconfiguredAbsent = 0,   // File or search_engine key absent
+    LbSearchProvenanceConfiguredCurrent = 1,    // search_engine.engine string present
+    LbSearchProvenanceConfiguredLegacy = 2,     // legacy search_engine.name string present
+    LbSearchProvenanceAmbiguousNull = 3,        // search_engine.engine is null (e.g. from unrelated save)
+    LbSearchProvenanceMalformed = 4,            // file exists but is malformed JSON or unexpected type
+} LbSearchProvenance;
+
+typedef struct LbSearchMigrationSnapshot {
+    uint32_t struct_size;           // sizeof(LbSearchMigrationSnapshot)
+    uint32_t api_version;           // LB_PORT_API_VERSION
+    LbSearchProvenance provenance;
+    char* selected_provider_name;   // Malloc buffer or NULL (caller frees with LbSearchFreeMigrationSnapshot)
+    size_t selected_provider_name_len;
+    int suggestions_enabled;        // 1 if enabled, 0 if disabled/absent
+    int has_legacy_autocomplete;    // 1 if legacy autocompleteEngine was present
+} LbSearchMigrationSnapshot;
+
+// Reads migration snapshot captured from engine profile Settings.json before any mutation occurred.
+// Caller frees allocated strings using LbSearchFreeMigrationSnapshot.
+LbResult LbSearchReadMigrationSnapshot(LbApp* app, LbSearchMigrationSnapshot* out_snapshot);
+
+// Idempotent, null-safe free helper for LbSearchMigrationSnapshot allocated fields.
+void LbSearchFreeMigrationSnapshot(LbSearchMigrationSnapshot* snapshot);
+
 #ifdef __cplusplus
 }
 #endif
