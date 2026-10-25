@@ -172,6 +172,11 @@ if (NOT WIN32)
         add_dependencies(TestNativePresentation ladybird_build_resource_files ${ladybird_helper_processes})
         target_link_libraries(TestNativePresentation PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView "-framework AppKit" "-framework QuartzCore")
         target_compile_definitions(TestNativePresentation PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+
+        add_executable(TestNativeContainers TestNativeContainers.cpp)
+        add_dependencies(TestNativeContainers ladybird_build_resource_files ${ladybird_helper_processes})
+        target_link_libraries(TestNativeContainers PRIVATE AK LibCore LibDatabase LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
+        target_compile_definitions(TestNativeContainers PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
     add_executable(TestBrowserHistoryTraversal TestBrowserHistoryTraversal.cpp)
