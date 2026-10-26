@@ -55,17 +55,14 @@ fn optional_string_value(vm: &Vm, string: Option<Utf16String>) -> Value {
 
 impl LocalePrototype {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<LocalePrototype> {
-        realm.create_object(
-            vm,
-            LocalePrototype {
-                base: Object::new_with_prototype(
-                    vm,
-                    Self::CLASS,
-                    realm.object_prototype(),
-                    MayInterfereWithIndexedPropertyAccess::No,
-                ),
-            },
-        )
+        realm.create_object(vm, |_| LocalePrototype {
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm.object_prototype(),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -299,15 +296,13 @@ impl LocalePrototype {
         let info = Object::create(vm, realm, Some(realm.object_prototype()));
 
         // 4. Let dir be TextDirectionOfLocale(loc).
-        let direction = text_direction_of_locale(&locale_object);
+        let direction = text_direction_of_locale(&locale_object)
+            .map(|direction| Value::from_string(PrimitiveString::create_from_utf8(vm, direction)))
+            .unwrap_or(Value::UNDEFINED);
 
         // 5. Perform ! CreateDataPropertyOrThrow(info, "direction", dir).
-        info.create_data_property_or_throw(
-            vm,
-            &vm.names.direction,
-            Value::from_string(PrimitiveString::create_from_utf8(vm, direction)),
-        )
-        .must();
+        info.create_data_property_or_throw(vm, &vm.names.direction, direction)
+            .must();
 
         // 6. Return info.
         Ok(Value::from_object(info))

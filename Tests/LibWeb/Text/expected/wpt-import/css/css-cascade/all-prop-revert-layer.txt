@@ -1,8 +1,8 @@
 Harness status: OK
 
-Found 337 tests
+Found 346 tests
 
-333 Pass
+342 Pass
 4 Fail
 Pass	accent-color
 Pass	border-collapse
@@ -26,6 +26,7 @@ Pass	font-feature-settings
 Pass	font-kerning
 Pass	font-language-override
 Pass	font-optical-sizing
+Pass	font-palette
 Pass	font-size
 Pass	font-size-adjust
 Pass	font-style
@@ -39,6 +40,8 @@ Pass	font-variant-position
 Pass	font-variation-settings
 Pass	font-weight
 Pass	font-width
+Pass	forced-color-adjust
+Pass	hyphenate-character
 Pass	image-rendering
 Pass	letter-spacing
 Pass	line-height
@@ -64,10 +67,13 @@ Pass	stroke-opacity
 Pass	stroke-width
 Pass	tab-size
 Pass	text-align
+Pass	text-align-last
 Pass	text-anchor
 Pass	text-decoration-skip-ink
+Pass	text-emphasis-position
 Pass	text-indent
 Pass	text-justify
+Pass	text-orientation
 Pass	text-rendering
 Pass	text-shadow
 Pass	text-transform
@@ -84,6 +90,7 @@ Pass	writing-mode
 Pass	align-content
 Pass	align-items
 Pass	align-self
+Pass	alignment-baseline
 Pass	animation-composition
 Pass	animation-delay
 Pass	animation-direction
@@ -109,6 +116,8 @@ Pass	background-position-x
 Pass	background-position-y
 Pass	background-repeat
 Pass	background-size
+Pass	baseline-shift
+Pass	baseline-source
 Fail	block-size
 Pass	border-block-end-color
 Pass	border-block-end-style

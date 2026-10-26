@@ -168,6 +168,16 @@ pub unsafe fn vm_from_abi<'vm>(vm: *mut JSVM) -> &'vm Vm {
     unsafe { vm.cast::<Vm>().as_ref() }
 }
 
+/// The object of any class at the address of a JSObject the ABI passes.
+///
+/// # Safety
+///
+/// `object` must be the address of a live object.
+pub unsafe fn object_from_abi(object: *mut JSObject) -> Gc<Object> {
+    // SAFETY: The caller guarantees that the pointer is the address of a live object.
+    unsafe { cell_from_abi(object) }
+}
+
 /// The address of an object of any class, as the JSObject the ABI passes.
 pub fn object_into_abi<T: Extends<Object>>(object: Gc<T>) -> *mut JSObject {
     cell_into_abi(object.upcast::<Object>())
@@ -259,8 +269,8 @@ pub unsafe fn completion_writing_result_to<T>(result: ThrowCompletionOr<T>, out:
 /// The completion an embedder's hook returned, as the runtime's own.
 pub fn completion_from_abi(completion: JSCompletion) -> ThrowCompletionOr<Value> {
     match completion.variant {
-        JS_COMPLETION_NORMAL => Ok(Value(completion.payload)),
-        JS_COMPLETION_THROW => Err(Throw::new(Value(completion.payload))),
+        JS_COMPLETION_NORMAL => Ok(Value::from_bits(completion.payload)),
+        JS_COMPLETION_THROW => Err(Throw::new(Value::from_bits(completion.payload))),
         variant => panic!("the embedder returned a completion of unknown variant {variant}"),
     }
 }
@@ -270,7 +280,7 @@ pub fn value_into_abi(value: Value) -> JSValue {
 }
 
 pub fn value_from_abi(value: JSValue) -> Value {
-    Value(value)
+    Value::from_bits(value)
 }
 
 /// A borrowed run of code units in the two storage kinds of AK::Utf16View: `data` points to `length_in_code_units`

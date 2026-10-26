@@ -7,9 +7,10 @@
 use super::*;
 
 /// The one question a layout pass still asks the document while it runs: what the container-relative
-/// lengths on an element resolve against. Answering it notes in the document that the element depends
-/// on its query container's size, so the answer cannot be published ahead of the pass. A pass holds
-/// this and no other part of the host. Every other host call takes the main thread token, which a
+/// lengths on an element resolve against. The answer reads the committed size of the element's query
+/// container, so it cannot be published ahead of the pass, and it writes nothing in the document: the
+/// dependencies it finds reach the document as commit messages. A pass holds this and no other part
+/// of the host. Every other host call takes the main thread token, which a
 /// pass is not handed, so a pass has no way to make any other call into the document.
 #[derive(Clone, Copy)]
 pub(crate) struct ContainerLengthBasesQuery {
@@ -67,6 +68,11 @@ pub(crate) struct LayoutPass<'arena> {
     pub(crate) initial_containing_block_inline_size: CssPixels,
     pub(crate) initial_containing_block_block_size: CssPixels,
     pub(crate) document_in_quirks_mode: bool,
+    /// The frame of the formatting context the pass is laying out, in which style reads see sizes and box sides.
+    pub(crate) frame: super::geometry::Frame,
+    /// The root of the run this pass view was handed to and that root's containing block, where containing block
+    /// searches from inside the run stop. Invalid outside any run.
+    innermost_run: (Node, Node),
 }
 
 impl<'arena> LayoutPass<'arena> {
@@ -85,9 +91,42 @@ impl<'arena> LayoutPass<'arena> {
             initial_containing_block_inline_size,
             initial_containing_block_block_size,
             document_in_quirks_mode,
+            frame: super::geometry::Frame::PHYSICAL,
+            innermost_run: (NodeSlotId::INVALID, NodeSlotId::INVALID),
         }
     }
 
+    /// A pass whose only question to the document has no answer, over `arena` and `scratch`.
+    #[cfg(test)]
+    pub(crate) fn for_test(arena: &'arena LayoutNodeArena, scratch: &'arena super::run_records::LayoutScratch) -> Self {
+        Self::new(
+            arena,
+            scratch,
+            ContainerLengthBasesQuery {
+                context: std::ptr::null_mut(),
+                query: None,
+            },
+            CssPixels::default(),
+            CssPixels::default(),
+            false,
+        )
+    }
+
+    /// This pass, as the run rooted at `root` sees it.
+    #[inline]
+    pub(super) fn for_run(mut self, root: Node, root_containing_block: Node) -> Self {
+        self.innermost_run = (root, root_containing_block);
+        self
+    }
+
+    /// This pass, laying out in the frame of `writing_mode`.
+    #[inline]
+    pub(crate) fn in_frame_of(mut self, writing_mode: u8) -> Self {
+        self.frame = super::geometry::Frame::of(writing_mode);
+        self
+    }
+
+    #[inline]
     pub(crate) fn arena(&self) -> &'arena LayoutNodeArena {
         self.arena
     }
@@ -107,6 +146,7 @@ impl<'arena> LayoutPass<'arena> {
         self.arena.intrinsic_size_cache_stamp(node)
     }
 
+    #[inline]
     pub(crate) fn node_data(&self, node: Node) -> &'arena NodeData {
         self.arena().data(node)
     }
@@ -117,10 +157,20 @@ impl<'arena> LayoutPass<'arena> {
             .expect("text node content must be synced to the arena before layout")
     }
 
+    #[inline]
     pub(crate) fn style_payloads(&self, node: Node) -> &'arena FfiStylePayloads {
-        self.arena
-            .style_payloads(node)
+        self.style_payloads_if_styled(node)
             .expect("styled node must publish its style container before layout")
+    }
+
+    /// The style of `node`: that of its row, or the position option it is being laid out with.
+    #[inline]
+    pub(crate) fn style_payloads_if_styled(&self, node: Node) -> Option<&'arena FfiStylePayloads> {
+        if let Some(style) = self.scratch.position_option_style(node) {
+            // SAFETY: A position option's style record stays pinned while a box is laid out with it.
+            return unsafe { super::node_data::style_payloads(style) };
+        }
+        self.arena.style_payloads(node)
     }
 
     pub(crate) fn replaced_content_facts(&self, node: Node) -> Option<FfiReplacedContentFacts> {
@@ -128,8 +178,7 @@ impl<'arena> LayoutPass<'arena> {
     }
 
     pub(crate) fn computed_values_view_if_styled(&self, node: Node) -> Option<ComputedValuesView<'arena>> {
-        self.arena
-            .style_payloads(node)
+        self.style_payloads_if_styled(node)
             .map(|payloads| ComputedValuesView::new(&payloads.groups))
     }
 
@@ -223,7 +272,7 @@ impl<'arena> LayoutPass<'arena> {
     }
 
     pub(crate) fn in_flow_containing_block(&self, node: Node) -> Node {
-        let (innermost_root, innermost_root_containing_block) = self.arena.innermost_run.get();
+        let (innermost_root, innermost_root_containing_block) = self.innermost_run;
         if node == innermost_root {
             return innermost_root_containing_block;
         }

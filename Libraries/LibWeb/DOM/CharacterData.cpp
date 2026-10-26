@@ -18,6 +18,8 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/Editing/SpellingMarkers.h>
+#include <LibWeb/Editing/WritingSuggestionController.h>
+#include <LibWeb/PaintTiming/PaintTiming.h>
 #include <LibWeb/Selection/Selection.h>
 
 namespace Web::DOM {
@@ -174,6 +176,9 @@ WebIDL::ExceptionOr<void> CharacterData::replace_data(size_t offset, size_t coun
     if (has_spelling_markers())
         document().spelling_markers().did_replace_data(as<Text>(*this), offset, count, data.length_in_code_units());
 
+    if (auto* controller = document().writing_suggestion_controller_if_exists(); controller && is<Text>(*this))
+        controller->did_change_text(as<Text>(*this));
+
     // A text node holding nothing leaves its parent `:empty`, so data arriving in it or leaving it
     // moves the parent's emptiness without any node being created or destroyed.
     if (is<Text>(*this) && old_data.is_empty() != m_data.is_empty()) {
@@ -199,6 +204,10 @@ WebIDL::ExceptionOr<void> CharacterData::replace_data(size_t offset, size_t coun
                 set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::CharacterDataReplaceData);
             else if (auto* parent = this->parent())
                 parent->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::CharacterDataReplaceData);
+
+            // NB: Paint timing stops looking at text that is all white space, which this text no longer is.
+            if (!m_data.is_ascii_whitespace())
+                PaintTiming::text_node_may_be_painted_for_the_first_time(as<Text>(*this));
         }
     }
 

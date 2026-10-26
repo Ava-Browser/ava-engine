@@ -67,9 +67,9 @@ void StyleEngine::mint_style_nodes(Span<StyleNodeID> nodes)
 {
     if (nodes.is_empty())
         return;
-    auto* raw_nodes = reinterpret_cast<u32*>(nodes.data());
-    StyleEngineFFI::style_node_id_allocator_mint(m_style_node_ids, false, raw_nodes, nodes.size());
-    StyleEngineFFI::style_engine_mint_style_nodes(m_render_document->host(), raw_nodes, nodes.size());
+    Span<u32> raw_nodes { reinterpret_cast<u32*>(nodes.data()), nodes.size() };
+    StyleEngineFFI::style_node_id_allocator_mint(m_style_node_ids, false, raw_nodes);
+    StyleEngineFFI::style_engine_mint_style_nodes(m_render_document->host(), raw_nodes);
     // An element minted beside a style transaction that flew is unknown to it, whenever its arrival is recorded.
     if (has_flown_style_transaction()) {
         for (auto node : nodes)
@@ -81,9 +81,9 @@ void StyleEngine::mint_text_style_nodes(Span<StyleNodeID> nodes)
 {
     if (nodes.is_empty())
         return;
-    auto* raw_nodes = reinterpret_cast<u32*>(nodes.data());
-    StyleEngineFFI::style_node_id_allocator_mint(m_style_node_ids, true, raw_nodes, nodes.size());
-    StyleEngineFFI::style_engine_mint_style_nodes(m_render_document->host(), raw_nodes, nodes.size());
+    Span<u32> raw_nodes { reinterpret_cast<u32*>(nodes.data()), nodes.size() };
+    StyleEngineFFI::style_node_id_allocator_mint(m_style_node_ids, true, raw_nodes);
+    StyleEngineFFI::style_engine_mint_style_nodes(m_render_document->host(), raw_nodes);
 }
 
 HashTable<StyleNodeID> StyleEngine::take_deferred_element_initial_features()
@@ -112,9 +112,9 @@ void StyleEngine::finish_sheet_rules_replacement(SheetID sheet)
     StyleEngineFFI::style_engine_finish_sheet_rules_replacement(host(), sheet, StyleEngineFFI::style_engine_next_declaration_block_version(host()));
 }
 
-void StyleEngine::set_element_inline_style_properties(StyleNodeID node, RustDeclarationBlock const* declarations)
+void StyleEngine::set_element_inline_style_properties(StyleNodeID node, Parser::ValueParserFFI::DeclarationBlock const* declarations)
 {
-    if (StyleEngineFFI::style_engine_set_element_inline_style_properties(host(), node.value(), declarations ? declarations->handle() : nullptr))
+    if (StyleEngineFFI::style_engine_set_element_inline_style_properties(host(), node.value(), declarations))
         note_css_transitions_may_observe_style_changes();
 }
 
@@ -201,6 +201,8 @@ Optional<StyleEngine::DemandedPseudoElement> StyleEngine::demanded_pseudo_elemen
     // The engine numbers each pseudo-element it answers as its kind: the synthetic ones, the ones an element in the
     // shadow tree backs, and the named view transition ones. ::part() and ::slotted() name other elements.
     switch (pseudo_element) {
+    // FIXME: Compute the styles of ::highlight() pseudo-elements for each custom highlight name.
+    case PseudoElement::Highlight:
     case PseudoElement::Part:
     case PseudoElement::Slotted:
     case PseudoElement::KnownPseudoElementCount:

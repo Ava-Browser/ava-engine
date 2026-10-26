@@ -1,0 +1,7 @@
+Harness status: OK
+
+Found 2 tests
+
+2 Pass
+Pass	RadicalKernBeforeDegree = -1em < 0
+Pass	RadicalKernBeforeAfterDegree = -5em < -3em = -degree's inline size

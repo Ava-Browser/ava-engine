@@ -11,6 +11,7 @@
 #include <AK/Utf16StringBuilder.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/FontStyleMapping.h>
+#include <LibWeb/CSS/CSSKeywordValue.h>
 #include <LibWeb/CSS/CSSStyleValue.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Parser/Parser.h>
@@ -19,7 +20,6 @@
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/AngleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/BackgroundSizeStyleValue.h>
-#include <LibWeb/CSS/StyleValues/BorderImageSliceStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorFunctionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
@@ -30,7 +30,6 @@
 #include <LibWeb/CSS/StyleValues/CursorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CustomIdentStyleValue.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
-#include <LibWeb/CSS/StyleValues/EdgeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FilterStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FlexStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FontSourceStyleValue.h>
@@ -44,12 +43,9 @@
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/OpacityValueStyleValue.h>
-#include <LibWeb/CSS/StyleValues/OpenTypeTaggedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PendingSubstitutionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
-#include <LibWeb/CSS/StyleValues/PositionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RatioStyleValue.h>
-#include <LibWeb/CSS/StyleValues/RepeatStyleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ResolutionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ShadowStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ShorthandStyleValue.h>
@@ -75,7 +71,7 @@ static_assert(offsetof(Web::CSS::ComputedValuesFFI::RetainedUtf16FlyString, raw)
 
 namespace Web::CSS {
 
-Utf16FlyString css_string_from_rust(void const* string)
+Utf16FlyString css_string_from_rust(StyleValueFFI::CssString const* string)
 {
     auto view = StyleValueFFI::rust_css_string_view(string);
     return Utf16FlyString::from_utf16(Utf16View { reinterpret_cast<char16_t const*>(view.data), view.length });
@@ -128,7 +124,7 @@ ValueComparingNonnullRefPtr<StyleValue const> StyleValue::adopt_rust_style_value
     case StyleValueFFI::StyleValueData::Tag::BorderRadiusRect:
         return adopt_ref(*new (nothrow) StyleValue(Type::BorderRadiusRect, data));
     case StyleValueFFI::StyleValueData::Tag::BorderImageSlice:
-        return adopt_ref(*new (nothrow) BorderImageSliceStyleValue(data));
+        return adopt_ref(*new (nothrow) StyleValue(Type::BorderImageSlice, data));
     case StyleValueFFI::StyleValueData::Tag::Calculated:
         return adopt_ref(*new (nothrow) CalculatedStyleValue(data));
     case StyleValueFFI::StyleValueData::Tag::ColorFunction:
@@ -160,7 +156,7 @@ ValueComparingNonnullRefPtr<StyleValue const> StyleValue::adopt_rust_style_value
     case StyleValueFFI::StyleValueData::Tag::Content:
         return adopt_ref(*new (nothrow) ContentStyleValue(data));
     case StyleValueFFI::StyleValueData::Tag::Edge:
-        return adopt_ref(*new (nothrow) EdgeStyleValue(data));
+        return adopt_ref(*new (nothrow) StyleValue(Type::Edge, data));
     case StyleValueFFI::StyleValueData::Tag::EmptyOptional:
         return adopt_ref(*new (nothrow) StyleValue(Type::EmptyOptional, data));
     case StyleValueFFI::StyleValueData::Tag::Easing:
@@ -229,11 +225,11 @@ ValueComparingNonnullRefPtr<StyleValue const> StyleValue::adopt_rust_style_value
     case StyleValueFFI::StyleValueData::Tag::PendingSubstitution:
         return adopt_ref(*new (nothrow) PendingSubstitutionStyleValue(data));
     case StyleValueFFI::StyleValueData::Tag::OpenTypeTagged:
-        return adopt_ref(*new (nothrow) OpenTypeTaggedStyleValue(data));
+        return adopt_ref(*new (nothrow) StyleValue(Type::OpenTypeTagged, data));
     case StyleValueFFI::StyleValueData::Tag::OverflowClipMargin:
         return adopt_ref(*new (nothrow) StyleValue(Type::OverflowClipMargin, data));
     case StyleValueFFI::StyleValueData::Tag::Position:
-        return adopt_ref(*new (nothrow) PositionStyleValue(data));
+        return adopt_ref(*new (nothrow) StyleValue(Type::Position, data));
     case StyleValueFFI::StyleValueData::Tag::Ratio:
         return adopt_ref(*new (nothrow) RatioStyleValue(data));
     case StyleValueFFI::StyleValueData::Tag::Ray:
@@ -241,7 +237,7 @@ ValueComparingNonnullRefPtr<StyleValue const> StyleValue::adopt_rust_style_value
     case StyleValueFFI::StyleValueData::Tag::Rect:
         return adopt_ref(*new (nothrow) StyleValue(Type::Rect, data));
     case StyleValueFFI::StyleValueData::Tag::RepeatStyle:
-        return adopt_ref(*new (nothrow) RepeatStyleStyleValue(data));
+        return adopt_ref(*new (nothrow) StyleValue(Type::RepeatStyle, data));
     case StyleValueFFI::StyleValueData::Tag::RandomValueSharing:
         return adopt_ref(*new (nothrow) StyleValue(Type::RandomValueSharing, data));
     case StyleValueFFI::StyleValueData::Tag::RadialSize:
@@ -291,8 +287,6 @@ ValueComparingNonnullRefPtr<StyleValue const> StyleValue::create_guaranteed_inva
 
 void StyleValue::set_style_sheet(StyleSheetState* style_sheet)
 {
-    m_has_style_sheet_context = !!style_sheet;
-
     // Only the types holding nested values with document-associated state care.
     switch (type()) {
     case Type::Content:
@@ -313,6 +307,11 @@ void StyleValue::set_style_sheet(StyleSheetState* style_sheet)
 bool StyleValue::is_computationally_independent() const
 {
     return ComputedValuesFFI::rust_style_value_is_computationally_independent(m_value.operator->());
+}
+
+bool StyleValue::contains_anchor_function() const
+{
+    return StyleValueFFI::rust_style_value_contains_anchor_function(m_value.operator->());
 }
 
 void StyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
@@ -490,6 +489,12 @@ GC::Ref<CSSStyleValue> StyleValue::reify(Utf16FlyString const& associated_proper
     case Type::Resolution:
     case Type::Time:
         return as_dimension().reify(associated_property);
+    case Type::BackgroundSize:
+        // NB: A background size whose height is `auto` serializes as just its width, so reify it as that width. For
+        //     example, the `auto` keyword is parsed as a size of `auto auto`.
+        if (as_background_size().size_y()->has_auto())
+            return as_background_size().size_x()->reify(associated_property);
+        break;
     case Type::Calculated:
         return as_calculated().reify(associated_property);
     case Type::CustomIdent:
@@ -504,6 +509,16 @@ GC::Ref<CSSStyleValue> StyleValue::reify(Utf16FlyString const& associated_proper
         return as_number().reify(associated_property);
     case Type::OpacityValue:
         return as_opacity_value().reify(associated_property);
+    case Type::GridTrackSizeList:
+        // NB: A track list that is just one track size, as for `grid-auto-columns: 10px`, is that track size.
+        if (auto const* track_size = StyleValueFFI::rust_style_value_grid_track_size_list_single_size(rust_style_value_data()))
+            return adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(track_size))->reify(associated_property);
+        break;
+    case Type::TextIndent:
+        // NB: A text-indent without the `hanging` or `each-line` keywords is just its length-percentage.
+        if (!m_value->text_indent.hanging && !m_value->text_indent.each_line)
+            return wrap_rust_child(m_value->text_indent.length_percentage)->reify(associated_property);
+        break;
     case Type::Unresolved:
         return as_unresolved().reify(associated_property);
     case Type::ValueList:
@@ -511,6 +526,16 @@ GC::Ref<CSSStyleValue> StyleValue::reify(Utf16FlyString const& associated_proper
     default:
         break;
     }
+
+    // AD-HOC: Some values that are just a single keyword are represented by a more specific type, for example
+    //         `font-style: italic`, `grid-auto-flow: row` or `font-variant-numeric: ordinal`. Reify those as the
+    //         keyword. Colors and shorthands are left alone, as they are not keywords on their own.
+    if (type() != Type::Color && type() != Type::Shorthand) {
+        auto serialized_value = to_utf16_string(SerializationMode::Normal);
+        if (keyword_from_string(serialized_value).has_value())
+            return CSSKeywordValue::create(Utf16FlyString { serialized_value });
+    }
+
     return default_reify(associated_property);
 }
 
@@ -531,17 +556,6 @@ StyleValueVector StyleValue::subdivide_into_iterations(PropertyNameAndID const& 
     if (type() == Type::ValueList)
         return as_value_list().subdivide_into_iterations(property);
     return StyleValueVector { *this };
-}
-
-i32 int_from_style_value(NonnullRefPtr<StyleValue const> const& style_value)
-{
-    if (style_value->is_integer())
-        return style_value->as_integer().integer();
-
-    if (style_value->is_calculated())
-        return style_value->as_calculated().resolve_integer({}).value();
-
-    VERIFY_NOT_REACHED();
 }
 
 double number_from_style_value(NonnullRefPtr<StyleValue const> const& style_value, Optional<double> percentage_basis)

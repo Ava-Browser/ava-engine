@@ -290,6 +290,10 @@ impl RetainedState {
         {
             return;
         }
+        if let Some(deferred) = &mut self.deferred_user_agent_routes {
+            deferred.push((rule, program));
+            return;
+        }
         let routing = Arc::make_mut(&mut self.routing);
         routing.add_rule(rule, program, &self.programs);
     }
@@ -2012,6 +2016,7 @@ impl StyleEngine {
                 children_explicitly_inherit_marks: HashMap::default(),
                 css_defined_animations: Default::default(),
                 animation_keyframes: Default::default(),
+                position_try_rules: Default::default(),
                 animation_effect_descriptions: Default::default(),
                 hover: Default::default(),
                 held_root_font_inputs: None,
@@ -2027,6 +2032,7 @@ impl StyleEngine {
                 batch_custom_property_matches: HashMap::default(),
                 batch_custom_property_answers: HashMap::default(),
                 batch_backing_pseudo_matches: HashMap::default(),
+                shadow_host_backing_pseudo_matches: HashMap::default(),
                 engine_cold_record_cache: Default::default(),
                 engine_cold_record_donors: Default::default(),
 
@@ -2056,6 +2062,7 @@ impl StyleEngine {
                 relational_arrival_keys_version: 0,
                 selector_programs_need_sweep: false,
                 routing: Arc::new(RoutingRegistry::new()),
+                deferred_user_agent_routes: None,
                 selector_truth_changes: SelectorTruthChanges::default(),
                 already_planned_selector_truth: DeltaBatch::default(),
                 selector_truth_changes_active: false,
@@ -3386,6 +3393,7 @@ impl RetainedState {
             children_explicitly_inherit_marks,
             css_defined_animations,
             animation_keyframes: _,
+            position_try_rules: _,
             animation_effect_descriptions,
             // Like the host, a `rem` keeps reading the last document element's font until another
             // takes its place.
@@ -3405,6 +3413,8 @@ impl RetainedState {
             batch_custom_property_matches: _,
             batch_custom_property_answers: _,
             batch_backing_pseudo_matches: _,
+            // Forgotten for departed elements in `forget_departed_elements`.
+            shadow_host_backing_pseudo_matches: _,
             engine_cold_record_cache: _,
             engine_cold_record_donors: _,
             style_invalidation_cache: _,
@@ -3439,6 +3449,7 @@ impl RetainedState {
             relational_arrival_keys_version: _,
             selector_programs_need_sweep: _,
             routing: _,
+            deferred_user_agent_routes: _,
             // Scratch of one transaction.
             selector_truth_changes: _,
             already_planned_selector_truth: _,

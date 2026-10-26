@@ -111,7 +111,7 @@ private:
                     action->set_checked(checked);
                 action->activate();
 
-                if (first_is_one_of(action->id(), WebView::ActionID::BookmarkItem, WebView::ActionID::Reload)) {
+                if (first_is_one_of(action->id(), WebView::ActionID::BookmarkItem, WebView::ActionID::Reload, WebView::ActionID::ReloadBypassingCache)) {
                     if (auto* active_tab = Application::the().active_tab())
                         active_tab->view().setFocus();
                 }
@@ -176,6 +176,13 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
             qaction.setIcon(create_chrome_icon(ChromeIcon::Reload, palette));
         qaction.setShortcuts({ QKeySequence(Qt::CTRL | Qt::Key_R), QKeySequence(Qt::Key_F5) });
         break;
+    case WebView::ActionID::ReloadBypassingCache:
+#if defined(AK_OS_MACOS)
+        qaction.setShortcuts({ QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_R), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R) });
+#else
+        qaction.setShortcuts({ QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R), QKeySequence(Qt::CTRL | Qt::Key_F5) });
+#endif
+        break;
     case WebView::ActionID::ViewDownloads:
         if (include_action_icon == IncludeActionIcon::Yes)
             qaction.setIcon(create_chrome_icon(ChromeIcon::Download, palette));
@@ -218,7 +225,7 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         break;
     case WebView::ActionID::BookmarkItem:
         if (auto icon = action.png_icon(); icon.has_value())
-            qaction.setIcon(icon_from_png(icon->bytes(), MENU_ICON_SIZE));
+            qaction.setIcon(favicon_with_rounded_corners(icon_from_png(icon->bytes(), MENU_ICON_SIZE), MENU_ICON_SIZE));
         else
             qaction.setIcon(create_chrome_icon(ChromeIcon::Globe, palette));
         break;

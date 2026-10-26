@@ -108,6 +108,7 @@
 #include <WebContent/TestConnection.h>
 #include <WebContent/WebContentClientEndpoint.h>
 #include <WebContent/WebContentCompositorHost.h>
+#include <WebContent/WebDriverBiDi.h>
 
 namespace WebContent {
 
@@ -116,9 +117,13 @@ ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transpo
     , m_page_host(PageHost::create(*this))
     , m_enable_test_mode(enable_test_mode)
 {
+    Web::StorageAPI::set_storage_area_mirror_client(this);
 }
 
-ConnectionFromClient::~ConnectionFromClient() = default;
+ConnectionFromClient::~ConnectionFromClient()
+{
+    Web::StorageAPI::set_storage_area_mirror_client(nullptr);
+}
 
 Web::Compositor::CompositorConnection* ConnectionFromClient::compositor_process_connection() const
 {
@@ -295,7 +300,7 @@ void ConnectionFromClient::cancel_navigation_params_creation(Web::PageId page_id
         page->cancel_navigation_params_creation(navigable_id, navigation_id);
 }
 
-void ConnectionFromClient::deliver_posted_message(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor message)
+void ConnectionFromClient::deliver_posted_message(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::MessageDescriptor message)
 {
     if (auto page = this->page(page_id); page.has_value())
         page->deliver_posted_message(navigable_id, move(message));
@@ -392,6 +397,23 @@ void ConnectionFromClient::run_webdriver_command(Web::PageId page_id, u64 comman
     }
 
     page->run_webdriver_command(command_id, navigable_id, name, move(payload), move(arguments));
+}
+
+void ConnectionFromClient::run_webdriver_bidi_command(Web::PageId page_id, u64 command_id, Web::HTML::CrossProcessId navigable_id, String method, JsonValue params)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value()) {
+        // NB: A command the driver is waiting on must be answered even when its page is gone here.
+        async_webdriver_command_complete(page_id, command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchFrame, "Browsing context not found"sv));
+        return;
+    }
+
+    WebContent::run_webdriver_bidi_command(*page, command_id, navigable_id, method, move(params));
+}
+
+void ConnectionFromClient::set_webdriver_bidi_session_state(Web::WebDriver::BiDiSessionState state)
+{
+    WebContent::set_webdriver_bidi_session_state(move(state));
 }
 
 void ConnectionFromClient::set_webdriver_session_config(Web::PageId page_id, Web::WebDriver::UserPromptHandler user_prompt_handler, Web::WebDriver::PageLoadStrategy page_load_strategy, bool strict_file_interactability, JsonValue timeouts)
@@ -1122,6 +1144,11 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
         return;
     }
 
+    if (request == "clear-user-style") {
+        page->page().set_user_style({});
+        return;
+    }
+
     if (request == "spoof-user-agent") {
         Web::ResourceLoader::the().set_user_agent(MUST(String::from_byte_string(argument)));
         return;
@@ -1241,65 +1268,54 @@ void ConnectionFromClient::inspect_storage(Web::PageId page_id, Web::StorageAPI:
     async_did_inspect_storage(page_id, request_id, storage_items.serialized());
 }
 
-static Optional<GC::Ref<Web::HTML::Storage>> active_session_storage_for_page(PageClient& page)
+Web::StorageAPI::StorageAreaConnection ConnectionFromClient::connect_to_storage_area(Web::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id)
 {
-    auto document = page.page().local_traversable()->active_document();
-    if (!document || !document->window())
-        return {};
-
-    auto storage_or_error = document->window()->session_storage();
-    if (storage_or_error.is_exception())
-        return {};
-
-    return storage_or_error.release_value();
+    auto response = send_sync_but_allow_failure<Messages::WebContentClient::ConnectToStorageArea>(page_id, storage_endpoint, environment_id);
+    if (!response) {
+        dbgln("WebContent client disconnected during ConnectToStorageArea. Exiting peacefully.");
+        Core::Process::terminate_immediately(0);
+    }
+    return { response->area_id(), response->take_keys(), response->take_values(), response->usage() };
 }
 
-Messages::WebContentServer::SetSessionStorageItemResponse ConnectionFromClient::set_session_storage_item(Web::PageId page_id, Utf16String key, Utf16String value)
+void ConnectionFromClient::disconnect_from_storage_area(Web::StorageAPI::StorageAreaId area_id)
 {
-    auto page = this->page(page_id);
-    if (!page.has_value())
-        return Optional<WebView::StorageSetResult> {};
-
-    auto storage = active_session_storage_for_page(*page);
-    if (!storage.has_value())
-        return Optional<WebView::StorageSetResult> {};
-
-    auto old_value = (*storage)->get_item(key);
-    auto result = (*storage)->set_item(key, value);
-    if (result.is_exception())
-        return WebView::StorageSetResult { WebView::StorageOperationError::QuotaExceededError };
-
-    return WebView::StorageSetResult { move(old_value) };
+    async_disconnect_from_storage_area(area_id);
 }
 
-Messages::WebContentServer::RemoveSessionStorageItemResponse ConnectionFromClient::remove_session_storage_item(Web::PageId page_id, Utf16String key)
+void ConnectionFromClient::set_storage_item(Web::StorageAPI::StorageAreaId area_id, Utf16String const& key, Utf16String const& value, String const& document_url)
 {
-    auto page = this->page(page_id);
-    if (!page.has_value())
-        return Optional<Utf16String> {};
-
-    auto storage = active_session_storage_for_page(*page);
-    if (!storage.has_value())
-        return Optional<Utf16String> {};
-
-    auto old_value = (*storage)->get_item(key);
-    if (old_value.has_value())
-        (*storage)->remove_item(key);
-    return old_value;
+    async_set_storage_item(area_id, key, value, document_url);
 }
 
-Messages::WebContentServer::ClearSessionStorageResponse ConnectionFromClient::clear_session_storage(Web::PageId page_id)
+void ConnectionFromClient::remove_storage_item(Web::StorageAPI::StorageAreaId area_id, Utf16String const& key, String const& document_url)
 {
-    auto page = this->page(page_id);
-    if (!page.has_value())
-        return false;
+    async_remove_storage_item(area_id, key, document_url);
+}
 
-    auto storage = active_session_storage_for_page(*page);
-    if (!storage.has_value() || (*storage)->length() == 0)
-        return false;
+void ConnectionFromClient::clear_storage_area(Web::StorageAPI::StorageAreaId area_id, String const& document_url)
+{
+    async_clear_storage_area(area_id, document_url);
+}
 
-    (*storage)->clear();
-    return true;
+void ConnectionFromClient::storage_area_changed(Web::StorageAPI::StorageAreaId area_id, Optional<Utf16String> key, Optional<Utf16String> old_value, Optional<Utf16String> new_value, String url)
+{
+    Web::StorageAPI::StorageAreaMirror::did_change(area_id, key, old_value, new_value, url);
+}
+
+void ConnectionFromClient::storage_area_write_acknowledged(Web::StorageAPI::StorageAreaId area_id)
+{
+    Web::StorageAPI::StorageAreaMirror::did_acknowledge_write(area_id);
+}
+
+void ConnectionFromClient::storage_area_write_refused(Web::StorageAPI::StorageAreaId area_id, Vector<Utf16String> keys, Vector<Utf16String> values)
+{
+    Web::StorageAPI::StorageAreaMirror::did_refuse_write(area_id, move(keys), move(values));
+}
+
+void ConnectionFromClient::storage_area_reset(Web::StorageAPI::StorageAreaId area_id, Vector<Utf16String> keys, Vector<Utf16String> values)
+{
+    Web::StorageAPI::StorageAreaMirror::did_reset(area_id, move(keys), move(values));
 }
 
 void ConnectionFromClient::inspect_dom_node(Web::PageId page_id, WebView::DOMNodeProperties::Type property_type, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element, JsonValue options_value)
@@ -3406,6 +3422,18 @@ void ConnectionFromClient::did_check_spelling(Web::PageId page_id, u64 request_i
         page->page().did_check_spelling(request_id, move(errors));
 }
 
+void ConnectionFromClient::set_writing_suggestions_available(Web::PageId page_id, bool available)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().set_writing_suggestions_available(available);
+}
+
+void ConnectionFromClient::did_get_writing_suggestion(Web::PageId page_id, u64 request_id, Optional<Web::WritingSuggestion> suggestion)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().did_get_writing_suggestion(request_id, move(suggestion));
+}
+
 void ConnectionFromClient::replace_context_menu_misspelling(Web::PageId page_id, Utf16String replacement)
 {
     if (auto page = this->page(page_id); page.has_value())
@@ -3599,6 +3627,11 @@ void ConnectionFromClient::did_worker_agent_fail_loading_script(Web::HTML::Worke
 void ConnectionFromClient::did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno)
 {
     Web::HTML::WorkerAgentParent::did_report_worker_exception(owner_token, move(message), move(filename), lineno, colno);
+}
+
+void ConnectionFromClient::did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource)
+{
+    Web::HTML::WorkerAgentParent::did_report_content_security_policy_violation(owner_token, policy_index, move(effective_directive), move(resource));
 }
 
 void ConnectionFromClient::did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token)

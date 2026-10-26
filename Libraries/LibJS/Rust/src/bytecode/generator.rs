@@ -292,6 +292,14 @@ impl FinallyContext {
     pub const FIRST_JUMP_INDEX: i32 = 3;
 }
 
+/// The kind of a disposable resource, as the hint operand of AddDisposableResource encodes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DisposableResourceKind {
+    SyncDispose = 0,
+    AsyncDispose = 1,
+}
+
 /// A break/continue target registered with a FinallyContext.
 pub struct FinallyJump {
     pub index: i32,
@@ -367,6 +375,8 @@ pub struct Generator {
     // This avoids the deep-clone issues of an owned Box parent chain.
     pub finally_contexts: Vec<FinallyContext>,
     pub current_finally_context: Option<usize>,
+    /// The [[DisposableResourceStack]] of the innermost scope that has `using` or `await using` declarations.
+    pub current_disposable_resource_stack: Option<ScopedOperand>,
 
     // --- Various counters ---
     pub next_property_lookup_cache: u32,
@@ -554,6 +564,7 @@ impl Generator {
             home_objects: Vec::new(),
             finally_contexts: Vec::new(),
             current_finally_context: None,
+            current_disposable_resource_stack: None,
             next_property_lookup_cache: 0,
             next_global_variable_cache: 0,
             next_environment_coordinate_cache: 0,
@@ -1820,6 +1831,11 @@ impl Generator {
                     });
                 }
                 BlockBoundaryType::ReturnToFinally => {
+                    debug_assert_eq!(
+                        self.current_finally_context
+                            .and_then(|index| self.finally_contexts[index].lexical_environment_at_entry.as_ref()),
+                        Some(&self.lexical_environment_register_stack[env_stack_offset - 1])
+                    );
                     return;
                 }
                 _ => {}
@@ -1847,6 +1863,29 @@ impl Generator {
         } else {
             self.emit(Instruction::Return { value: value.operand() });
         }
+    }
+
+    pub fn forward_completion_to_outer_finally(
+        &mut self,
+        outer_index: usize,
+        completion_type: &ScopedOperand,
+        completion_value: &ScopedOperand,
+    ) {
+        let outer = &self.finally_contexts[outer_index];
+        let outer_completion_type = outer.completion_type.clone();
+        let outer_completion_value = outer.completion_value.clone();
+        let outer_finally_body = outer.finally_body;
+        let outer_environment = outer.lexical_environment_at_entry.clone();
+        self.emit_mov(&outer_completion_type, completion_type);
+        self.emit_mov(&outer_completion_value, completion_value);
+        if let Some(environment) = outer_environment {
+            self.emit(Instruction::SetLexicalEnvironment {
+                environment: environment.operand(),
+            });
+        }
+        self.emit(Instruction::Jump {
+            target: outer_finally_body,
+        });
     }
 
     pub fn add_constant_i32(&mut self, val: i32) -> ScopedOperand {

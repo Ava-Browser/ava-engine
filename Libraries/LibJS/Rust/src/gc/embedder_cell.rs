@@ -19,6 +19,7 @@ use core::ptr::NonNull;
 
 use super::class::{Class, ExternalMemorySize, GcCell, MIN_CELL_SIZE, class_of};
 use super::class_id::ClassId;
+use super::defer_gc::DeferGc;
 use super::visitor::{Trace, Visitor};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, CellKind, Gc};
@@ -75,8 +76,9 @@ unsafe impl<T: Trace> Trace for EmbedderCell<T> {
 /// }
 /// ```
 ///
-/// LibGC traces the cells of the class, and destroys those whose value has a destructor. It does not finalize them,
-/// and counts memory they own outside the heap only for a class that new_with_external_memory_size() creates.
+/// LibGC traces the cells of the class, and destroys those whose value has a destructor. It finalizes them only for a
+/// class that with_finalize() gives a finalize entry, and counts memory they own outside the heap only for a class that
+/// new_with_external_memory_size() creates.
 pub struct EmbedderClass<T: 'static> {
     class: Class,
     _value: PhantomData<fn() -> T>,
@@ -98,6 +100,13 @@ impl<T: Trace + 'static> EmbedderClass<T> {
 
     pub const fn class(&'static self) -> &'static Class {
         &self.class
+    }
+
+    /// The class with a finalize entry, which LibGC calls with each dead cell of the class while every cell that dies
+    /// in the collection is still intact, before it destroys any. The entry must not allocate.
+    pub const fn with_finalize(mut self, finalize: unsafe extern "C" fn(cell: *mut c_void)) -> Self {
+        self.class.type_info.finalize = Some(finalize);
+        self
     }
 }
 
@@ -133,19 +142,15 @@ unsafe impl<T: EmbedderValue> GcCell for EmbedderCell<T> {
 }
 
 impl<T: EmbedderValue> EmbedderClass<T> {
-    /// Moves `value` into a new cell of the class, from the allocator of the class, which the first allocation for
-    /// the class creates.
-    pub fn allocate(&'static self, vm: &Vm, value: T) -> Gc<EmbedderCell<T>> {
+    /// Moves the value that `build` returns into a new cell of the class, as Heap::allocate() does.
+    pub fn allocate(&'static self, vm: &Vm, build: impl FnOnce(&DeferGc<'_>) -> T) -> Gc<EmbedderCell<T>> {
         let allocator = vm.heap().embedder_class_allocator(&self.class);
-        vm.heap().allocate_in(
-            allocator,
-            EmbedderCell {
-                header: CellHeader::for_class(&self.class),
-                value: ValueWithRoomForFreeListLink {
-                    value: ManuallyDrop::new(value),
-                },
+        vm.heap().allocate_in(allocator, |defer_gc| EmbedderCell {
+            header: CellHeader::for_class(&self.class),
+            value: ValueWithRoomForFreeListLink {
+                value: ManuallyDrop::new(build(defer_gc)),
             },
-        )
+        })
     }
 
     /// The cell behind the pointer, if it is a cell of this class.

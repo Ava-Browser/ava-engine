@@ -65,8 +65,52 @@ fn shape_glyph_data(
         glyphs: shaped.into_glyphs(),
         font,
         text_type,
+        is_upright: false,
     };
     (glyph_data, trailing_whitespace)
+}
+
+/// Whether text in the given writing mode and text orientation that starts with `code_point` is set with its glyphs
+/// upright, stacked along the vertical inline axis, rather than turned sideways like a horizontal line of text.
+/// https://drafts.csswg.org/css-writing-modes-4/#text-orientation
+pub(crate) fn text_is_set_upright(writing_mode: u8, text_orientation: u8, code_point: u32) -> bool {
+    // NB: The sideways writing modes set all text sideways, whatever its text orientation.
+    if !matches!(writing_mode, writing_mode::VERTICAL_RL | writing_mode::VERTICAL_LR) {
+        return false;
+    }
+    match text_orientation {
+        // upright: Typographic character units from horizontal-only scripts are typeset upright, i.e. in their
+        // standard horizontal orientation. Typographic character units from vertical scripts are typeset with their
+        // intrinsic orientation and shaped normally.
+        // FIXME: This value causes the used value of 'direction' to be 'ltr', and for the purposes of bidi
+        //        reordering, causes all characters to be treated as strong LTR.
+        text_orientation::UPRIGHT => true,
+        // mixed: Typographic character units from horizontal-only scripts are typeset sideways, i.e. 90° clockwise
+        // from their standard orientation in horizontal text. Typographic character units from vertical scripts are
+        // typeset with their intrinsic orientation.
+        text_orientation::MIXED => text_chunker::code_point_is_upright_in_mixed_orientation(code_point),
+        _ => false,
+    }
+}
+
+/// Sets shaped glyphs upright: each of them takes one em along the inline axis, which runs downwards in the frame of
+/// a vertical writing mode, while keeping its own horizontal width, which painting centers it within.
+// FIXME: Use the vertical metrics of the font, where it has them.
+fn set_glyphs_upright(glyph_data: &mut line_box_fragment::GlyphData, inline_offset: f32, advance: f32) {
+    let glyphs = glyph_data.glyphs.to_mut();
+    let mut pen = inline_offset;
+    let mut count = 0usize;
+    for glyph in glyphs.iter_mut() {
+        if glyph.length_in_code_units != 0 {
+            if count > 0 {
+                pen += advance;
+            }
+            count += 1;
+        }
+        glyph.x = pen;
+    }
+    glyph_data.width = advance * count as f32;
+    glyph_data.is_upright = true;
 }
 
 impl Item {
@@ -211,6 +255,7 @@ impl Item {
             font: glyph_data.font.clone(),
             text_type: glyph_data.text_type,
             width: glyph_data.width - split_x,
+            is_upright: glyph_data.is_upright,
         })
     }
 
@@ -292,6 +337,7 @@ impl Item {
             font: prefix.font.clone(),
             text_type: prefix.text_type,
             width: prefix.width - split_x,
+            is_upright: prefix.is_upright,
         };
         prefix.width = split_x;
 
@@ -683,13 +729,20 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
             && is_last_chunk
             && text_context.text.is_empty()
             && self.context().facts(text_node).produces_line_box_fragment_when_empty();
+        // INTEROP: A text control's text that ends in a preserved newline keeps the empty line after it, which gives
+        //          that line its height and the caret on it a fragment.
+        let synthesize_chunk_after_trailing_newline = chunk.is_none()
+            && text_context.next_chunk_index == chunks.len()
+            && text_context.should_respect_linebreaks
+            && chunks.last().is_some_and(|last| last.has_breaking_newline)
+            && self.context().facts(text_node).is_text_control_text();
         let chunk = if let Some(chunk) = chunk {
             chunk
-        } else if synthesize_zero_length_chunk {
-            text_context.next_chunk_index = 1;
+        } else if synthesize_zero_length_chunk || synthesize_chunk_after_trailing_newline {
+            text_context.next_chunk_index = chunks.len() + 1;
             let parent_style = self.context().style(self.context().parent_node(text_node));
             text_chunker::TextChunk {
-                start: 0,
+                start: text_context.text.len(),
                 length: 0,
                 font: parent_style.first_available_font(),
                 has_breaking_newline: false,
@@ -762,7 +815,7 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
             inline_offset = tab_stop_distance.to_double() as f32;
         }
         let shaped_text = &full_text[shaped_start..shaped_start + shaped_length];
-        let (glyphs, shaped_trailing_whitespace) = shape_glyph_data(
+        let (mut glyphs, shaped_trailing_whitespace) = shape_glyph_data(
             shaped_text,
             chunk.font.clone(),
             text_type,
@@ -770,8 +823,23 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
             style.letter_spacing().to_double() as f32,
             word_spacing.to_double() as f32,
         );
+        if !shaped_text.is_empty()
+            && text_is_set_upright(
+                style.writing_mode(),
+                style.text_orientation(),
+                text_chunker::code_point_at(shaped_text, 0),
+            )
+        {
+            // NB: The font's own size takes any font-size-adjust into account.
+            set_glyphs_upright(
+                &mut glyphs,
+                inline_offset,
+                chunk.font.facts().pixel_size + style.letter_spacing().to_double() as f32,
+            );
+        }
         let chunk_inline_size = CssPixels::nearest_value_for_f32(glyphs.width + inline_offset);
         let generated_empty = synthesize_zero_length_chunk
+            || synthesize_chunk_after_trailing_newline
             || (self.context().facts(text_node).is_generated_for_pseudo_element() && chunk.length == 0);
         let mut item = Item::new(ItemType::Text, text_node);
         item.glyphs = Some(glyphs);
@@ -921,6 +989,9 @@ fn record_entered_inline_box<'context>(
     used
 }
 
+/// The inline items a block container generated, kept for the later runs of the container in the same pass. Their
+/// glyphs are shared, so that each run that reads them copies no glyphs.
+#[derive(Clone)]
 pub(crate) struct StashedInlineItems {
     items: Vec<Item>,
     entered_box_model_nodes: Vec<Node>,
@@ -1049,7 +1120,7 @@ impl InlineLevelIterator {
         atomic_sizing: AtomicInlineSizing,
     ) -> Option<Self> {
         let callbacks = context.callbacks;
-        match callbacks.scratch().take_inline_item_stash(context.containing_block) {
+        match callbacks.scratch().inline_item_stash(context.containing_block) {
             Some(stash) => Some(Self::from_stash(context, stash)),
             None => InlineLevelIteratorGenerator::generate(context, atomic_sizing),
         }
@@ -1087,10 +1158,16 @@ impl InlineLevelIterator {
         if !self.is_independent_of_available_space(context) {
             return;
         }
+        let mut items = self.items.into_vec();
+        for glyphs in items.iter_mut().filter_map(|item| item.glyphs.as_mut()) {
+            if let libgfx_rust::text_layout::GlyphBuffer::Owned(owned) = &mut glyphs.glyphs {
+                glyphs.glyphs = libgfx_rust::text_layout::GlyphBuffer::Shared(std::mem::take(owned).into());
+            }
+        }
         context.callbacks.scratch().store_inline_item_stash(
             context.containing_block,
             StashedInlineItems {
-                items: self.items.into_vec(),
+                items,
                 entered_box_model_nodes: self.entered_box_model_nodes,
             },
         );

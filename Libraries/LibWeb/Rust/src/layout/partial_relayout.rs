@@ -171,6 +171,12 @@ impl LayoutNodeArena {
             return false;
         }
 
+        // https://drafts.csswg.org/css-anchor-position-1/#fallback-apply
+        // NB: Only a full layout pass determines the position fallback styles of a box.
+        if style.is_some_and(|style| style.anchor().position_try_fallbacks.length != 0) {
+            return false;
+        }
+
         // Only a full layout pass resolves anchor() functions in the inset properties to plain
         // values; a replay from saved inputs cannot.
         if node_facts::has_flag(data, NodeFlag::InsetsUseAnchorFunctions) {
@@ -189,7 +195,8 @@ impl LayoutNodeArena {
             formatting_context_type_created_by_node_data(
                 data,
                 style,
-                node_facts::node_is_flex_or_grid_container(parent_style)
+                node_facts::node_is_flex_or_grid_container(parent_style),
+                || parent_style.map(|style| style.writing_mode()),
             ),
             Some(
                 FormattingContextType::Block
@@ -557,6 +564,33 @@ impl LayoutNodeArena {
         {
             return None;
         }
+        // Anchor functions resolve against anchors this path does not look up.
+        let size_contains_anchor_function = |size: &crate::layout::ComputedSize| {
+            size.is_length_percentage() && size.length_percentage().contains_anchor_function()
+        };
+        let side_contains_anchor_function = |side: &crate::layout::ComputedLengthPercentageOrAuto| {
+            side.length_percentage()
+                .is_some_and(|length_percentage| length_percentage.contains_anchor_function())
+        };
+        let surround = style.surround();
+        if [
+            style.width(),
+            style.min_width(),
+            style.max_width(),
+            style.height(),
+            style.min_height(),
+            style.max_height(),
+        ]
+        .into_iter()
+        .any(size_contains_anchor_function)
+            || [&surround.inset, &surround.margin].into_iter().any(|sides| {
+                [&sides.top, &sides.right, &sides.bottom, &sides.left]
+                    .into_iter()
+                    .any(side_contains_anchor_function)
+            })
+        {
+            return None;
+        }
         // A static position depends on where the box would have been in flow.
         let inset = &style.surround().inset;
         if (inset.left.is_auto() && inset.right.is_auto()) || (inset.top.is_auto() && inset.bottom.is_auto()) {
@@ -582,7 +616,8 @@ impl LayoutNodeArena {
             formatting_context_type_created_by_node_data(
                 parent_data,
                 parent_style,
-                node_facts::node_is_flex_or_grid_container(grandparent_style)
+                node_facts::node_is_flex_or_grid_container(grandparent_style),
+                || grandparent_style.map(|style| style.writing_mode()),
             ),
             None | Some(FormattingContextType::Block | FormattingContextType::Flex)
         ) {
@@ -617,8 +652,11 @@ impl LayoutNodeArena {
                 inline_alignment: None,
                 block_alignment: None,
                 derives_from_own_computed_values: false,
+                is_position_area: false,
             },
             resolved_anchor_insets: None,
+            resolved_anchor_sizes: Default::default(),
+            position_option: Default::default(),
         })
     }
 

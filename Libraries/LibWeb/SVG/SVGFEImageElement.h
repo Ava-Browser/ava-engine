@@ -8,6 +8,7 @@
 
 #include <AK/Optional.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/SVG/SVGAnimatedPreserveAspectRatio.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGFilterPrimitiveStandardAttributes.h>
 #include <LibWeb/SVG/SVGURIReference.h>
@@ -26,17 +27,21 @@ public:
 
     GC::Ptr<HTML::DecodedImageData> image_data() const;
 
+    GC::Ref<SVGAnimatedPreserveAspectRatio> preserve_aspect_ratio_for_bindings();
+
 private:
     SVGFEImageElement(DOM::Document&, DOM::QualifiedName);
     virtual void visit_edges(Cell::Visitor&) override;
 
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
+    virtual void adopted_from(DOM::Document&) override;
 
     void process_href(Optional<Utf16String> const& href);
 
     Optional<URL::URL> m_href;
 
     GC::Ptr<HTML::SharedResourceRequest> m_resource_request;
+    GC::Ptr<SVGAnimatedPreserveAspectRatio> m_preserve_aspect_ratio;
 };
 
 };

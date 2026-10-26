@@ -32,7 +32,6 @@
 #include <LibWeb/Geometry/DOMRectReadOnly.h>
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/HTML/ImageData.h>
-#include <LibWeb/WebAssembly/Module.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/QuotaExceededError.h>
 
@@ -541,6 +540,19 @@ TEST_CASE(image_serializables_round_trip)
         auto& bitmap = unwrap_wrappable<Web::HTML::ImageBitmap>(MUST(storage_deserialize(image_bitmap_record(2, 2, 8, "BGRA8888"sv, "premultiplied"sv, { pixels.data(), pixels.size() }))));
         EXPECT_EQ(bitmap.width(), 2u);
         EXPECT_EQ(bitmap.height(), 2u);
+        EXPECT(bitmap.frame()->color_space().data().has<Empty>());
+    }
+
+    {
+        Array<u8, 16> pixels {};
+        Array<u8, 3> display_p3 { 1, 12, 13 }; // CICP, SMPTE432 primaries, sRGB transfer characteristics
+        auto& bitmap = unwrap_wrappable<Web::HTML::ImageBitmap>(MUST(storage_deserialize(image_bitmap_record(2, 2, 8, "BGRA8888"sv, "premultiplied"sv, { pixels.data(), pixels.size() }, { display_p3.data(), display_p3.size() }))));
+        EXPECT_EQ(bitmap.width(), 2u);
+        EXPECT_EQ(bitmap.height(), 2u);
+        auto const& color_space = bitmap.frame()->color_space().data();
+        EXPECT(color_space.has<Gfx::ColorSpace::CICP>());
+        EXPECT(color_space.get<Gfx::ColorSpace::CICP>().color_primaries == Media::ColorPrimaries::SMPTE432);
+        EXPECT(color_space.get<Gfx::ColorSpace::CICP>().transfer_characteristics == Media::TransferCharacteristics::SRGB);
     }
 }
 
@@ -571,16 +583,6 @@ TEST_CASE(image_data_over_a_shrunk_resizable_buffer_has_no_pixels)
     EXPECT(!image.is_detached());
     EXPECT_EQ(image.pixels(), nullptr);
     EXPECT(image.bitmap().is_error());
-}
-
-TEST_CASE(webassembly_module_decodes_from_frozen_bytes)
-{
-    auto value = MUST(principal_storage_deserialize(webassembly_module_storage_record(s_minimal_webassembly_module_bytes.span())));
-    auto module = GC::Ref { unwrap_wrappable<Web::WebAssembly::Module>(value) };
-
-    auto compiled_module = module->compiled_module();
-    EXPECT_EQ(compiled_module->module->import_count(), 0u);
-    EXPECT_EQ(compiled_module->module->export_count(), 0u);
 }
 
 TEST_CASE(crypto_key_algorithm_variants_decode_from_frozen_bytes)

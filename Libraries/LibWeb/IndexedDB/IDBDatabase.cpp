@@ -246,7 +246,10 @@ WebIDL::ExceptionOr<GC::Ref<IDBTransaction>> IDBDatabase::transaction(Variant<Ut
     // 3. Let scope be the set of unique strings in storeNames if it is a sequence, or a set containing one string equal to storeNames otherwise.
     Vector<Utf16String> scope;
     if (store_names.has<Vector<Utf16String>>()) {
-        scope = store_names.get<Vector<Utf16String>>();
+        for (auto const& store_name : store_names.get<Vector<Utf16String>>()) {
+            if (!scope.contains_slow(store_name))
+                scope.append(store_name);
+        }
     } else {
         scope.append(store_names.get<Utf16String>());
     }
@@ -272,7 +275,7 @@ WebIDL::ExceptionOr<GC::Ref<IDBTransaction>> IDBDatabase::transaction(Variant<Ut
         scope_stores.append(*store);
     }
 
-    auto transaction = IDBTransaction::create(*this, mode, options.durability, scope_stores);
+    auto transaction = IDBTransaction::create(*this, mode, options.durability, move(scope_stores));
 
     // 8. Set transaction’s cleanup event loop to the current event loop.
     transaction->set_cleanup_event_loop(HTML::main_thread_event_loop());

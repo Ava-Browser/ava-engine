@@ -36,7 +36,7 @@ static SerializedPolicyContainer serialize_request_policy_container(Fetch::Infra
             VERIFY(request.client());
             return request.client()->policy_container()->serialize();
         },
-        [](GC::Ref<PolicyContainer> policy_container) {
+        [](NonnullRefPtr<PolicyContainer const> const& policy_container) {
             return policy_container->serialize();
         });
 }
@@ -53,16 +53,15 @@ static NavigationRequestDescriptor create_navigation_request_descriptor(Fetch::I
         .redirect_count = request.redirect_count(),
         .text_directive_user_activation = request.text_directive_user_activation(),
         .browsing_context_group_has_multiple_contexts = request.browsing_context_group_has_multiple_contexts(),
+        .cache_mode = request.cache_mode(),
     };
 }
 
 static Optional<ByteBuffer> copy_body_source(Fetch::Infrastructure::Body const& body)
 {
-    return body.source().visit(
-        [](Empty) -> Optional<ByteBuffer> { return {}; },
-        [](ByteBuffer const& bytes) -> Optional<ByteBuffer> { return MUST(ByteBuffer::copy(bytes)); },
-        [](Core::ImmutableBytes const& bytes) -> Optional<ByteBuffer> { return MUST(ByteBuffer::copy(bytes.bytes())); },
-        [](GC::Ref<FileAPI::Blob> const& blob) -> Optional<ByteBuffer> { return MUST(ByteBuffer::copy(blob->raw_bytes())); });
+    if (auto const& source = body.source(); source.has_value())
+        return MUST(source->copy_to_byte_buffer());
+    return {};
 }
 
 static NavigationResponseDescriptor create_navigation_response_descriptor(Fetch::Infrastructure::Response const& response)
@@ -178,7 +177,9 @@ static NavigationParamsDescriptor create_navigation_params_descriptor(Navigation
         .about_base_url = params.about_base_url,
         .user_involvement = params.user_involvement,
         .agent_cluster_id = params.agent_cluster_id,
+        .agent_cluster_cross_origin_isolation_mode = params.agent_cluster_cross_origin_isolation_mode,
         .new_browsing_context_group_id = params.new_browsing_context_group_id,
+        .permissions_policy = params.permissions_policy,
     };
 }
 
@@ -241,6 +242,7 @@ static GC::Ptr<Fetch::Infrastructure::Request> create_navigation_request_from_de
     request->set_redirect_count(descriptor->redirect_count);
     request->set_text_directive_user_activation(descriptor->text_directive_user_activation);
     request->set_browsing_context_group_has_multiple_contexts(descriptor->browsing_context_group_has_multiple_contexts);
+    request->set_cache_mode(descriptor->cache_mode);
     return request;
 }
 
@@ -262,7 +264,7 @@ static GC::Ptr<Fetch::Infrastructure::Body> adopt_navigation_response_body(JS::R
     // populate_session_history_entry_document() decides whether to load it as a document or transfer it again.
     request->set_body_delivery_paused(true);
 
-    auto stream = realm.heap().allocate<Streams::ReadableStream>();
+    auto stream = Streams::ReadableStream::create(realm);
     auto pull_algorithm = GC::create_function(realm.heap(), [&realm]() {
         return WebIDL::create_resolved_promise(realm, JS::js_undefined());
     });
@@ -300,7 +302,7 @@ static GC::Ptr<Fetch::Infrastructure::Body> adopt_navigation_response_body(JS::R
                 return;
             }
 
-            body->set_sniff_bytes_complete();
+            body->set_sniff_bytes_failed();
             if (stream->is_readable())
                 stream->error(JS::TypeError::create(realm, "Transferred navigation response failed"_utf16));
         });
@@ -393,7 +395,9 @@ ErrorOr<NavigationParamsVariant> create_navigation_params_from_descriptor(JS::Re
         params.user_involvement);
     navigation_params->fetch_timing_info = fetch_timing_info;
     navigation_params->agent_cluster_id = params.agent_cluster_id;
+    navigation_params->agent_cluster_cross_origin_isolation_mode = params.agent_cluster_cross_origin_isolation_mode;
     navigation_params->new_browsing_context_group_id = params.new_browsing_context_group_id;
+    navigation_params->permissions_policy = move(params.permissions_policy);
     return navigation_params;
 }
 

@@ -88,6 +88,11 @@ public:
     Utf16String spelling_error_ranges(GC::Ref<DOM::Node>);
     GC::Ref<WebIDL::Promise> check_spelling_for_testing(Utf16String const& text);
     GC::Ref<WebIDL::Promise> spell_check_settled();
+
+    GC::Ref<WebIDL::Promise> request_writing_suggestion_for_testing(Utf16String const& text, WebIDL::UnsignedLong caret_offset);
+    Utf16String writing_suggestion();
+    GC::Ref<WebIDL::Promise> writing_suggestion_settled();
+    GC::Ref<WebIDL::Promise> writing_suggestion_request_sent();
     GC::Ref<WebIDL::Promise> activate_spelling_menu_item(Bindings::SpellingMenuItem, WebIDL::UnsignedLong guess_index);
 
     void send_text(HTML::HTMLElement&, Utf16String const&, WebIDL::UnsignedShort modifiers);
@@ -139,6 +144,7 @@ public:
     WebIDL::ExceptionOr<bool> dispatch_user_activated_event(DOM::EventTarget&, DOM::Event& event);
 
     void spoof_current_url(Utf16String const& url);
+    void spoof_current_origin_in_this_process(Utf16String const& url);
     void set_navigator_compatibility_mode(Bindings::InternalsNavigatorCompatibilityMode);
     void load_url(Utf16String const& url);
 
@@ -149,6 +155,7 @@ public:
     void simulate_drop(double x, double y);
 
     void expire_cookies_with_time_offset(WebIDL::LongLong seconds);
+    void clear_storage_for_testing(Utf16String const& type);
     GC::Ref<WebIDL::Promise> delete_all_cookies();
     WebIDL::ExceptionOr<bool> has_cookie_for_url(Utf16String const& url, String const& name, String const& value);
 
@@ -184,6 +191,8 @@ public:
 
     static u16 get_echo_server_port();
     static void set_echo_server_port(u16 port);
+    static u16 get_https_echo_server_port();
+    static void set_https_echo_server_port(u16 port);
 
     WebIDL::ExceptionOr<void> set_hsts_policy(Utf16String const& domain, u64 max_age, bool include_sub_domains);
     WebIDL::ExceptionOr<void> ingest_hsts_header(Utf16String const& url, Utf16String const& header_value);
@@ -216,9 +225,11 @@ public:
     Utf16String dump_session_store_tab_state();
     Utf16String dump_site_isolation_process_tree();
     bool has_populated_document(HTML::HTMLIFrameElement&);
+    bool canvas_has_unpresented_content(HTML::HTMLCanvasElement&);
     void crash_remote_frame_processes();
     void stop_loading_through_ui_process();
     void reload_through_ui_process();
+    void reload_bypassing_cache_through_ui_process();
     void traverse_history_through_ui_process(i32 delta);
     GC::Ref<WebIDL::Promise> flush_session_history_traversal_queue();
     bool html_parser_body_is_exhausted(DOM::Document&);
@@ -310,6 +321,8 @@ public:
     void disconnect_media_server();
     void set_page_muted(bool muted);
     String viewport_overflow_x();
+
+    GC::Ref<Streams::ReadableStream> create_stream_pulling_from_bytes(String const& bytes, WebIDL::UnsignedLong pull_size);
 
 private:
     GC::Ref<JS::Object> first_wheel_step_route_to_object(Compositing::FirstWheelStepRouteForTesting const&);

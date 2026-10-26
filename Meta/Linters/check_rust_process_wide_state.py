@@ -33,6 +33,7 @@ ALLOWED = {
     "Libraries/LibCompositing/Rust/src/test_stubs.rs:NEXT": "test stub for LibGfx's C++ counters, in the cargo test binary that has no C++ side",
     "Libraries/LibCompositing/Rust/src/display_list/replay.rs:WARM_REPLAY_SCRATCH_STORAGE": "per-thread replay scratch; a second copy costs memory, never an answer",
     "Libraries/LibJS/Flap/src/low_ir/lowering.rs:LABELS": "per-thread scratch buffer; a second copy costs memory, never an answer",
+    "Libraries/LibJS/JIT/Rust/src/asm/x86_64/sse.rs:FEATURES": "immutable CPU/OS feature cache; each copy computes the same supported instructions",
     "Libraries/LibWeb/HTML/Parser/Rust/src/token.rs:SPARE_ATTRIBUTE_LISTS": "per-thread allocation pool; a second copy costs memory, never an answer",
     "Libraries/LibWeb/HTML/Parser/Rust/src/token.rs:SPARE_ATTRIBUTE_VALUES": "per-thread allocation pool; a second copy costs memory, never an answer",
 }
@@ -52,9 +53,10 @@ IN_ONE_LIBRARY = {
         "a dependency of libweb_bindings_rust alone, whose archive LibWeb's library links",
     ),
     "libwasm_engine": (
-        {"libwasm_jit"},
-        "a dev-dependency of libwasm_jit alone, whose tests run compiled code against it; the engine is the one Rust "
-        "archive of LibWasm's library (Libraries/LibWasm/CMakeLists.txt)",
+        {"libwasm_jit", "libweb_bindings_rust"},
+        "a dev-dependency of libwasm_jit, whose tests run compiled code against it, and a dependency of "
+        "libweb_bindings_rust, whose archive LibWeb's library links; LibWasm's library builds the other copy, with the "
+        "C ABI, for the tools, and no process uses both (Libraries/LibWasm/CMakeLists.txt)",
     ),
 }
 
@@ -116,7 +118,7 @@ RENDER_STATE_ALLOWED = {
             "css/style/mod.rs:SELECTOR_TRUTH_DERIVATION",
             "css/style/mod.rs:STYLE_ANSWER_PATCH",
             "css/style/mod.rs:STYLE_PLAN_PROVENANCE",
-            "layout/in_flow_block_cache.rs:ENABLED",
+            "layout/run_repeatability.rs:VERIFICATION",
             "render_state/clock/hover.rs:LOGS",
         ],
     ),

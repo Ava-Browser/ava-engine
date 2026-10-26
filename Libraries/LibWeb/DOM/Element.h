@@ -71,6 +71,8 @@ enum class ScrollIntoViewContainer : u8;
 enum class ScrollLogicalPosition : u8;
 struct GetHTMLOptions;
 struct PointerLockOptions;
+struct SetHTMLOptions;
+struct SetHTMLUnsafeOptions;
 WEB_API void set_prototype_from_custom_element_definition_if_needed(DOM::Element&, JS::HostObject& wrapper);
 WEB_API JS::Value element(JS::Realm&, GC::Ref<DOM::Element>);
 WEB_API DOM::Element* element_from_value(JS::Value);
@@ -86,7 +88,9 @@ WEB_API WebIDL::ExceptionOr<TrustedTypes::TrustedHTMLOrString> inner_html(DOM::E
 WEB_API WebIDL::ExceptionOr<void> set_inner_html(DOM::Element&, TrustedTypes::TrustedHTMLOrString const&);
 WEB_API WebIDL::ExceptionOr<TrustedTypes::TrustedHTMLOrString> outer_html(DOM::Element&);
 WEB_API WebIDL::ExceptionOr<void> set_outer_html(DOM::Element&, TrustedTypes::TrustedHTMLOrString const&);
-WEB_API WebIDL::ExceptionOr<void> set_html_unsafe(DOM::Element&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const&);
+WEB_API WebIDL::ExceptionOr<void> set_html_unsafe(DOM::Element&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const&, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const&);
+WEB_API WebIDL::ExceptionOr<void> append_html_unsafe(DOM::Element&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const&, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const&);
+WEB_API WebIDL::ExceptionOr<void> prepend_html_unsafe(DOM::Element&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const&, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const&);
 WEB_API WebIDL::ExceptionOr<void> insert_adjacent_html(DOM::Element&, Utf16String const& position, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const&);
 WEB_API WebIDL::ExceptionOr<void> set_attribute(DOM::Element&, Utf16String const&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, GC::Ref<TrustedTypes::TrustedScript>, GC::Ref<TrustedTypes::TrustedScriptURL>, Utf16String> const&);
 WEB_API WebIDL::ExceptionOr<void> set_attribute_ns(DOM::Element&, Optional<Utf16FlyString> const&, Utf16FlyString const&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, GC::Ref<TrustedTypes::TrustedScript>, GC::Ref<TrustedTypes::TrustedScriptURL>, Utf16String> const&);
@@ -159,6 +163,13 @@ enum class ProximityToTheViewport : u8 {
     // - The element’s proximity to the viewport is not determined:
     NotDetermined,
 };
+
+// NB: The steps of these algorithms that follow running the reflected target's get the element, shared by the
+//     element and ElementInternals reflected targets.
+// https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#attr-associated-element
+WEB_API GC::Ptr<Element> get_the_attribute_associated_element(Element const& element, Optional<Utf16String> const& content_attribute_value, GC::Ptr<Element> explicitly_set_attribute_element);
+// https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#attr-associated-elements
+WEB_API Optional<GC::RootVector<GC::Ref<Element>>> get_the_attribute_associated_elements(Element const& element, Function<Optional<Utf16String>()> const& get_the_content_attribute, Optional<Vector<GC::Weak<Element>> const&> explicitly_set_attribute_elements);
 
 class WEB_API Element
     : public ParentNode
@@ -504,12 +515,17 @@ public:
         }
     }
 
-    GC::Ptr<CSS::CSSStyleProperties> inline_style() { return m_inline_style; }
-    GC::Ptr<CSS::CSSStyleProperties const> inline_style() const { return m_inline_style; }
+    // The CSSOM object of the element's own declarations, made on first use; null if it has none.
+    GC::Ptr<CSS::CSSStyleProperties> inline_style();
+    GC::Ptr<CSS::CSSStyleProperties const> inline_style() const;
+    // The element's own declarations, without making their CSSOM object; null if it has none.
+    CSS::Parser::ValueParserFFI::DeclarationBlock const* inline_style_declarations() const;
+    bool has_inline_style_declarations() const;
     void set_inline_style(GC::Ptr<CSS::CSSStyleProperties>);
     void prepare_for_inline_style_change();
     bool can_defer_inline_style_attribute_update() const;
     void did_update_inline_style();
+    void clone_inline_style_from(Element const&);
 
     GC::Ref<CSS::CSSStyleProperties> style();
     GC::Ref<CSS::StylePropertyMap> attribute_style_map();
@@ -517,18 +533,20 @@ public:
     CSS::StyleScope& document_or_shadow_root_style_scope();
     ElementByIdMap& document_or_shadow_root_element_by_id_map();
 
-    static WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target, Utf16View markup, HTML::ParserScriptingMode = HTML::ParserScriptingMode::Inert, HTML::FragmentFastPath = HTML::FragmentFastPath::Allow);
+    static WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target, Utf16View markup, HTML::ParserScriptingMode = HTML::ParserScriptingMode::Inert, HTML::FragmentFastPath = HTML::FragmentFastPath::Allow, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> = nullptr);
 
     [[nodiscard]] GC::Ptr<Element const> element_to_inherit_style_from(Optional<CSS::PseudoElement>) const;
 
     WebIDL::ExceptionOr<Utf16String> inner_html() const;
-    WebIDL::ExceptionOr<void> set_inner_html(Utf16View html);
+    WebIDL::ExceptionOr<void> set_inner_html(Utf16View html, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> = nullptr);
 
-    WebIDL::ExceptionOr<void> set_html_unsafe(StringView html);
+    WebIDL::ExceptionOr<void> set_html(Utf16String const& html, Bindings::SetHTMLOptions const&);
+    WebIDL::ExceptionOr<void> append_html(Utf16String const& html, Bindings::SetHTMLOptions const&);
+    WebIDL::ExceptionOr<void> prepend_html(Utf16String const& html, Bindings::SetHTMLOptions const&);
 
     WebIDL::ExceptionOr<Utf16String> get_html(HTMLSerializationOptions const&) const;
 
-    WebIDL::ExceptionOr<void> insert_adjacent_html(String const& position, StringView html);
+    WebIDL::ExceptionOr<void> insert_adjacent_html(String const& position, StringView html, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> = nullptr);
 
     enum class FullscreenRequester {
         Bindings,
@@ -560,7 +578,7 @@ public:
     bool is_picture_in_picture_element() const;
 
     WebIDL::ExceptionOr<Utf16String> outer_html() const;
-    WebIDL::ExceptionOr<void> set_outer_html(StringView html);
+    WebIDL::ExceptionOr<void> set_outer_html(StringView html, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> = nullptr);
 
     bool is_focused() const;
     bool is_the_active_element() const;
@@ -858,6 +876,11 @@ public:
 
     ProximityToTheViewport proximity_to_the_viewport() const;
     void determine_proximity_to_the_viewport(Layout::BegunRead const& read);
+
+    // https://w3c.github.io/paint-timing/#set-of-elements-with-rendered-text
+    bool is_in_set_of_elements_with_rendered_text() const { return m_is_in_set_of_elements_with_rendered_text; }
+    void append_to_set_of_elements_with_rendered_text() { m_is_in_set_of_elements_with_rendered_text = true; }
+    void remove_from_set_of_elements_with_rendered_text() { m_is_in_set_of_elements_with_rendered_text = false; }
     bool is_relevant_to_the_user();
 
     // https://drafts.csswg.org/css-contain-2/#skips-its-contents
@@ -924,6 +947,9 @@ public:
 
     void prepare_for_style_computation(Badge<CSS::StyleComputer>) { prepare_for_style_computation(); }
 
+    // Unregisters the anchor names this element registered in the tree scope `tree_root` is the root of.
+    void unregister_anchor_names_before_leaving_tree_scope(Badge<Node>, Node& tree_root);
+
 protected:
     Element(Document&, DOM::QualifiedName);
 
@@ -941,6 +967,7 @@ protected:
     virtual void prepare_for_style_computation() { }
 
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual void finalize() override;
     virtual size_t external_memory_size() const override;
 
     virtual bool id_reference_exists(Utf16View) const override;
@@ -1063,6 +1090,9 @@ private:
     OwnPtr<AttributeList> m_attributes;
     u64 m_subtree_attribute_name_filter { 0 };
     GC::Ptr<CSS::CSSStyleProperties> m_inline_style;
+    // NB: The declarations of a style attribute, until something asks for their CSSOM object, which takes them over.
+    //     At most one of the two is set.
+    CSS::Parser::ValueParserFFI::DeclarationBlock* m_inline_declarations { nullptr };
     GC::Ptr<ShadowRoot> m_shadow_root;
 
     // A consumer handle mirroring StyleEngine's authoritative style-record column. C++ consumers
@@ -1102,6 +1132,10 @@ private:
     bool m_uses_document_global_custom_element_registry : 1 { false };
     bool m_has_name : 1 { false };
     mutable bool m_style_attribute_is_dirty : 1 { false };
+    bool m_is_in_set_of_elements_with_rendered_text : 1 { false };
+    // Whether the style attribute was set while the element was not connected, so that whether Content Security
+    // Policy blocks it is decided when the element is inserted.
+    bool m_style_attribute_awaits_content_security_policy_check : 1 { false };
 
     // The child indices the element remembers, or zero for those not counted yet, and the generation of its parent's
     // child list they were counted in; zero for none.

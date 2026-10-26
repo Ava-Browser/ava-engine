@@ -14,7 +14,6 @@
 #include <LibGfx/CornerRadii.h>
 #include <LibGfx/GradientInterpolation.h>
 #include <LibGfx/Matrix4x4.h>
-#include <LibGfx/Path.h>
 #include <LibGfx/TextLayout.h>
 #include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/CSS/Enums.h>
@@ -224,7 +223,7 @@ Vector<u32> rust_owned_visual_context_node_indices(Layout::Node const& layout_no
     auto slot = committed_row_slot(layout_node);
     indices.resize(Layout::RustFFI::render_state_paintable_visual_context_node_count(host, slot, list));
     if (!indices.is_empty())
-        Layout::RustFFI::render_state_paintable_visual_context_copy_node_indices(host, slot, list, indices.data(), indices.size());
+        Layout::RustFFI::render_state_paintable_visual_context_copy_node_indices(host, slot, list, indices.span());
     return indices;
 }
 
@@ -630,8 +629,7 @@ Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRe
     }
     inputs.caret = resolve_document_caret_paint(read, document);
     inputs.focused_text_control = resolve_focused_text_control_selection(read, document);
-    Vector<u8> focused_area_path_bytes;
-    inputs.focused_area_outline = resolve_focused_area_outline(read, document, focused_area_path_bytes);
+    inputs.focused_area_outline = resolve_focused_area_outline(read, document);
     {
         auto color_scheme = document.canvas_color_scheme(read);
         bool opaque_canvas = false;

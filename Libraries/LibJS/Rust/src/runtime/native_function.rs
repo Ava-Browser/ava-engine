@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::{Cell, OnceCell};
+use core::cell::Cell;
 use core::ops::Deref;
 use core::ptr::NonNull;
 
@@ -238,6 +238,13 @@ impl NativeFunction {
         )
     }
 
+    /// The captures of the object, if it is a native function that create() or create_with_name() made with captures
+    /// of type C, which tell such a function from all others, as an internal slot of its own would.
+    pub fn captures_if<C: 'static>(object: &Object) -> Option<&C> {
+        let function = crate::gc::class::downcast_ref::<Object, CapturingNativeFunction>(object)?;
+        function.native_function.captures().downcast_ref::<C>()
+    }
+
     pub fn as_native_function_gc(&self) -> Gc<NativeFunction> {
         Gc::from_ref(self)
     }
@@ -450,6 +457,9 @@ impl FunctionObject {
 /// The behaviour of a native function that captures state, which a CapturingNativeFunction calls.
 pub trait NativeFunctionBehaviour: Trace + 'static {
     fn call(&self, vm: &Vm) -> ThrowCompletionOr<Value>;
+
+    /// The state the behaviour captures.
+    fn captures(&self) -> &dyn core::any::Any;
 }
 
 /// A behaviour together with the state it captures. The behaviour is zero-sized, so the captures are all the state
@@ -474,6 +484,10 @@ where
     fn call(&self, vm: &Vm) -> ThrowCompletionOr<Value> {
         (self.behaviour)(vm, &self.captures)
     }
+
+    fn captures(&self) -> &dyn core::any::Any {
+        &self.captures
+    }
 }
 
 /// A native function whose behaviour captures state.
@@ -481,7 +495,7 @@ where
 #[derive(Trace)]
 struct CapturingNativeFunction {
     base: NativeFunction,
-    native_function: OnceCell<Box<dyn NativeFunctionBehaviour>>,
+    native_function: Box<dyn NativeFunctionBehaviour>,
 }
 
 static CAPTURING_NATIVE_FUNCTION_VIRTUAL_METHODS: NativeFunctionMethods = NativeFunctionMethods {
@@ -513,19 +527,10 @@ impl CapturingNativeFunction {
                 "a native function captures its state through its captures, not its behaviour"
             );
         };
-        let function = allocate_object(
-            vm,
-            CapturingNativeFunction {
-                base,
-                native_function: OnceCell::new(),
-            },
-        );
-        // The captures stay on the stack, where the collector finds them, until the function that keeps them alive
-        // exists. Nothing allocates from the heap between allocating the function and storing them in it.
-        let behaviour: Box<dyn NativeFunctionBehaviour> = Box::new(CapturingBehaviour { captures, behaviour });
-        if function.native_function.set(behaviour).is_err() {
-            unreachable!("the behaviour is stored once");
-        }
+        let function = allocate_object(vm, |_| CapturingNativeFunction {
+            base,
+            native_function: Box::new(CapturingBehaviour { captures, behaviour }),
+        });
         function.upcast()
     }
 
@@ -533,11 +538,7 @@ impl CapturingNativeFunction {
         let function: &CapturingNativeFunction = cast_ref(function);
         // NB: The behaviour is borrowed for the whole call. That is sound: the function is the [[Function]] of the
         //     running execution context, which keeps it and its behaviour alive, and the behaviour is never replaced.
-        function
-            .native_function
-            .get()
-            .expect("a capturing native function has its behaviour")
-            .call(vm)
+        function.native_function.call(vm)
     }
 }
 
@@ -602,8 +603,8 @@ impl RawNativeFunctionResult {
 
     pub fn into_completion(self) -> ThrowCompletionOr<Value> {
         match self.variant {
-            0 => Ok(Value(self.payload)),
-            1 => Err(Throw::new(Value(self.payload))),
+            0 => Ok(Value::from_bits(self.payload)),
+            1 => Err(Throw::new(Value::from_bits(self.payload))),
             variant => unreachable!("{variant} is not a ThrowCompletionOr variant"),
         }
     }
@@ -754,10 +755,9 @@ impl RawNativeFunction {
         let realm = realm.unwrap_or_else(|| vm.current_realm().expect("there is a current realm"));
 
         let prototype = realm.function_prototype();
-        let function = allocate_object(
-            vm,
-            Self::new_with_realm(vm, Self::CLASS, behaviour, Some(prototype), realm, builtin),
-        );
+        let function = allocate_object(vm, |_| {
+            Self::new_with_realm(vm, Self::CLASS, behaviour, Some(prototype), realm, builtin)
+        });
         function.unsafe_set_shape(realm.native_function_shape());
         function.initialize_direct(realm.native_function_length_offset(), Value::from_i32(length));
         let function_name = function.make_function_name(vm, &ClassElementName::PropertyKey(name.clone()), prefix);
@@ -771,10 +771,9 @@ impl RawNativeFunction {
         name: &Utf16FlyString,
         function: RawNativeFunctionPointer,
     ) -> Gc<RawNativeFunction> {
-        allocate_object(
-            vm,
-            Self::new_with_name(vm, Self::CLASS, name.clone(), function, realm.function_prototype()),
-        )
+        allocate_object(vm, |_| {
+            Self::new_with_name(vm, Self::CLASS, name.clone(), function, realm.function_prototype())
+        })
     }
 
     fn call(function: &NativeFunction, vm: &Vm) -> ThrowCompletionOr<Value> {
@@ -832,10 +831,9 @@ impl DirectGetterFunction {
         configuration: DirectGetterConfiguration,
         prefix: Option<&str>,
     ) -> Gc<DirectGetterFunction> {
-        let function = allocate_object(
-            vm,
-            Self::new(vm, behaviour, realm.function_prototype(), realm, configuration),
-        );
+        let function = allocate_object(vm, |_| {
+            Self::new(vm, behaviour, realm.function_prototype(), realm, configuration)
+        });
         function.unsafe_set_shape(realm.native_function_shape());
         function.initialize_direct(realm.native_function_length_offset(), Value::from_i32(length));
         let function_name = function.make_function_name(vm, &ClassElementName::PropertyKey(name.clone()), prefix);

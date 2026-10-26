@@ -9,7 +9,9 @@
 
 use super::canvas_2d::{Compositing, Paint, Stroke, TapeWriter};
 use super::commands::*;
-use libgfx_rust::{AffineTransform, Color, FloatPoint, FloatRect, IntRect, IntSize, ScalingMode, WindingRule};
+use libgfx_rust::{
+    AffineTransform, Color, FloatPoint, FloatRect, IntPoint, IntRect, IntSize, ScalingMode, WindingRule,
+};
 
 /// The number of commands that the shared stream carries to the Compositor at most in one batch. A batch holds the
 /// image frames of its commands, each a bitmap that an IPC attachment carries, so it has to stay small.
@@ -23,6 +25,18 @@ pub enum AlphaType {
     Unpremultiplied,
 }
 
+/// The color space that the pixels of a context, and the colors of its commands, are in: the values of
+/// Web::Bindings::PredefinedColorSpace, https://html.spec.whatwg.org/multipage/canvas.html#predefinedcolorspace
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ColorSpace {
+    #[default]
+    Srgb,
+    SrgbLinear,
+    DisplayP3,
+    DisplayP3Linear,
+}
+
 /// The context of a canvas in the Compositor, and the stream that the commands of every canvas of WebContent share.
 /// In the product that is a RemoteCanvas2DTransport of LibWeb.
 pub trait Transport {
@@ -34,7 +48,7 @@ pub trait Transport {
     type VideoFrameHold: ?Sized;
     type Bitmap;
 
-    fn create_context(&self, size: IntSize, alpha: bool) -> bool;
+    fn create_context(&self, size: IntSize, alpha: bool, will_read_frequently: bool, color_space: ColorSpace) -> bool;
     fn canvas_id(&self) -> Option<CanvasId>;
     fn destroy_context(&self);
 
@@ -49,8 +63,8 @@ pub trait Transport {
     fn pending_command_count(&self) -> usize;
     fn flush(&self);
 
-    /// Unpremultiplied pixels come back as RGBA8888, premultiplied pixels as BGRA8888.
-    fn read_back_pixels(&self, rect: IntRect, alpha_type: AlphaType) -> Option<Self::Bitmap>;
+    /// Unpremultiplied pixels come back as RGBA8888, premultiplied pixels as BGRA8888, in the color space.
+    fn read_back_pixels(&self, rect: IntRect, alpha_type: AlphaType, color_space: ColorSpace) -> Option<Self::Bitmap>;
 }
 
 pub struct Recorder<T: Transport> {
@@ -66,8 +80,15 @@ impl<T: Transport> Recorder<T> {
         }
     }
 
-    pub fn create_context(&self, size: IntSize, alpha: bool) -> bool {
-        self.transport.create_context(size, alpha)
+    pub fn create_context(
+        &self,
+        size: IntSize,
+        alpha: bool,
+        will_read_frequently: bool,
+        color_space: ColorSpace,
+    ) -> bool {
+        self.transport
+            .create_context(size, alpha, will_read_frequently, color_space)
     }
 
     pub fn canvas_id(&self) -> Option<CanvasId> {
@@ -82,8 +103,8 @@ impl<T: Transport> Recorder<T> {
         self.transport.flush();
     }
 
-    pub fn read_back_pixels(&self, rect: IntRect, alpha_type: AlphaType) -> Option<T::Bitmap> {
-        self.transport.read_back_pixels(rect, alpha_type)
+    pub fn read_back_pixels(&self, rect: IntRect, alpha_type: AlphaType, color_space: ColorSpace) -> Option<T::Bitmap> {
+        self.transport.read_back_pixels(rect, alpha_type, color_space)
     }
 
     /// Makes what the canvas has drawn so far the content that the page shows.
@@ -111,27 +132,13 @@ impl<T: Transport> Recorder<T> {
     }
 
     /// `path` is a serialized Gfx::Path.
-    pub fn fill_path(
-        &mut self,
-        path: &[u8],
-        paint: &Paint,
-        winding_rule: WindingRule,
-        blur_radius: f32,
-        compositing: &Compositing,
-    ) {
-        self.record(|tape| tape.fill_path(path, paint, winding_rule, blur_radius, compositing));
+    pub fn fill_path(&mut self, path: &[u8], paint: &Paint, winding_rule: WindingRule, compositing: &Compositing) {
+        self.record(|tape| tape.fill_path(path, paint, winding_rule, compositing));
     }
 
     /// `path` is a serialized Gfx::Path.
-    pub fn stroke_path(
-        &mut self,
-        path: &[u8],
-        paint: &Paint,
-        stroke: &Stroke,
-        blur_radius: f32,
-        compositing: &Compositing,
-    ) {
-        self.record(|tape| tape.stroke_path(path, paint, stroke, blur_radius, compositing));
+    pub fn stroke_path(&mut self, path: &[u8], paint: &Paint, stroke: &Stroke, compositing: &Compositing) {
+        self.record(|tape| tape.stroke_path(path, paint, stroke, compositing));
     }
 
     pub fn draw_glyph_run(
@@ -154,7 +161,7 @@ impl<T: Transport> Recorder<T> {
         &mut self,
         frame: &T::ImageFrame,
         dst_rect: FloatRect,
-        src_rect: IntRect,
+        src_rect: FloatRect,
         scaling_mode: ScalingMode,
         compositing: &Compositing,
     ) {
@@ -162,11 +169,17 @@ impl<T: Transport> Recorder<T> {
         self.record(|tape| tape.draw_image_frame(frame_id, dst_rect, src_rect, scaling_mode, compositing));
     }
 
+    /// Sets the pixels of the canvas at the position to those of the frame, as putImageData() does.
+    pub fn put_image_frame(&mut self, frame: &T::ImageFrame, position: IntPoint) {
+        let frame_id = self.transport.add_image_frame(frame);
+        self.record(|tape| tape.put_image_frame(frame_id, position));
+    }
+
     pub fn draw_canvas(
         &mut self,
         source_canvas_id: CanvasId,
         dst_rect: FloatRect,
-        src_rect: IntRect,
+        src_rect: FloatRect,
         scaling_mode: ScalingMode,
         compositing: &Compositing,
     ) {
@@ -184,7 +197,7 @@ impl<T: Transport> Recorder<T> {
         video_sink_handle: u64,
         generation: u64,
         dst_rect: FloatRect,
-        src_rect: IntRect,
+        src_rect: FloatRect,
         scaling_mode: ScalingMode,
         compositing: &Compositing,
     ) {
@@ -259,7 +272,13 @@ mod tests {
         type VideoFrameHold = u32;
         type Bitmap = IntRect;
 
-        fn create_context(&self, size: IntSize, _alpha: bool) -> bool {
+        fn create_context(
+            &self,
+            size: IntSize,
+            _alpha: bool,
+            _will_read_frequently: bool,
+            _color_space: ColorSpace,
+        ) -> bool {
             size.width > 0 && size.height > 0
         }
 
@@ -306,7 +325,7 @@ mod tests {
             self.pending_command_count.set(0);
         }
 
-        fn read_back_pixels(&self, rect: IntRect, _alpha_type: AlphaType) -> Option<IntRect> {
+        fn read_back_pixels(&self, rect: IntRect, _alpha_type: AlphaType, _color_space: ColorSpace) -> Option<IntRect> {
             Some(rect)
         }
     }
@@ -346,7 +365,7 @@ mod tests {
     fn an_image_and_a_video_frame_travel_beside_the_records_that_draw_them() {
         let mut recorder = Recorder::new(FakeTransport::default());
         let dst_rect = FloatRect::new(0.0, 0.0, 8.0, 8.0);
-        let src_rect = IntRect::new(0, 0, 4, 4);
+        let src_rect = FloatRect::new(0.0, 0.0, 4.0, 4.0);
         recorder.draw_image_frame(
             &9,
             dst_rect,
@@ -398,12 +417,15 @@ mod tests {
     #[test]
     fn the_calls_of_the_context_reach_the_transport() {
         let recorder = Recorder::new(FakeTransport::default());
-        assert!(recorder.create_context(IntSize { width: 2, height: 2 }, true));
+        assert!(recorder.create_context(IntSize { width: 2, height: 2 }, true, false, ColorSpace::Srgb));
         assert_eq!(recorder.canvas_id(), Some(CanvasId(5)));
         recorder.present();
         recorder.flush();
         let rect = IntRect::new(1, 1, 1, 1);
-        assert_eq!(recorder.read_back_pixels(rect, AlphaType::Premultiplied), Some(rect));
+        assert_eq!(
+            recorder.read_back_pixels(rect, AlphaType::Premultiplied, ColorSpace::Srgb),
+            Some(rect)
+        );
         recorder.destroy_context();
         assert_eq!(*recorder.transport.events.borrow(), [Event::Present, Event::Flush]);
     }

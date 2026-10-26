@@ -496,14 +496,14 @@ pub unsafe extern "C" fn js_array_buffer_data(buffer: *mut JSObject, out_byte_le
 pub unsafe extern "C" fn js_array_buffer_detach(vm: *mut JSVM, buffer: *mut JSObject, key: JSValue) -> JSCompletion {
     // SAFETY: The caller passes a live VM and buffer.
     let (vm, buffer) = unsafe { (vm_from_abi(vm), array_buffer_from_abi(buffer)) };
-    completion_into_abi(detach_array_buffer(vm, buffer, Some(Value(key))))
+    completion_into_abi(detach_array_buffer(vm, buffer, Some(Value::from_bits(key))))
 }
 
 /// ArrayBuffer::detach_and_take_data_block(): detaches `buffer`, as DetachArrayBuffer(buffer) does, and describes the
 /// storage of the data block it had in `out`, which the caller takes over. The caller owns the storage of a block of
 /// kind JS_ARRAY_BUFFER_STORAGE_OWNED, and frees it with gc_primitive_storage_free() or gives it to
-/// js_array_buffer_create_adopting_storage(), and keeps the owner of JS_ARRAY_BUFFER_STORAGE_EXTERNAL storage alive
-/// itself. Throws a TypeError, and leaves the buffer as it was, if the buffer has a detach key. Main thread only.
+/// js_array_buffer_create_adopting_storage(). Throws a TypeError, and leaves the buffer as it was, if the buffer has a
+/// detach key. Main thread only.
 ///
 /// # Safety
 ///
@@ -534,16 +534,7 @@ pub unsafe extern "C" fn js_array_buffer_detach_and_take_storage(
                 storage.kind = JS_ARRAY_BUFFER_STORAGE_OWNED;
                 storage.handle = owned.into_handle();
             }
-            DataBlockStorage::External(external) => {
-                storage.kind = JS_ARRAY_BUFFER_STORAGE_EXTERNAL;
-                storage.handle = external.handle();
-                storage.external = JSExternalPrimitiveStorage {
-                    owner: external.owner().as_ptr(),
-                    handle: external.handle(),
-                    fixed_byte_length: external.fixed_byte_length().unwrap_or(0),
-                    has_fixed_byte_length: external.fixed_byte_length().is_some(),
-                };
-            }
+            DataBlockStorage::External(_) => unreachable!("external storage is copied when it is taken"),
             DataBlockStorage::Shared(_) => unreachable!("a SharedArrayBuffer is never detached"),
         }
         storage
@@ -613,7 +604,7 @@ pub unsafe extern "C" fn js_array_buffer_detach_key(buffer: *mut JSObject) -> JS
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn js_array_buffer_set_detach_key(buffer: *mut JSObject, key: JSValue) {
     // SAFETY: The caller passes a live buffer.
-    unsafe { array_buffer_from_abi(buffer) }.set_detach_key(Value(key));
+    unsafe { array_buffer_from_abi(buffer) }.set_detach_key(Value::from_bits(key));
 }
 
 /// DataView::create(): a view of `buffer` from `byte_offset` on, of `byte_length` bytes, or of the rest of a resizable

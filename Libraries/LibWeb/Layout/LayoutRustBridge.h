@@ -37,6 +37,7 @@ WEB_API void register_layout_host(NodeArena&, DOM::Document&);
 // identity. An element's attributes are layout input that no pass can change, so the document publishes them as
 // they are written rather than answering for them while a pass runs.
 void publish_svg_attribute_facts(DOM::Element&);
+void publish_math_attribute_facts(DOM::Element const&);
 void publish_svg_style_references(DOM::Element&);
 
 // Which shape an SVG geometry element draws, and the endpoints a <line> parses. The other fields keep their defaults.
@@ -59,6 +60,10 @@ void publish_element_scroll_offset(DOM::Element const&);
 // Publishes the spans a table cell's or table column's attributes give it, under its identity, which table fixup reads
 // before the build that stamps the element's row is over. Every other element spans one of each and publishes nothing.
 void publish_table_spans(DOM::Element const&);
+
+// Publishes the writing suggestion showing after the caret, at offset in text, or that none shows when text is null.
+// The tree build splits the text's box around it.
+void publish_writing_suggestion(DOM::Document&, DOM::Text const* text, size_t offset, Utf16View remainder);
 
 inline RustFFI::FfiSvgNumberPercentage to_ffi_number_percentage(SVG::NumberPercentage value)
 {

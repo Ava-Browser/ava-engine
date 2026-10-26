@@ -27,7 +27,7 @@ pub(crate) enum DOMStringOrCanvasGradientOrCanvasPattern {
 impl From<FillOrStrokeStyle> for DOMStringOrCanvasGradientOrCanvasPattern {
     fn from(style: FillOrStrokeStyle) -> Self {
         match style {
-            FillOrStrokeStyle::Color(color) => Self::DOMString(serialize_color(color)),
+            FillOrStrokeStyle::Color(color) => Self::DOMString(serialize_color(color.srgb)),
             FillOrStrokeStyle::Gradient(gradient) => Self::CanvasGradient(gradient),
             FillOrStrokeStyle::Pattern(pattern) => Self::CanvasPattern(pattern),
         }
@@ -43,7 +43,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
     /// https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-strokestyle
     pub(crate) fn set_stroke_style(
         &self,
-        _: &mut CallContext,
+        cx: &mut CallContext,
         style: DOMStringOrCanvasGradientOrCanvasPattern,
     ) -> WebIdlResult<()> {
         let style = match style {
@@ -58,7 +58,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
                 };
 
                 // 4. Set this's stroke style to parsedValue.
-                self.drawing_state_mut().stroke_style = FillOrStrokeStyle::Color(parsed_value);
+                self.drawing_state_mut(cx.vm()).stroke_style = FillOrStrokeStyle::Color(parsed_value);
 
                 // 5. Return.
                 return Ok(());
@@ -75,7 +75,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
         };
 
         // 3. Set this's stroke style to the given value.
-        self.drawing_state_mut().stroke_style = style;
+        self.drawing_state_mut(cx.vm()).stroke_style = style;
         Ok(())
     }
 
@@ -87,7 +87,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
     /// https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fillstyle
     pub(crate) fn set_fill_style(
         &self,
-        _: &mut CallContext,
+        cx: &mut CallContext,
         style: DOMStringOrCanvasGradientOrCanvasPattern,
     ) -> WebIdlResult<()> {
         let style = match style {
@@ -102,7 +102,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
                 };
 
                 // 4. Set this's fill style to parsedValue.
-                self.drawing_state_mut().fill_style = FillOrStrokeStyle::Color(parsed_value);
+                self.drawing_state_mut(cx.vm()).fill_style = FillOrStrokeStyle::Color(parsed_value);
 
                 // 5. Return.
                 return Ok(());
@@ -119,7 +119,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
         };
 
         // 3. Set this's fill style to the given value.
-        self.drawing_state_mut().fill_style = style;
+        self.drawing_state_mut(cx.vm()).fill_style = style;
         Ok(())
     }
 
@@ -179,6 +179,6 @@ impl<K: CanvasKind> RenderingContext2D<K> {
         image: CanvasImageSource,
         repetition: Utf16String,
     ) -> WebIdlResult<Option<Ref<CanvasPattern>>> {
-        CanvasPattern::create_for_image(cx.vm(), &image, &repetition)
+        CanvasPattern::create_for_image(cx.vm(), &image, &repetition, self.context_attributes.color_space.into())
     }
 }

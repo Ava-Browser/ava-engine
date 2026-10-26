@@ -25,19 +25,17 @@ TextNode::TextNode(DOM::Document& document, BindToPreparedArenaSlot bind, Compos
 
 TextNode::~TextNode() = default;
 
-// The build stamped the row with its characters, which this layout node shares.
 GeneratedTextNode::GeneratedTextNode(DOM::Document& document, BindToPreparedArenaSlot bind, Compositing::RustFFI::NodeSlotId slot, RustFFI::NodeKind kind)
     : TextNode(document, bind, slot, kind)
-    , m_text(Utf16String::adopt_raw(RustFFI::layout_row_generated_text(document_host(), slot)))
 {
 }
 
 GeneratedTextNode::~GeneratedTextNode() = default;
 
-Utf16String TextNode::rendered_text_for_dom(bool collapse_whitespace) const
+Utf16String TextNode::rendered_text_for_dom() const
 {
     Utf16String text;
-    RustFFI::layout_script_rendered_text(document_host(), slot_id(this), collapse_whitespace, &text,
+    RustFFI::layout_script_rendered_text(document_host(), slot_id(this), &text,
         [](void* context, RustFFI::FfiRenderedTextView view) {
             *static_cast<Utf16String*>(context) = Utf16String::from_utf16({ reinterpret_cast<char16_t const*>(view.text), view.length_in_code_units });
         });

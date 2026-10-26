@@ -72,7 +72,6 @@ def define_the_pair_iterable_declaration(
     if interface.iterable is None or interface.iterable.key_type is None:
         return
 
-    includes.add("LibJS/Runtime/ArrayPrototype.h")
     out.write(
         """    object.define_native_function(realm, vm.names.entries, entries, 0, default_attributes);
     object.define_native_function(realm, vm.names.forEach, for_each, 1, default_attributes);
@@ -121,6 +120,9 @@ def define_the_maplike_declaration(
 """
     )
     if not interface.maplike.readonly:
+        operation_callbacks = operation_callback_names(interface)
+        if "set" not in operation_callbacks:
+            out.write("    object.define_native_function(realm, vm.names.set, set, 2, default_attributes);\n")
         out.write(
             """    object.define_native_function(realm, vm.names.delete_, delete_, 1, default_attributes);
     object.define_native_function(realm, vm.names.clear, clear, 0, default_attributes);
@@ -267,7 +269,6 @@ def write_iterator_prototype_implementation(
 
     includes.add("LibJS/Runtime/Error.h")
     includes.add("LibJS/Runtime/HostObject.h")
-    includes.add("LibJS/Runtime/IteratorPrototype.h")
     includes.add("LibJS/Runtime/PrimitiveString.h")
     includes.add("LibJS/Runtime/ValueInlines.h")
     includes.add("LibWeb/WebIDL/ExceptionOrUtils.h")
@@ -359,7 +360,6 @@ def write_async_iterator_prototype_implementation(
         return
 
     includes.add("AK/StringView.h")
-    includes.add("LibJS/Runtime/AsyncIteratorPrototype.h")
     includes.add("LibJS/Runtime/PrimitiveString.h")
     includes.add("LibWeb/WebIDL/ExceptionOrUtils.h")
     includes.add("LibWeb/WebIDL/AsyncIterator.h")
@@ -616,7 +616,7 @@ JS_DEFINE_NATIVE_FUNCTION({interface.prototype_class}::set)
     {type_check_idl_value(interface.maplike.value_type, "value", includes, context, interface.name)}
 
     // 9. Set map[key] to value.
-    TRY(WebIDL::throw_dom_exception_if_needed(vm, this_object_realm, [&] {{ return set(this_object_realm, *this_impl, key.to_string(), value); }}));
+    TRY(WebIDL::throw_dom_exception_if_needed(vm, this_object_realm, [&] {{ return Web::Bindings::set(this_object_realm, *this_impl, key, value); }}));
 
     // 10. Return O.
     return vm.this_value();

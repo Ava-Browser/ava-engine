@@ -7,7 +7,7 @@
 //! https://registry.khronos.org/webgl/specs/latest/1.0/#5.14
 
 use ak::Utf16String;
-use libjs_rust::api::{Gc, Object, Trace};
+use libjs_rust::api::{Gc, MarkedVec, Object, Trace};
 
 use super::buffer_kind::BufferKind;
 use super::buffer_source::copy_of_first_numbers;
@@ -41,6 +41,7 @@ use super::web_gl_texture::WebGLTexture;
 use super::web_gl_uniform_location::WebGLUniformLocation;
 use crate::bindings::conversions::CppInterface;
 use crate::bindings::interface::Ref;
+use crate::bindings::promise::WebIdlPromise;
 use crate::bindings::{CallContext, WebIdlResult};
 
 /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#WEBGLCONTEXTATTRIBUTES
@@ -682,7 +683,7 @@ impl<V: Version> RenderingContext<V> {
 
     pub(crate) fn framebuffer_renderbuffer(
         &self,
-        _: &mut CallContext,
+        cx: &mut CallContext,
         target: u32,
         attachment: u32,
         renderbuffertarget: u32,
@@ -717,13 +718,13 @@ impl<V: Version> RenderingContext<V> {
         }
         self.proxy
             .framebuffer_renderbuffer(target, attachment, renderbuffertarget, renderbuffer_handle);
-        bound_framebuffer.set_renderbuffer_attachment(attachment, renderbuffer);
+        bound_framebuffer.set_renderbuffer_attachment(cx.vm(), attachment, renderbuffer);
         Ok(())
     }
 
     pub(crate) fn framebuffer_texture2d(
         &self,
-        _: &mut CallContext,
+        cx: &mut CallContext,
         target: u32,
         attachment: u32,
         textarget: u32,
@@ -764,7 +765,7 @@ impl<V: Version> RenderingContext<V> {
         }
         self.proxy
             .framebuffer_texture2d(target, attachment, textarget, texture_handle, level);
-        bound_framebuffer.set_texture_attachment(attachment, texture, textarget, level);
+        bound_framebuffer.set_texture_attachment(cx.vm(), attachment, texture, textarget, level);
         Ok(())
     }
 
@@ -822,20 +823,26 @@ impl<V: Version> RenderingContext<V> {
         )))
     }
 
-    pub(crate) fn get_attached_shaders(
+    pub(crate) fn get_attached_shaders<'vm>(
         &self,
-        _: &mut CallContext,
+        cx: &mut CallContext<'vm>,
         program: Ref<WebGLProgram>,
-    ) -> WebIdlResult<Option<Vec<Ref<WebGLShader>>>> {
+    ) -> WebIdlResult<Option<MarkedVec<'vm, Ref<WebGLShader>>>> {
         if self.handle_of(program).is_none() {
             return Ok(None);
         }
 
-        let attached_shaders = [
+        let attached_shaders = MarkedVec::with_capacity(cx.vm(), 2);
+        for shader in [
             program.attached_vertex_shader.get(),
             program.attached_fragment_shader.get(),
-        ];
-        Ok(Some(attached_shaders.into_iter().flatten().collect()))
+        ]
+        .into_iter()
+        .flatten()
+        {
+            attached_shaders.push(shader);
+        }
+        Ok(Some(attached_shaders))
     }
 
     pub(crate) fn get_attrib_location(
@@ -850,7 +857,7 @@ impl<V: Version> RenderingContext<V> {
         Ok(self.proxy.get_attrib_location(program_handle, &utf8_bytes(&name)))
     }
 
-    pub(crate) fn make_xr_compatible(&self, _: &mut CallContext) -> WebIdlResult<Gc<Object>> {
+    pub(crate) fn make_xr_compatible(&self, _: &mut CallContext) -> WebIdlResult<WebIdlPromise> {
         // SAFETY: The cell is that of this context.
         Ok(unsafe { super::canvas::make_xr_compatible(self.context_ref().cell()) })
     }

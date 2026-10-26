@@ -273,6 +273,7 @@ fn property_uses_special_keyword_parser(property: u16) -> bool {
             | property_id::ROTATE
             | property_id::SCALE
             | property_id::TEXT_DECORATION_LINE
+            | property_id::TEXT_EMPHASIS_POSITION
             | property_id::TEXT_INDENT
             | property_id::TEXT_SHADOW
             | property_id::TEXT_UNDERLINE_POSITION
@@ -281,6 +282,7 @@ fn property_uses_special_keyword_parser(property: u16) -> bool {
             | property_id::TRANSFORM_ORIGIN
             | property_id::TRANSITION_PROPERTY
             | property_id::TRANSLATE
+            | property_id::VIEW_TRANSITION_CLASS
             | property_id::WHITE_SPACE
             | property_id::WHITE_SPACE_TRIM
             | property_id::WILL_CHANGE
@@ -1929,6 +1931,37 @@ fn parse_text_indent_property(context: &ParseContext, property: u16, values: &[C
     }))
 }
 
+// https://drafts.csswg.org/css-text-decor-4/#text-emphasis-position-property
+// [ over | under ] && [ right | left ]?
+fn parse_text_emphasis_position_property(values: &[ComponentValue]) -> ParseOutcome {
+    let Some(keywords) = keyword_sequence(values) else {
+        return ParseOutcome::Invalid;
+    };
+    let mut horizontal = None;
+    let mut vertical = None;
+    for keyword in keywords {
+        match keyword {
+            keyword::OVER | keyword::UNDER if horizontal.is_none() => horizontal = Some(keyword),
+            keyword::LEFT | keyword::RIGHT if vertical.is_none() => vertical = Some(keyword),
+            _ => return ParseOutcome::Invalid,
+        }
+    }
+    let Some(horizontal) = horizontal else {
+        return ParseOutcome::Invalid;
+    };
+    // If [ right | left ] is omitted, it defaults to right.
+    let horizontal = StyleValueData::Keyword { keyword: horizontal };
+    let position = match vertical {
+        Some(vertical) => value_list(
+            vec![horizontal, StyleValueData::Keyword { keyword: vertical }],
+            0,
+            false,
+        ),
+        None => horizontal,
+    };
+    ParseOutcome::Parsed(shared_style_value(position))
+}
+
 fn parse_text_underline_position_property(values: &[ComponentValue]) -> ParseOutcome {
     let Some(keywords) = keyword_sequence(values) else {
         return ParseOutcome::Invalid;
@@ -2766,6 +2799,23 @@ fn parse_comma_separated_dashed_ident_list(
     Some(value_list(values, 1, true))
 }
 
+fn parse_custom_ident_list(
+    context: &ParseContext,
+    values: &[ComponentValue],
+    blacklist: &[&str],
+) -> Option<StyleValueData> {
+    let names = values
+        .iter()
+        .filter(|value| !value.is_whitespace())
+        .map(|value| parse_custom_ident_value(context, value, blacklist))
+        .collect::<Option<Vec<_>>>()?;
+    match names.as_slice() {
+        [] => None,
+        [_] => names.into_iter().next(),
+        _ => Some(value_list(names, 0, false)),
+    }
+}
+
 fn parse_special_text_property(context: &ParseContext, property: u16, values: &[ComponentValue]) -> ParseOutcome {
     if !matches!(
         property,
@@ -2776,6 +2826,7 @@ fn parse_special_text_property(context: &ParseContext, property: u16, values: &[
             | property_id::POSITION_ANCHOR
             | property_id::TIMELINE_SCOPE
             | property_id::TRANSITION_PROPERTY
+            | property_id::VIEW_TRANSITION_CLASS
             | property_id::WILL_CHANGE
     ) {
         return ParseOutcome::NotHandled;
@@ -2798,18 +2849,13 @@ fn parse_special_text_property(context: &ParseContext, property: u16, values: &[
         }),
         property_id::CONTAINER_NAME => single_value
             .and_then(|value| parse_specific_keyword(value, &[keyword::NONE]))
-            .or_else(|| {
-                let names = values
-                    .iter()
-                    .filter(|value| !value.is_whitespace())
-                    .map(|value| parse_custom_ident_value(context, value, &["none", "and", "not", "or"]))
-                    .collect::<Option<Vec<_>>>()?;
-                match names.as_slice() {
-                    [] => None,
-                    [_] => names.into_iter().next(),
-                    _ => Some(value_list(names, 0, false)),
-                }
-            }),
+            .or_else(|| parse_custom_ident_list(context, values, &["none", "and", "not", "or"])),
+        // https://drafts.csswg.org/css-view-transitions-2/#view-transition-class-prop
+        // none | <custom-ident>+
+        // none is an invalid <custom-ident> for view-transition-class, even when combined with another <custom-ident>.
+        property_id::VIEW_TRANSITION_CLASS => single_value
+            .and_then(|value| parse_specific_keyword(value, &[keyword::NONE]))
+            .or_else(|| parse_custom_ident_list(context, values, &["none"])),
         property_id::FONT_LANGUAGE_OVERRIDE => single_value.and_then(|value| {
             if let Some(normal) = parse_specific_keyword(value, &[keyword::NORMAL]) {
                 return Some(normal);
@@ -6070,6 +6116,9 @@ fn parse_css_value_after_substitution_scan(
     if property_id == property_id::TEXT_INDENT {
         return parse_text_indent_property(context, property_id, values);
     }
+    if property_id == property_id::TEXT_EMPHASIS_POSITION {
+        return parse_text_emphasis_position_property(values);
+    }
     if property_id == property_id::TEXT_UNDERLINE_POSITION {
         return parse_text_underline_position_property(values);
     }
@@ -6289,32 +6338,20 @@ pub(crate) enum FontDescriptorKind {
 /// on success. A null return is disambiguated by `out_status`.
 ///
 /// # Safety
-/// All non-null pointers must remain readable for their accompanying lengths
-/// for the duration of this call. `out_status` must be a valid writable
-/// pointer.
+/// The pointers `context` holds must remain readable for their accompanying lengths during this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_parse_css_value(
     context: Option<&ParseContext>,
     property_id: u16,
     source: FfiUtf16View,
-    out_status: *mut FfiParseStatus,
+    out_status: Option<&mut FfiParseStatus>,
 ) -> *const c_void {
-    let invalid_ffi_result = || {
-        if !out_status.is_null() {
-            unsafe { *out_status = FfiParseStatus::NotHandled };
-        }
-        std::ptr::null()
+    let Some(out_status) = out_status else {
+        return std::ptr::null();
     };
-
-    let Some(context) = context else {
-        return invalid_ffi_result();
-    };
-
-    if out_status.is_null() {
-        return invalid_ffi_result();
-    }
-    let Some(source) = source.units() else {
-        return invalid_ffi_result();
+    let (Some(context), Some(source)) = (context, source.units()) else {
+        *out_status = FfiParseStatus::NotHandled;
+        return std::ptr::null();
     };
     let mut source_utf16 = Vec::with_capacity(source.len());
     source.append_to(&mut source_utf16);
@@ -6334,41 +6371,24 @@ pub unsafe extern "C" fn rust_parse_css_value(
         }
         Err(()) => ParseOutcome::NotHandled,
     };
-    match outcome {
-        ParseOutcome::Parsed(value) => {
-            unsafe {
-                *out_status = FfiParseStatus::Parsed;
-            }
-            Arc::into_raw(value).cast()
-        }
-        ParseOutcome::Invalid => {
-            unsafe {
-                *out_status = FfiParseStatus::Invalid;
-            }
-            std::ptr::null()
-        }
-        ParseOutcome::NotHandled => {
-            unsafe {
-                *out_status = FfiParseStatus::NotHandled;
-            }
-            std::ptr::null()
-        }
-    }
+    let (status, value) = match outcome {
+        ParseOutcome::Parsed(value) => (FfiParseStatus::Parsed, Arc::into_raw(value).cast()),
+        ParseOutcome::Invalid => (FfiParseStatus::Invalid, std::ptr::null()),
+        ParseOutcome::NotHandled => (FfiParseStatus::NotHandled, std::ptr::null()),
+    };
+    *out_status = status;
+    value
 }
 
 /// Returns a substitution-function presence bitmap for CSS source.
-///
-/// # Safety
-/// The source pointer must be valid for its accompanying length and
-/// `out_presence` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_collect_arbitrary_substitution_function_presence_from_source(
+pub extern "C" fn rust_collect_arbitrary_substitution_function_presence_from_source(
     source: FfiUtf16View,
-    out_presence: *mut u8,
+    out_presence: Option<&mut u8>,
 ) -> bool {
-    if out_presence.is_null() {
+    let Some(out_presence) = out_presence else {
         return false;
-    }
+    };
     let Some(source) = source.units() else {
         return false;
     };
@@ -6378,7 +6398,7 @@ pub unsafe extern "C" fn rust_collect_arbitrary_substitution_function_presence_f
     let Some(presence) = substitution_function_presence_bits(&values) else {
         return false;
     };
-    unsafe { *out_presence = presence };
+    *out_presence = presence;
     true
 }
 
@@ -7671,7 +7691,7 @@ mod tests {
         }
         assert!(matches!(
             parse(property_id::WIDTH, "calc(anchor-size(width) + 1px)"),
-            ParseOutcome::Invalid
+            ParseOutcome::Parsed(_)
         ));
     }
 

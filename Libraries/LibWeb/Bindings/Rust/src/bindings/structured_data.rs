@@ -20,9 +20,10 @@ use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
+use ak::Utf16String;
 use libjs_rust::api::{RawNativeFunctionResult, ThrowCompletionOr, Value};
 
-use crate::bindings::interface::{Interface, allocate, cell_from_abi, realm_arguments, wrap};
+use crate::bindings::interface::{ConstructedObject, Interface, Ref, cell_from_abi, realm_arguments, wrap};
 use crate::bindings::{CallContext, WebIdlResult};
 
 unsafe extern "C" {
@@ -30,10 +31,29 @@ unsafe extern "C" {
     fn web_bindings_serialize_u32(serialized: *mut c_void, value: u32);
     fn web_bindings_serialize_f64(serialized: *mut c_void, value: f64);
     fn web_bindings_serialize_bool(serialized: *mut c_void, value: bool);
+    fn web_bindings_serialize_i64(serialized: *mut c_void, value: i64);
+    fn web_bindings_serialize_optional_u64(serialized: *mut c_void, has_value: bool, value: u64);
+    fn web_bindings_serialize_utf16_string(serialized: *mut c_void, string: usize);
+    fn web_bindings_serialize_bytes(serialized: *mut c_void, bytes: ak::Span<'_, u8>);
     fn web_bindings_deserialize_value(serialized: *mut c_void) -> RawNativeFunctionResult;
     fn web_bindings_deserialize_u32(serialized: *mut c_void, out_value: &mut u32) -> RawNativeFunctionResult;
     fn web_bindings_deserialize_f64(serialized: *mut c_void, out_value: &mut f64) -> RawNativeFunctionResult;
     fn web_bindings_deserialize_bool(serialized: *mut c_void, out_value: &mut bool) -> RawNativeFunctionResult;
+    fn web_bindings_deserialize_i64(serialized: *mut c_void, out_value: &mut i64) -> RawNativeFunctionResult;
+    fn web_bindings_deserialize_optional_u64(
+        serialized: *mut c_void,
+        out_has_value: &mut bool,
+        out_value: &mut u64,
+    ) -> RawNativeFunctionResult;
+    fn web_bindings_deserialize_bytes(
+        serialized: *mut c_void,
+        bytes: *mut c_void,
+        append: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+    ) -> RawNativeFunctionResult;
+    fn web_bindings_deserialize_utf16_string(
+        serialized: *mut c_void,
+        out_string: &mut usize,
+    ) -> RawNativeFunctionResult;
     fn web_bindings_serialize_inline_object_header(serialized: *mut c_void, interface_name: u16);
     fn web_bindings_deserialize_inline_object_header(
         serialized: *mut c_void,
@@ -58,7 +78,7 @@ impl SerializationWriter<'_> {
     /// https://html.spec.whatwg.org/multipage/structured-data.html#sub-serialization
     pub(crate) fn write_value(&mut self, value: Value) -> WebIdlResult<()> {
         // SAFETY: The writer is lent for the steps, and the value is live while they run.
-        unsafe { web_bindings_serialize_value(self.raw.as_ptr(), value.0) }.into_completion()?;
+        unsafe { web_bindings_serialize_value(self.raw.as_ptr(), value.to_raw()) }.into_completion()?;
         Ok(())
     }
 
@@ -75,6 +95,26 @@ impl SerializationWriter<'_> {
     pub(crate) fn write_bool(&mut self, value: bool) {
         // SAFETY: The writer is lent for the steps.
         unsafe { web_bindings_serialize_bool(self.raw.as_ptr(), value) };
+    }
+
+    pub(crate) fn write_i64(&mut self, value: i64) {
+        // SAFETY: The writer is lent for the steps.
+        unsafe { web_bindings_serialize_i64(self.raw.as_ptr(), value) };
+    }
+
+    pub(crate) fn write_optional_u64(&mut self, value: Option<u64>) {
+        // SAFETY: The writer is lent for the steps.
+        unsafe { web_bindings_serialize_optional_u64(self.raw.as_ptr(), value.is_some(), value.unwrap_or(0)) };
+    }
+
+    pub(crate) fn write_utf16_string(&mut self, string: &Utf16String) {
+        // SAFETY: The writer is lent for the steps, and the call borrows the string.
+        unsafe { web_bindings_serialize_utf16_string(self.raw.as_ptr(), string.raw_identity()) };
+    }
+
+    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) {
+        // SAFETY: The writer is lent for the steps, and the call borrows the bytes.
+        unsafe { web_bindings_serialize_bytes(self.raw.as_ptr(), ak::Span::new(bytes)) };
     }
 
     /// Writes the record of a serializable object in place, as StructuredSerializeInternal writes it, but without
@@ -141,6 +181,42 @@ impl SerializationReader<'_> {
         unsafe { web_bindings_deserialize_bool(self.raw.as_ptr(), &mut value) }.into_completion()?;
         Ok(value)
     }
+
+    pub(crate) fn read_i64(&mut self) -> WebIdlResult<i64> {
+        let mut value = 0;
+        // SAFETY: The reader is lent for the steps.
+        unsafe { web_bindings_deserialize_i64(self.raw.as_ptr(), &mut value) }.into_completion()?;
+        Ok(value)
+    }
+
+    pub(crate) fn read_optional_u64(&mut self) -> WebIdlResult<Option<u64>> {
+        let mut has_value = false;
+        let mut value = 0;
+        // SAFETY: The reader is lent for the steps.
+        unsafe { web_bindings_deserialize_optional_u64(self.raw.as_ptr(), &mut has_value, &mut value) }
+            .into_completion()?;
+        Ok(has_value.then_some(value))
+    }
+
+    pub(crate) fn read_bytes(&mut self) -> WebIdlResult<Vec<u8>> {
+        unsafe extern "C" fn append(bytes: *mut c_void, data: *const u8, length: usize) {
+            // SAFETY: The bytes are the Vec that read_bytes() lends, and LibWeb passes that many bytes.
+            unsafe { (*bytes.cast::<Vec<u8>>()).extend_from_slice(ak::slice_from_raw_parts(data, length)) };
+        }
+        let mut bytes = Vec::new();
+        // SAFETY: The reader and the bytes are lent for the steps.
+        unsafe { web_bindings_deserialize_bytes(self.raw.as_ptr(), (&raw mut bytes).cast(), append) }
+            .into_completion()?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn read_utf16_string(&mut self) -> WebIdlResult<Utf16String> {
+        let mut string = 0;
+        // SAFETY: The reader is lent for the steps.
+        unsafe { web_bindings_deserialize_utf16_string(self.raw.as_ptr(), &mut string) }.into_completion()?;
+        // SAFETY: LibWeb hands over the string it read.
+        Ok(unsafe { Utf16String::from_raw_owned(string) })
+    }
 }
 
 /// An interface that is serializable, [Serializable] in its IDL.
@@ -191,10 +267,11 @@ pub(crate) trait Transferable: Interface {
     fn detached(&self) -> &Cell<bool>;
 
     /// https://html.spec.whatwg.org/multipage/structured-data.html#transfer-steps
-    fn transfer_steps(&self, cx: &mut CallContext, data_holder: &mut TransferDataWriter) -> WebIdlResult<()>;
+    fn transfer_steps(this: &Ref<Self>, cx: &mut CallContext, data_holder: &mut TransferDataWriter)
+    -> WebIdlResult<()>;
 
     /// https://html.spec.whatwg.org/multipage/structured-data.html#transfer-receiving-steps, which create the object.
-    fn transfer_receiving_steps(cx: &mut CallContext, data_holder: &mut TransferDataReader) -> WebIdlResult<Self>;
+    fn transfer_receiving_steps(cx: &mut CallContext, data_holder: &mut TransferDataReader) -> WebIdlResult<Ref<Self>>;
 }
 
 /// The completion of steps, as the entry points return it to C++.
@@ -204,8 +281,8 @@ fn completion(cx: &CallContext, result: WebIdlResult<Value>) -> RawNativeFunctio
 }
 
 /// The wrapper in the realm of the call context of the object that steps created.
-fn wrap_new_object<T: Interface>(cx: &CallContext, implementation: T) -> Value {
-    Value::from_object(wrap(cx, allocate(cx.vm(), implementation)))
+fn wrap_new_object<T: Interface>(cx: &CallContext, object: impl ConstructedObject<T>) -> Value {
+    Value::from_object(wrap(cx, object.into_object(cx.vm())))
 }
 
 /// The entry point of the serialization steps of `T`.
@@ -292,7 +369,7 @@ pub(crate) unsafe fn transfer_steps<T: Transferable>(
         raw: NonNull::new(data_holder).expect("C++ lends a data holder"),
         _lent: PhantomData,
     };
-    let result = object.transfer_steps(&mut cx, &mut data_holder);
+    let result = T::transfer_steps(&object, &mut cx, &mut data_holder);
     completion(&cx, result.map(|()| Value::UNDEFINED))
 }
 

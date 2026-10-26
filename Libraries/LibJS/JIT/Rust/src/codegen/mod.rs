@@ -1558,6 +1558,11 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.masm
                     .branch64(Condition::NotEqual, self.input(node_id, 0), scratch, exit);
             }
+            Op::CheckInitialized => {
+                let exit = self.exit_site(node_id);
+                self.masm
+                    .branch64_imm(Condition::Equal, self.input(node_id, 0), value::EMPTY as i64, exit);
+            }
             Op::Typeof => self.emit_typeof(node_id),
             Op::TypeofIs { kind, equal } => self.emit_typeof_is(node_id, *kind, *equal),
             Op::EmptyToUndefined => {
@@ -1628,24 +1633,28 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.masm.move_imm64(scratch, function.0);
                 self.masm.branch64_memory(Condition::NotEqual, &field, scratch, exit);
             }
-            Op::LoadNamed { offset } => {
-                let exit = self.exit_site(node_id);
+            Op::LoadNamed { offset, holds_data } => {
+                let exit = (!holds_data).then(|| self.exit_site(node_id));
                 let output = self.output(node_id);
                 let slot = self.named_property_address(output, *offset)?;
                 let cell = self.cell_address_of(node_id, output, 1);
                 let storage = Address::new(cell, self.runtime.offsets.object_named_properties as i32);
                 self.masm.load64(output, &storage);
-                self.emit_exit_if_accessor(&slot, exit);
+                if let Some(exit) = exit {
+                    self.emit_exit_if_accessor(&slot, exit);
+                }
                 self.masm.load64(output, &slot);
             }
-            Op::StoreNamed { offset } => {
-                let exit = self.exit_site(node_id);
+            Op::StoreNamed { offset, holds_data } => {
+                let exit = (!holds_data).then(|| self.exit_site(node_id));
                 let storage = Gpr(self.allocation.node(node_id).temps[0]);
                 let slot = self.named_property_address(storage, *offset)?;
                 let cell = self.cell_address_of(node_id, storage, 2);
                 let storage_field = Address::new(cell, self.runtime.offsets.object_named_properties as i32);
                 self.masm.load64(storage, &storage_field);
-                self.emit_exit_if_accessor(&slot, exit);
+                if let Some(exit) = exit {
+                    self.emit_exit_if_accessor(&slot, exit);
+                }
                 self.masm.store64(&slot, self.input(node_id, 1));
             }
             Op::AddNamed { offset, shape, .. } => self.emit_add_named(node_id, *offset, *shape)?,
@@ -1751,6 +1760,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             Op::LoadElementsCapacity => self.emit_load_elements_capacity(node_id),
             Op::AppendElement => self.emit_append_element_node(node_id),
             Op::CallArrayPush => self.emit_call_array_push(node_id),
+            Op::CallArraySplice => self.emit_call_array_splice(node_id),
             Op::CallStoreHoleyElement => self.emit_call_store_holey_element(node_id),
             Op::OpenArrayIteration => self.emit_open_array_iteration(node_id),
             Op::LoadArrayIteratorArray => self.emit_load_array_iterator_array(node_id),

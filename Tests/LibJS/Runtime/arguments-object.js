@@ -138,6 +138,24 @@ test("arguments of the enclosing function in arrow functions", () => {
     expect(writeThroughArrow(1, 2)).toBe("written");
 });
 
+test("catch parameter named arguments does not take the place of the arguments object", () => {
+    function local() {
+        try {
+            throw 1;
+        } catch (arguments) {}
+        return arguments.length;
+    }
+    expect(local(1, 2)).toBe(2);
+
+    function captured() {
+        try {
+            throw 1;
+        } catch (arguments) {}
+        return (() => arguments.length)();
+    }
+    expect(captured(1, 2)).toBe(2);
+});
+
 test("functions whose arguments object is never used", () => {
     const add = new Function("a", "b", "return a + b;");
     expect(add(1, 2)).toBe(3);
@@ -145,4 +163,24 @@ test("functions whose arguments object is never used", () => {
         return [a, b, arguments.length];
     }
     expect(withParametersAndArguments(1)).toEqual([1, undefined, 1]);
+});
+
+test("block-level function named arguments with arguments object reached through direct eval", () => {
+    function f() {
+        const before = eval("typeof arguments");
+        {
+            function arguments() {}
+        }
+        return [before, eval("typeof arguments")];
+    }
+    expect(f(1)).toEqual(["object", "function"]);
+
+    function g() {
+        const before = (() => eval("arguments.length"))();
+        {
+            function arguments() {}
+        }
+        return [before, (() => eval("typeof arguments"))()];
+    }
+    expect(g(1, 2)).toEqual([2, "function"]);
 });

@@ -9,9 +9,12 @@
 #include <AK/ScopeGuard.h>
 #include <LibCore/System.h>
 #include <LibIPC/Limits.h>
+#include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibJS/Runtime/TypedArray.h>
+#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/Bindings/Module.h>
 #include <LibWeb/Bindings/Serializable.h>
 #include <LibWeb/Crypto/CryptoKeySerializationTags.h>
 #include <LibWeb/FileAPI/File.h>
@@ -23,7 +26,6 @@
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/HTML/ImageData.h>
 #include <LibWeb/HTML/MessagePort.h>
-#include <LibWeb/WebAssembly/Module.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/QuotaExceededError.h>
 
@@ -464,15 +466,28 @@ TEST_CASE(ipc_serializable_object_has_no_version_framing)
 
 TEST_CASE(webassembly_module_encodes_to_frozen_ipc_bytes)
 {
-    auto value = MUST(principal_storage_deserialize(webassembly_module_storage_record(s_minimal_webassembly_module_bytes.span())));
-    auto module = GC::Ref { unwrap_wrappable<Web::WebAssembly::Module>(value) };
+    static constexpr auto module_bytes = to_array<u8>({ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
 
-    auto record = structured_serialize(test_realm().vm(), module);
+    auto& realm = principal_test_realm();
+    auto& vm = realm.vm();
+    auto& settings = Web::Bindings::principal_host_defined_environment_settings_object(realm);
+    auto depth = vm.execution_context_stack().size();
+    vm.push_execution_context(settings.realm_execution_context());
+
+    auto bytes = JS::ArrayBuffer::create(realm, MUST(ByteBuffer::copy(module_bytes.span())));
+    auto& module_constructor = Web::Bindings::ensure_web_constructor<Web::Bindings::ModulePrototype>(realm, "WebAssembly.Module"_utf16_fly_string);
+    auto module = MUST(JS::construct(vm, module_constructor, bytes.ptr()));
+    auto record = MUST(Web::HTML::structured_serialize(vm, JS::Value(module.ptr())));
+
+    while (vm.execution_context_stack().size() > depth)
+        vm.pop_execution_context();
+
     Web::HTML::StructuredSerializeReader reader { record };
 
     EXPECT_EQ(MUST(reader.decode<u8>()), to_underlying(ValueTag::SerializableObject));
     EXPECT_EQ(MUST(reader.decode<Web::Bindings::InterfaceName>()), Web::Bindings::InterfaceName::Module);
-    EXPECT_EQ(MUST(reader.decode<ByteBuffer>()).span(), s_minimal_webassembly_module_bytes.span());
+    EXPECT_EQ(MUST(reader.decode<ByteBuffer>()).span(), module_bytes.span());
+    EXPECT_EQ(MUST(reader.decode<Optional<u64>>()), settings.agent_cluster_id());
 }
 
 TEST_CASE(realm_helpers_share_vm_initialization)
@@ -602,6 +617,17 @@ TEST_CASE(image_serializables_encode_to_frozen_bytes)
         // Use the bitmap's actual pitch and data size.
         ReadonlyBytes data { bitmap->scanline_u8(0), bitmap->data_size() };
         auto expected = image_bitmap_record(bitmap->width(), bitmap->height(), bitmap->pitch(), "BGRA8888"sv, "premultiplied"sv, data);
+        expect_storage_encoding(image_bitmap, expected);
+    }
+
+    {
+        auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, { 2, 2 }));
+        auto color_space = MUST(Gfx::ColorSpace::from_cicp({ Media::ColorPrimaries::SMPTE432, Media::TransferCharacteristics::SRGB, Media::MatrixCoefficients::Identity, Media::VideoFullRangeFlag::Full }));
+        auto image_bitmap = Web::HTML::ImageBitmap::create(Gfx::DecodedImageFrame { *bitmap, move(color_space) });
+
+        ReadonlyBytes data { bitmap->scanline_u8(0), bitmap->data_size() };
+        Array<u8, 3> display_p3 { 1, 12, 13 }; // CICP, SMPTE432 primaries, sRGB transfer characteristics
+        auto expected = image_bitmap_record(bitmap->width(), bitmap->height(), bitmap->pitch(), "BGRA8888"sv, "premultiplied"sv, data, { display_p3.data(), display_p3.size() });
         expect_storage_encoding(image_bitmap, expected);
     }
 }
@@ -848,6 +874,7 @@ TEST_CASE(image_bitmap_transfer_rejects_invalid_shared_pixels)
         MUST(holder.encode(1));
         MUST(holder.encode(format));
         MUST(holder.encode(Gfx::AlphaType::Premultiplied));
+        MUST(holder.encode(static_cast<u8>(0))); // sRGB
         Web::HTML::TransferDataDecoder decoder { move(holder) };
         if (buffers)
             decoder.set_shared_buffers(*buffers);
@@ -920,6 +947,7 @@ TEST_CASE(image_bitmap_transfer_rejects_unsealed_backing)
     MUST(holder.encode(1));
     MUST(holder.encode(Gfx::BitmapFormat::BGRA8888));
     MUST(holder.encode(Gfx::AlphaType::Premultiplied));
+    MUST(holder.encode(static_cast<u8>(0))); // sRGB
     Web::HTML::TransferDataDecoder decoder { move(holder) };
     decoder.set_shared_buffers(shared_buffers);
     EXPECT(receive_image_bitmap(realm, decoder).is_error());
@@ -962,7 +990,7 @@ TEST_CASE(file_api_serializables_encode_to_frozen_bytes)
         expect_storage_encoding(blob, serializable_storage_record("Blob"sv, 1, body));
     }
 
-    auto file = MUST(Web::FileAPI::File::create({ { "data"_utf16 } }, "f.txt"_utf16));
+    auto file = Web::FileAPI::File::create("data"sv.bytes(), "f.txt"_utf16, {});
     {
         Vector<u8> body;
         append_storage_string(body, ""sv); // default type

@@ -136,6 +136,13 @@ impl<T: Copy> SealableCell<T> {
         self.sealed.set(true);
     }
 
+    /// Sets the value even where it is sealed, for moving a box's metrics between the frames of writing modes: that
+    /// changes how they read, not what they are.
+    #[inline]
+    pub(crate) fn set_ignoring_seal(&self, value: T) {
+        self.value.set(value);
+    }
+
     pub(crate) fn is_sealed(&self) -> bool {
         self.sealed.get()
     }
@@ -239,15 +246,22 @@ impl CommittedSvgFacts {
 
 #[derive(Clone, Default)]
 pub(crate) struct UsedValuesRareData {
-    pub(crate) computed_svg_path: Option<std::sync::Arc<libgfx_rust::path::OwnedPath>>,
+    pub(crate) computed_svg_path: Option<std::sync::Arc<libgfx_rust::path::Path>>,
     pub(crate) svg_text_character_cells: Option<std::sync::Arc<Vec<svg_formatting_context::FfiSvgTextCharacterCell>>>,
     pub(crate) svg: CommittedSvgFacts,
     pub(crate) grid_layout_data: Option<std::sync::Arc<grid_formatting_context::GridLayoutData>>,
     pub(crate) flex_layout_data: Option<std::sync::Arc<formatting_context::FlexLayoutData>>,
     pub(crate) multicol_layout_data: Option<std::sync::Arc<fragmentation::MulticolLayoutData>>,
+    pub(crate) math_paint_data: Option<std::sync::Arc<math_formatting_context::MathPaintData>>,
     pub(crate) used_grid_tracks: Option<std::sync::Arc<grid_formatting_context::OwnedUsedGridTracks>>,
     pub(crate) collapsed_table_borders: Option<std::sync::Arc<table_formatting_context::OwnedCollapsedTableBorders>>,
     pub(crate) abspos_layout_inputs: Option<abspos_inputs::AbsposLayoutInputs>,
+    /// The default scroll shift the run that resolved the box's anchor insets found, which its placement carries to
+    /// the commit.
+    pub(crate) default_scroll_shift: Option<abspos_inputs::DefaultScrollShift>,
+    /// For a box that establishes an orthogonal flow, its baselines as distances along the horizontal axis of the frame
+    /// it is laid out in, from the left edge of its content box.
+    pub(crate) orthogonal_flow_baselines: Option<DerivedBaselines>,
 }
 
 impl UsedValuesRareData {
@@ -259,12 +273,15 @@ impl UsedValuesRareData {
             grid_layout_data,
             flex_layout_data,
             multicol_layout_data,
+            math_paint_data,
             used_grid_tracks,
             collapsed_table_borders,
             abspos_layout_inputs,
+            default_scroll_shift,
+            orthogonal_flow_baselines,
         } = self;
         debug_assert!(
-            abspos_layout_inputs.is_none(),
+            abspos_layout_inputs.is_none() && default_scroll_shift.is_none(),
             "a run authored a parent-owned rare payload on its root record"
         );
         if computed_svg_path.is_none()
@@ -273,8 +290,10 @@ impl UsedValuesRareData {
             && grid_layout_data.is_none()
             && flex_layout_data.is_none()
             && multicol_layout_data.is_none()
+            && math_paint_data.is_none()
             && used_grid_tracks.is_none()
             && collapsed_table_borders.is_none()
+            && orthogonal_flow_baselines.is_none()
         {
             return;
         }
@@ -295,11 +314,17 @@ impl UsedValuesRareData {
         if let Some(data) = multicol_layout_data {
             rare.multicol_layout_data = Some(data);
         }
+        if let Some(data) = math_paint_data {
+            rare.math_paint_data = Some(data);
+        }
         if let Some(tracks) = used_grid_tracks {
             rare.used_grid_tracks = Some(tracks);
         }
         if let Some(borders) = collapsed_table_borders {
             rare.collapsed_table_borders = Some(borders);
+        }
+        if let Some(baselines) = orthogonal_flow_baselines {
+            rare.orthogonal_flow_baselines = Some(baselines);
         }
     }
 }
@@ -370,6 +395,7 @@ pub(crate) struct UsedValues {
     pub first_baseline: Cell<CssPixels>,
     pub has_last_baseline: Cell<bool>,
     pub last_baseline: Cell<CssPixels>,
+    pub inline_alignment_baseline: Cell<Option<CssPixels>>,
 
     // Layout outputs, deliberately outside the cell state.
     pub depends_on_percentage_block_size: Cell<bool>,
@@ -377,6 +403,8 @@ pub(crate) struct UsedValues {
 
     pub(crate) line_data: RefCell<LineDataState>,
     pub(crate) rare_data: LazyRefCell<UsedValuesRareData>,
+    /// The anchor-size() resolutions of an absolutely positioned box, set once as the abspos engine places it.
+    pub(crate) anchor_resolved_values: std::cell::OnceCell<Box<style_values::AnchorResolvedValues>>,
     pub(crate) held_committed_fragment: fragment_tree::HeldCommittedFragmentCell,
 }
 
@@ -424,16 +452,22 @@ impl Default for UsedValues {
             first_baseline: Cell::new(zero),
             has_last_baseline: Cell::new(false),
             last_baseline: Cell::new(zero),
+            inline_alignment_baseline: Cell::new(None),
             depends_on_percentage_block_size: Cell::new(false),
             has_descendant_that_depends_on_percentage_block_size: Cell::new(false),
             line_data: RefCell::new(LineDataState::Empty),
             rare_data: LazyRefCell::new(),
+            anchor_resolved_values: std::cell::OnceCell::new(),
             held_committed_fragment: fragment_tree::HeldCommittedFragmentCell::default(),
         }
     }
 }
 
 impl UsedValues {
+    pub(crate) fn orthogonal_flow_baselines(&self) -> Option<DerivedBaselines> {
+        self.rare_data.get()?.borrow().orthogonal_flow_baselines
+    }
+
     /// Resolves the left and right margins, borders and padding of `style`, with percentages against `basis`.
     pub(crate) fn resolve_horizontal_box_model(&self, style: &StyleValues<'_>, basis: CssPixels) {
         self.margin_left.set(style.margin_left().to_px(basis));
@@ -500,6 +534,7 @@ impl UsedValues {
                 std::mem::take(data.as_mut()),
                 callbacks.arena(),
                 self.content_inline_size.get(),
+                callbacks.frame.writing_mode(),
             )),
         };
         *state = LineDataState::Finished(content.clone());
@@ -508,6 +543,7 @@ impl UsedValues {
 
     pub(crate) fn content_baselines_from_cells(&self) -> DerivedBaselines {
         DerivedBaselines {
+            inline_alignment: self.inline_alignment_baseline.get(),
             first: self.has_first_baseline.get().then(|| self.first_baseline.get()),
             last: self.has_last_baseline.get().then(|| self.last_baseline.get()),
         }
@@ -537,6 +573,46 @@ impl UsedValues {
         self.inset_bottom.seal();
         self.has_content_offset.seal();
         self.content_offset.seal();
+    }
+
+    /// Moves the box's sizes, size constraints and box sides from frame `from` to frame `to`, keeping its placement.
+    pub(crate) fn move_box_metrics_to_frame(&self, from: geometry::Frame, to: geometry::Frame) {
+        if from == to {
+            return;
+        }
+        let state = UsedValuesCellState::capture(self).in_frame(from, to);
+        macro_rules! move_sealable {
+            ($($field:ident),+) => {
+                $(self.$field.set_ignoring_seal(state.$field);)+
+            };
+        }
+        move_sealable!(
+            content_inline_size,
+            content_block_size,
+            margin_left,
+            margin_right,
+            margin_top,
+            margin_bottom,
+            border_left,
+            border_right,
+            border_top,
+            border_bottom,
+            padding_left,
+            padding_right,
+            padding_top,
+            padding_bottom,
+            inset_left,
+            inset_right,
+            inset_top,
+            inset_bottom
+        );
+        self.has_definite_inline_size.set(state.has_definite_inline_size);
+        self.has_definite_block_size.set(state.has_definite_block_size);
+        self.inline_size_constraint.set(state.inline_size_constraint);
+        self.block_size_constraint.set(state.block_size_constraint);
+        self.has_first_baseline.set(state.has_first_baseline);
+        self.has_last_baseline.set(state.has_last_baseline);
+        self.inline_alignment_baseline.set(state.inline_alignment_baseline);
     }
 
     pub(crate) fn own_metrics_are_sealed(&self) -> bool {
@@ -626,9 +702,52 @@ used_values_cell_state! {
     first_baseline: CssPixels,
     has_last_baseline: bool,
     last_baseline: CssPixels,
+    inline_alignment_baseline: Option<CssPixels>,
 }
 
 impl UsedValuesCellState {
+    /// The state, with the sizes, size constraints and box sides it holds in frame `from` read in frame `to` instead.
+    pub(crate) fn in_frame(mut self, from: geometry::Frame, to: geometry::Frame) -> Self {
+        if from == to {
+            return self;
+        }
+        [self.margin_top, self.margin_right, self.margin_bottom, self.margin_left] = from.sides_in(
+            [self.margin_top, self.margin_right, self.margin_bottom, self.margin_left],
+            to,
+        );
+        [self.border_top, self.border_right, self.border_bottom, self.border_left] = from.sides_in(
+            [self.border_top, self.border_right, self.border_bottom, self.border_left],
+            to,
+        );
+        [
+            self.padding_top,
+            self.padding_right,
+            self.padding_bottom,
+            self.padding_left,
+        ] = from.sides_in(
+            [
+                self.padding_top,
+                self.padding_right,
+                self.padding_bottom,
+                self.padding_left,
+            ],
+            to,
+        );
+        [self.inset_top, self.inset_right, self.inset_bottom, self.inset_left] = from.sides_in(
+            [self.inset_top, self.inset_right, self.inset_bottom, self.inset_left],
+            to,
+        );
+        if from.is_orthogonal_to(to) {
+            std::mem::swap(&mut self.content_inline_size, &mut self.content_block_size);
+            std::mem::swap(&mut self.has_definite_inline_size, &mut self.has_definite_block_size);
+            std::mem::swap(&mut self.inline_size_constraint, &mut self.block_size_constraint);
+            self.has_first_baseline = false;
+            self.has_last_baseline = false;
+            self.inline_alignment_baseline = None;
+        }
+        self
+    }
+
     pub(crate) fn materialize_record(&self) -> UsedValues {
         let record = UsedValues::default();
         self.apply_to_record(&record);
@@ -968,6 +1087,7 @@ pub(crate) fn create_used_values(
                 && facts.display().is_block_outside()
                 && facts.parent_is_unfloated_flow_container()
                 && containing_block_has_definite_size(Axis::Inline)
+                && !formatting_context::frame_established_by(callbacks, node).is_orthogonal_to(callbacks.frame)
             {
                 let available = containing_block_size_for_axis(Axis::Inline);
                 return Some(clamp_to_max_dimension_value(

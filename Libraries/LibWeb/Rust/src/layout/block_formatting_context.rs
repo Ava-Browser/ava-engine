@@ -182,10 +182,6 @@ enum InFlowReuse {
         validity: fc_run_cache::FcRunCacheValidity,
         flow_position: CssPixels,
         abspos_containing_block_info_contributions_received: u64,
-        verify: Option<(
-            std::sync::Arc<in_flow_block_cache::InFlowBlockEntry>,
-            std::sync::Arc<fragment_tree::Fragment>,
-        )>,
     },
 }
 
@@ -363,9 +359,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             clamped_content_is_scrollable_overflow,
             // NB: Measurements at a definite inline size need the clamped block size, just like committed layout.
             max_lines: Cell::new(
-                ((!run.purpose.is_measurement()
-                    || run.records.used_values(run.box_).has_definite_inline_size()
-                    || style.writing_mode() != writing_mode::HORIZONTAL_TB)
+                ((!run.purpose.is_measurement() || run.records.used_values(run.box_).has_definite_inline_size())
                     && is_line_clamp_container
                     && style.max_lines() > 0)
                     .then_some(style.max_lines() as usize),
@@ -454,10 +448,12 @@ impl<'pass> BlockFormattingContext<'pass> {
         self.table_box_in_wrapper_border_box_block_size.get()
     }
 
+    #[inline]
     fn facts(&self, node: Node) -> NodeFacts<'_> {
         NodeFacts::new(&self.run.callbacks, node)
     }
 
+    #[inline]
     fn style(&self, node: Node) -> StyleValues<'pass> {
         StyleValues::for_node(&self.run.callbacks, node)
     }
@@ -522,6 +518,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         ancestor == node || self.is_ancestor_of(ancestor, node)
     }
 
+    #[inline]
     pub(crate) fn sizing(&self) -> sizing_context::SizingContext<'pass> {
         sizing_context::SizingContext::new(self.run.purpose, self.run.records, self.run.callbacks)
     }
@@ -655,6 +652,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                     formatting_context::FormattingContextType::Block
                         | formatting_context::FormattingContextType::Flex
                         | formatting_context::FormattingContextType::Grid
+                        | formatting_context::FormattingContextType::Math
                 )
             )
     }
@@ -842,6 +840,11 @@ impl<'pass> BlockFormattingContext<'pass> {
         let containing_block_direction = self.style(self.containing_block(node)).direction();
         let computed_margin_left = style.margin_left();
         let computed_margin_right = style.margin_right();
+        // NB: A box that establishes an orthogonal flow and has an automatic inline size is sized to its content, not
+        //     over-constrained: its margins keep their values, unless the line-right margin has to place it at the
+        //     inline start of a right-to-left containing block.
+        let is_content_sized_orthogonal_flow =
+            sizing.establishes_orthogonal_flow(node) && sizing.should_treat_inline_size_as_auto(node, available_space);
         let compute = |input: Option<CssPixels>,
                        margin_left: &mut CssPixels,
                        margin_right: &mut CssPixels,
@@ -903,7 +906,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                 } else if !*margin_left_is_auto && !*margin_right_is_auto {
                     if containing_block_direction == direction::RTL {
                         *margin_left += underflow;
-                    } else {
+                    } else if !is_content_sized_orthogonal_flow {
                         *margin_right += underflow;
                     }
                 } else if !*margin_left_is_auto && *margin_right_is_auto {
@@ -943,6 +946,11 @@ impl<'pass> BlockFormattingContext<'pass> {
             // https://html.spec.whatwg.org/multipage/rendering.html#button-layout
             // If the computed value of 'inline-size' is 'auto', then the used value is the fit-content inline size.
             Some(sizing.calculate_fit_content_size(node, SizingAxis::Inline, available_space, constraints))
+        } else if is_content_sized_orthogonal_flow {
+            // https://drafts.csswg.org/css-writing-modes-4/#orthogonal-shrink-to-fit
+            // Note that this section requires that when a child box auto-sized in its block axis establishes an
+            // orthogonal flow, the used block size of the child is calculated to fit its content
+            Some(sizing.calculate_fit_content_size(node, SizingAxis::Inline, remaining_available_space, constraints))
         } else if sizing.should_treat_inline_size_as_auto(node, available_space) {
             None
         } else {
@@ -2539,9 +2547,8 @@ impl<'pass> BlockFormattingContext<'pass> {
     ) -> bool {
         let facts = self.facts(node);
         let container_facts = self.facts(block_container);
-        self.run.purpose == formatting_context::LayoutPurpose::Commit
+        !self.run.callbacks.scratch().reads_no_memoized_layout()
             && self.run.fragmentainer.is_none()
-            && self.run.layout_mode == LayoutMode::Normal
             && self.run.fragments.is_some()
             && !self.run.should_collect_devtools_layout_data
             && containing_line_box_fragment.is_none()
@@ -2578,33 +2585,21 @@ impl<'pass> BlockFormattingContext<'pass> {
             self.margin_state.borrow().clone(),
         );
         let validity = fc_run_cache::run_root_validity(callbacks, node);
+        // NB: The committed subtree is reused only while it is the one the stored layout produced.
         let hit = callbacks
             .arena()
-            .in_flow_block_cache_store()
-            .matching(node.slot_index(), validity, &key)
-            .and_then(|entry| {
-                // NB: The committed subtree is reused only while it is the one the stored layout produced. A layout
-                //     whose fragments were superseded within its pass never committed them.
-                let fragment = callbacks
-                    .arena()
-                    .with_current_committed_fragment(node, |fragment| {
-                        (fragment.identity == entry.fragment_identity).then(|| fragment.clone())
-                    })
-                    .flatten()?;
+            .with_current_committed_fragment(node, |fragment| fragment.clone())
+            .and_then(|fragment| {
+                let entry = callbacks.arena().in_flow_block_cache_store().matching(
+                    node.slot_index(),
+                    validity,
+                    &key,
+                    fragment.identity,
+                )?;
                 Some((entry, fragment))
             });
         if let Some((entry, fragment)) = hit {
-            if !in_flow_block_cache::verification_is_enabled() {
-                return InFlowReuse::Hit { entry, fragment };
-            }
-            return InFlowReuse::Store {
-                key,
-                validity,
-                flow_position: self.flow_position(),
-                abspos_containing_block_info_contributions_received: self
-                    .abspos_containing_block_info_contributions_received(),
-                verify: Some((entry, fragment)),
-            };
+            return InFlowReuse::Hit { entry, fragment };
         }
         InFlowReuse::Store {
             key,
@@ -2612,7 +2607,6 @@ impl<'pass> BlockFormattingContext<'pass> {
             flow_position: self.flow_position(),
             abspos_containing_block_info_contributions_received: self
                 .abspos_containing_block_info_contributions_received(),
-            verify: None,
         }
     }
 
@@ -2688,14 +2682,12 @@ impl<'pass> BlockFormattingContext<'pass> {
             validity,
             flow_position,
             abspos_containing_block_info_contributions_received,
-            verify,
         } = attempt
         else {
             return;
         };
-        let store = self.run.callbacks.arena().in_flow_block_cache_store();
+        let arena = self.run.callbacks.arena();
         let Some(placed) = placed else {
-            store.remove_entry(node.slot_index());
             return;
         };
         let used = self.used(node);
@@ -2706,6 +2698,9 @@ impl<'pass> BlockFormattingContext<'pass> {
             && self.abspos_containing_block_info_contributions_received()
                 == abspos_containing_block_info_contributions_received
             && used.border_box_block_size(false) != CssPixels::default();
+        if !reusable {
+            return;
+        }
         let mut cells = used_values::UsedValuesCellState::capture(used);
         cells.has_content_offset = false;
         cells.content_offset = FfiCssPixelPoint::default();
@@ -2727,24 +2722,10 @@ impl<'pass> BlockFormattingContext<'pass> {
             depends_on_percentage_block_size,
             fragment_identity: placed.fragment.identity,
         };
-        if let Some((stored, committed)) = verify {
-            let fragments = self.run.fragments.as_deref();
-            let was_reused = |slot: u32| fragments.is_some_and(|fragments| fragments.subtree_was_reused(slot));
-            in_flow_block_cache::verify_reuse(
-                node,
-                &stored,
-                &committed,
-                &entry,
-                &placed.fragment,
-                reusable,
-                &was_reused,
-            );
-        }
-        if reusable {
-            store.store(node.slot_index(), entry);
-        } else {
-            store.remove_entry(node.slot_index());
-        }
+        let committed_identity = arena.with_current_committed_fragment(node, |fragment| fragment.identity);
+        arena
+            .in_flow_block_cache_store()
+            .store(node.slot_index(), entry, committed_identity);
     }
 
     fn layout_block_level_children(
@@ -3384,14 +3365,22 @@ impl<'pass> BlockFormattingContext<'pass> {
         };
 
         let mut baselines = formatting_context::DerivedBaselines::default();
-        let mut note_baselines = |first: Option<CssPixels>, last: Option<CssPixels>| {
-            if let Some(first) = first {
-                baselines.first = Some(baselines.first.map_or(first, |baseline| baseline.min(first)));
-            }
-            if let Some(last) = last {
-                baselines.last = Some(baselines.last.map_or(last, |baseline| baseline.max(last)));
-            }
-        };
+        let mut note_baselines =
+            |first: Option<CssPixels>, last: Option<CssPixels>, inline_alignment: Option<CssPixels>| {
+                if let Some(first) = first {
+                    baselines.first = Some(baselines.first.map_or(first, |baseline| baseline.min(first)));
+                }
+                if let Some(last) = last {
+                    baselines.last = Some(baselines.last.map_or(last, |baseline| baseline.max(last)));
+                }
+                if let Some(inline_alignment) = inline_alignment {
+                    baselines.inline_alignment = Some(
+                        baselines
+                            .inline_alignment
+                            .map_or(inline_alignment, |baseline| baseline.max(inline_alignment)),
+                    );
+                }
+            };
         let mut root_line_count = 0;
         let mut root_line_data_of_columns = Vec::new();
         let mut rows = Vec::new();
@@ -3451,6 +3440,10 @@ impl<'pass> BlockFormattingContext<'pass> {
                 note_baselines(
                     column_baselines.first.map(|baseline| baseline + row_block_offset),
                     column_baselines.last.map(|baseline| baseline + row_block_offset),
+                    column_baselines
+                        .inline_alignment
+                        .or(column_baselines.last)
+                        .map(|baseline| baseline + row_block_offset),
                 );
                 let Some(outgoing) = outcome.outgoing else {
                     break;
@@ -3505,6 +3498,14 @@ impl<'pass> BlockFormattingContext<'pass> {
                     spanner,
                     formatting_context::BaselineSet::Last,
                     formatting_context::ChildBaselineSource::Own,
+                ),
+                formatting_context::baseline_of_child_for_purpose(
+                    self.run.records,
+                    &self.run.callbacks,
+                    spanner,
+                    formatting_context::BaselineSet::Last,
+                    formatting_context::ChildBaselineSource::Own,
+                    formatting_context::BaselinePurpose::InlineAlignment,
                 ),
             );
             row_block_offset = row_block_offset.max(bottom_of_spanner_margin_box);
@@ -3737,15 +3738,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                 early_break_before,
                 allows_early_break_requests,
             ));
-            let journals_stored_entries = self.run.fragments.is_some();
-            let fc_run_cache_store = self.run.callbacks.arena().fc_run_cache_store();
-            if journals_stored_entries {
-                fc_run_cache_store.begin_store_journal();
-            }
             let outputs = formatting_context::run_fragmentainer(&self.run, purpose, input, fragmentainer.clone());
-            if journals_stored_entries {
-                fc_run_cache_store.end_store_journal(fragmentainer.outcome_mut().needs_early_break_before.is_none());
-            }
             if outputs.result.depends_on_percentage_block_size {
                 self.used(self.run.box_)
                     .has_descendant_that_depends_on_percentage_block_size
@@ -3778,6 +3771,11 @@ impl<'pass> BlockFormattingContext<'pass> {
                     (early_break_before, allows_early_break_requests),
                 );
             }
+            // NB: Only the attempt that is kept tells the host what it found out.
+            self.run
+                .callbacks
+                .scratch()
+                .receive_host_findings(outputs.host_findings);
             return ColumnLayout {
                 outcome,
                 consumed_block_size: outputs.result.automatic_content_block_size,
@@ -4786,32 +4784,6 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     pub(crate) fn automatic_content_inline_size(&self) -> CssPixels {
-        if self.style(self.run.box_).writing_mode() != writing_mode::HORIZONTAL_TB && self.line_clamp_reached() {
-            let used = self.used(self.run.box_);
-            if let Some(line) = used
-                .line_data_ref()
-                .as_ref()
-                .and_then(|data| data.building().line_boxes.last())
-            {
-                // https://drafts.csswg.org/css-overflow-4/#block-ellipsis
-                // The block overflow ellipsis is wrapped in an anonymous inline whose parent is the block
-                // container's root inline box. This inline is assigned line-height: 0.
-                let line_block_size = line
-                    .visible_fragments()
-                    .filter(|fragment| !fragment.is_block_ellipsis)
-                    .map(|fragment| {
-                        if fragment.is_atomic_inline {
-                            self.used(fragment.layout_node).margin_box_block_size(false)
-                        } else {
-                            fragment.block_length
-                        }
-                    })
-                    .max()
-                    .unwrap_or_default()
-                    .max(self.style(self.run.box_).line_height());
-                return line.block_start + line_block_size;
-            }
-        }
         let root_facts = self.facts(self.run.box_);
         if root_facts.children_are_inline() {
             let content_inline_size = self.used(self.run.box_).content_inline_size.get();
@@ -5056,9 +5028,14 @@ pub(crate) fn automatic_block_size_for_bfc_root(
             let (first, last) = laid_out_children.unwrap_or_else(|| (callbacks.first_child(root), Node::INVALID));
             callbacks.siblings_from(first, last).collect()
         };
+        let participates = |child: Node| {
+            let child_facts = NodeFacts::new(&callbacks, child);
+            child_facts.is_flow_layout_participant() && !child_facts.is_floating()
+        };
+        let last_participant = flow_children.iter().copied().rev().find(|&child| participates(child));
         for child in flow_children {
             let child_facts = NodeFacts::new(&callbacks, child);
-            if !child_facts.is_flow_layout_participant() || child_facts.is_floating() {
+            if !participates(child) {
                 continue;
             }
             let Some(child_used) = records.used_values_if_owned(child) else {
@@ -5070,13 +5047,22 @@ pub(crate) fn automatic_block_size_for_bfc_root(
             // Margins cannot collapse out of a BFC root: below the last real in-flow
             // child, the run's trailing collapsed margin (which folds in any trailing
             // collapse-through siblings) replaces that child's own bottom margin.
+            let collapsed = child_used.uses_collapsing_borders_model.get();
             let margin_bottom = match trailing_collapsed_margin {
                 Some((last_real_child, aggregate)) if last_real_child == child => aggregate,
+                // NB: The margins of an empty box collapse through it into those of the boxes after it, which
+                //     are placed past them, so its own bottom margin reaches no further than theirs.
+                _ if Some(child) != last_participant
+                    && child_used.border_box_block_size(collapsed) == CssPixels::default()
+                    && formatting_context::formatting_context_type_created_by_box(child_facts).is_none() =>
+                {
+                    CssPixels::default()
+                }
                 _ => child_used.margin_bottom.get(),
             };
             let child_bottom = child_used.content_offset.get().y
                 + child_used.content_block_size.get()
-                + child_used.border_box_bottom(child_used.uses_collapsing_borders_model.get())
+                + child_used.border_box_bottom(collapsed)
                 + margin_bottom;
             bottom = Some(bottom.map_or(child_bottom, |value: CssPixels| value.max(child_bottom)));
         }

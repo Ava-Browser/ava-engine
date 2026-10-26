@@ -1663,10 +1663,12 @@ void HTMLMediaElement::run_remote_mode_resource_fetch_steps(ByteRange byte_range
     }
 
     // 8. Fetch request, with processResponse set to the following steps given response response:
-    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DeliverStreamToConsumerAgent };
 
     fetch_algorithms_input.process_response = [self = GC::Ref(*this), byte_range = move(byte_range), fetch_generation](auto response) mutable {
         auto& fetch_data = self->m_remote_fetch_data;
+
+        auto response_is_cors_cross_origin = response->is_cors_cross_origin();
 
         // FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
         //        https://github.com/whatwg/html/issues/9355
@@ -1705,7 +1707,7 @@ void HTMLMediaElement::run_remote_mode_resource_fetch_steps(ByteRange byte_range
         // 2. Let updateMedia be to queue a media element task given the media element to run the first appropriate steps from the media data processing
         //    steps list below. (A new task is used for this so that the work described below occurs relative to the appropriate media element event task
         //    source rather than using the networking task source.)
-        auto update_media = GC::create_function(self->heap(), [weak_self = GC::Weak(self), fetch_generation](ByteBuffer media_data) mutable {
+        auto update_media = GC::create_function(self->heap(), [weak_self = GC::Weak(self), fetch_generation, response_is_cors_cross_origin](ByteBuffer media_data) mutable {
             if (!weak_self)
                 return;
             if (fetch_generation != weak_self->m_current_fetch_generation)
@@ -1715,6 +1717,8 @@ void HTMLMediaElement::run_remote_mode_resource_fetch_steps(ByteRange byte_range
             // 6. Update the media data with the contents of response's unsafe response obtained in this fashion. response can be CORS-same-origin or
             //    CORS-cross-origin; this affects whether subtitles referenced in the media data are exposed in the API and, for video elements, whether
             //    a canvas gets tainted when the video is drawn on it.
+            if (response_is_cors_cross_origin)
+                weak_self->m_media_data_is_cors_cross_origin = true;
             fetch_data->stream->add_chunk_at(fetch_data->offset, media_data.bytes());
             fetch_data->offset += media_data.size();
 
@@ -1749,7 +1753,13 @@ void HTMLMediaElement::run_remote_mode_resource_fetch_steps(ByteRange byte_range
             weak_self->queue_interrupted_fetch_steps();
         });
 
-        VERIFY(response->body());
+        // AD-HOC: A response with a null body status (204, 205, 304) has nothing to read, so treat the resource as
+        //         complete with no content, so that it fails to parse metadata.
+        if (!response->body()) {
+            process_end_of_media->function()();
+            return;
+        }
+
         response->body()->incrementally_read(HTML::relevant_realm(*self), update_media, process_end_of_media, process_body_error, GC::Ref { global });
     };
 
@@ -1919,6 +1929,16 @@ Optional<Utf16String> HTMLMediaElement::verify_response_or_get_failure_reason(GC
         return Utf16String::formatted("Failed to extract values from Content-Range: {}", internal_response->header_list()->get("Content-Range"sv));
 
     auto const& content_range = maybe_content_range.get<HTTP::HeaderList::ContentRangeValues>();
+
+    // AD-HOC: The server chooses where its bytes land in the resource, so hold it to the range that was asked for.
+    //         Otherwise a response could place bytes anywhere, including past the end of the representable resource.
+    if (content_range.last_byte_pos < content_range.first_byte_pos)
+        return Utf16String::formatted("Content-Range ends before it begins: {}", internal_response->header_list()->get("Content-Range"sv));
+    if (content_range.complete_length.has_value() && content_range.last_byte_pos >= content_range.complete_length.value())
+        return Utf16String::formatted("Content-Range extends past the complete length: {}", internal_response->header_list()->get("Content-Range"sv));
+    if (content_range.first_byte_pos != byte_range.get<UntilEnd>().first)
+        return Utf16String::formatted("Content-Range does not begin at the requested byte {}: {}", byte_range.get<UntilEnd>().first, internal_response->header_list()->get("Content-Range"sv));
+
     m_remote_fetch_data->offset = content_range.first_byte_pos;
     if (content_range.complete_length.has_value())
         m_remote_fetch_data->stream->set_expected_size(content_range.complete_length.value());
@@ -2009,6 +2029,13 @@ Optional<Compositing::VideoSinkResourceId> HTMLMediaElement::video_sink_resource
     if (!m_active_video_sink)
         return {};
     return m_active_video_sink->resource_id();
+}
+
+// https://html.spec.whatwg.org/multipage/media.html#media-data
+bool HTMLMediaElement::media_data_is_cors_cross_origin() const
+{
+    // NB: Media data from a MediaSource or a MediaStream is provided by the page itself.
+    return m_media_data_is_cors_cross_origin;
 }
 
 Optional<Compositing::CapturedVideoFrame> HTMLMediaElement::capture_current_video_frame() const
@@ -2368,14 +2395,20 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
     }));
 
     m_playback_manager->add_media_source(*m_remote_fetch_data->stream)
-        ->when_resolved(GC::weak_callback(*this, [](auto& self, MediaClient::RemotePlaybackManager::AddedTracks& added_tracks) {
+        ->when_resolved(GC::weak_callback(*this, [weak_manager = m_playback_manager->make_weak_ptr()](auto& self, MediaClient::RemotePlaybackManager::AddedTracks& added_tracks) {
             // -> If the media resource is found to have an audio track
-            for (auto const& track : added_tracks.audio_tracks)
+            for (auto const& track : added_tracks.audio_tracks) {
                 self.on_audio_track_added(track);
+                if (!weak_manager)
+                    return;
+            }
 
             // -> If the media resource is found to have a video track
-            for (auto const& track : added_tracks.video_tracks)
+            for (auto const& track : added_tracks.video_tracks) {
                 self.on_video_track_added(track);
+                if (!weak_manager)
+                    return;
+            }
 
             // -> Once enough of the media data has been fetched to determine the duration of the media resource, its dimensions, and other metadata
             self.on_metadata_parsed(SourceType::Remote);
@@ -2653,6 +2686,7 @@ void HTMLMediaElement::forget_media_resource_specific_tracks()
     if (m_playback_manager)
         m_playback_manager->on_playback_state_change = nullptr;
     release_active_video_sink();
+    m_media_data_is_cors_cross_origin = false;
     m_audio_tracks->remove_all_tracks();
     m_video_tracks->remove_all_tracks();
     update_audio_play_state();

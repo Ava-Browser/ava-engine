@@ -111,19 +111,9 @@ Length Length::percentage_of(Percentage const& percentage) const
     return Length { percentage.as_fraction() * raw_value(), m_unit };
 }
 
-CSSPixels Length::font_relative_length_to_px(Length::FontMetrics const& font_metrics, Length::FontMetrics const& root_font_metrics) const
-{
-    return CSSPixels::nearest_value_for(font_relative_length_to_px_without_rounding(font_metrics, root_font_metrics));
-}
-
 double Length::font_relative_length_to_px_without_rounding(Length::FontMetrics const& font_metrics, Length::FontMetrics const& root_font_metrics) const
 {
     return ratio_between_font_relative_unit_and_px(m_unit, font_metrics, root_font_metrics) * m_value;
-}
-
-CSSPixels Length::viewport_relative_length_to_px(CSSPixelRect const& viewport_rect) const
-{
-    return CSSPixels::nearest_value_for(viewport_relative_length_to_px_without_rounding(viewport_rect));
 }
 
 double Length::viewport_relative_length_to_px_without_rounding(CSSPixelRect const& viewport_rect) const
@@ -144,13 +134,19 @@ double Length::container_relative_length_to_px_without_rounding(ResolutionContex
         }
 
         auto& subject = *context.subject_element;
-        const_cast<DOM::Element&>(subject).set_style_depends_on_size_container_query();
+        auto* deferred_marks = context.deferred_container_query_marks();
+        if (!deferred_marks)
+            const_cast<DOM::Element&>(subject).set_style_depends_on_size_container_query();
 
         auto query_container = get_or_compute_query_container_for_axis(context, physical_axis);
         // A container unit asks about the container's box exactly as a size query does, so the
         // container has to know that a resize of it is a change for something under it.
-        if (query_container)
-            const_cast<DOM::Element&>(*query_container).set_is_size_query_container();
+        if (query_container) {
+            if (deferred_marks)
+                (physical_axis == ContainerRelativeAxis::Width ? deferred_marks->width_query_container : deferred_marks->height_query_container) = query_container;
+            else
+                const_cast<DOM::Element&>(*query_container).set_is_size_query_container();
+        }
         if (!query_container) {
             context.record_viewport_relative_length_resolution();
             auto viewport_length = physical_axis == ContainerRelativeAxis::Width ? context.viewport_rect.width() : context.viewport_rect.height();
@@ -166,8 +162,12 @@ double Length::container_relative_length_to_px_without_rounding(ResolutionContex
             // A running partial relayout pass reports layout as up to date, but a container
             // with no paintable yet still needs the post-layout evaluation, which routes the
             // follow-up pass to the full layout path that resolves the container's size.
-            if (!subject.document().layout_is_up_to_date() || subject.document().is_running_update_layout())
-                const_cast<DOM::Document&>(subject.document()).set_needs_container_query_evaluation_after_layout(*query_container);
+            if (!subject.document().layout_is_up_to_date() || subject.document().is_running_update_layout()) {
+                if (deferred_marks)
+                    (physical_axis == ContainerRelativeAxis::Width ? deferred_marks->width_query_container_awaits_layout : deferred_marks->height_query_container_awaits_layout) = true;
+                else
+                    const_cast<DOM::Document&>(subject.document()).set_needs_container_query_evaluation_after_layout(*query_container);
+            }
             return 0.0;
         }
 

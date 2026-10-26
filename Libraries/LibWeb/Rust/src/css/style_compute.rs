@@ -15,6 +15,8 @@
 //! Element-bound inputs, such as container sizes and tree positions, are
 //! snapshotted by C++ before entering the Rust computation drive.
 
+use crate::css::css_string::CssString;
+use crate::css::ffi_support::OwnedBox;
 use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::{Arc, OnceLock};
@@ -1382,20 +1384,15 @@ pub(crate) fn value_is_computationally_independent(value: &StyleValueData) -> Op
         }
         StyleValueData::ColorMix {
             color_interpolation_method,
-            first_color,
-            first_percentage,
-            second_color,
-            second_percentage,
+            colors,
+            percentages,
             ..
         } => {
             let mut independent = true;
-            for value in [
-                color_interpolation_method,
-                first_color,
-                first_percentage,
-                second_color,
-                second_percentage,
-            ] {
+            for value in std::iter::once(color_interpolation_method)
+                .chain(colors.as_slice())
+                .chain(percentages.as_slice())
+            {
                 if let Some(value) = value.optional_data() {
                     independent = independent && value_is_computationally_independent(value)?;
                 }
@@ -1536,6 +1533,9 @@ pub(crate) fn collect_external_value_dependencies(value: &StyleValueData) -> Ext
                 collect_values(&[numerator, denominator], dependencies);
             }
             StyleValueData::Edge { offset, .. } => collect_optional(offset, dependencies),
+            StyleValueData::Anchor { fallback_value, .. } | StyleValueData::AnchorSize { fallback_value, .. } => {
+                collect_optional(fallback_value, dependencies);
+            }
             StyleValueData::Ray { angle, position, .. } => {
                 collect_optional(angle, dependencies);
                 collect_optional(position, dependencies);
@@ -1679,21 +1679,14 @@ pub(crate) fn collect_external_value_dependencies(value: &StyleValueData) -> Ext
             }
             StyleValueData::ColorMix {
                 color_interpolation_method,
-                first_color,
-                first_percentage,
-                second_color,
-                second_percentage,
+                colors,
+                percentages,
                 ..
-            } => collect_values(
-                &[
-                    color_interpolation_method,
-                    first_color,
-                    first_percentage,
-                    second_color,
-                    second_percentage,
-                ],
-                dependencies,
-            ),
+            } => {
+                collect_values(&[color_interpolation_method], dependencies);
+                collect_values(&colors.as_slice().iter().collect::<Vec<_>>(), dependencies);
+                collect_values(&percentages.as_slice().iter().collect::<Vec<_>>(), dependencies);
+            }
             StyleValueData::ContrastColor { color, .. } => collect(color.data(), dependencies),
             StyleValueData::LightDark { light, dark, .. } => collect_values(&[light, dark], dependencies),
             StyleValueData::Superellipse { parameter } => collect_optional(parameter, dependencies),
@@ -1927,21 +1920,14 @@ pub(crate) fn collect_unfixed_random_sharings_in_value(
         }
         StyleValueData::ColorMix {
             color_interpolation_method,
-            first_color,
-            first_percentage,
-            second_color,
-            second_percentage,
+            colors,
+            percentages,
             ..
-        } => collect_values(
-            &[
-                color_interpolation_method,
-                first_color,
-                first_percentage,
-                second_color,
-                second_percentage,
-            ],
-            sharings,
-        ),
+        } => {
+            collect_values(&[color_interpolation_method], sharings);
+            collect_values(&colors.as_slice().iter().collect::<Vec<_>>(), sharings);
+            collect_values(&percentages.as_slice().iter().collect::<Vec<_>>(), sharings);
+        }
         StyleValueData::ContrastColor { color, .. } => collect_values(&[color], sharings),
         StyleValueData::LightDark { light, dark, .. } => collect_values(&[light, dark], sharings),
         StyleValueData::Superellipse { parameter } => collect_values(&[parameter], sharings),
@@ -2134,7 +2120,7 @@ fn compute_border_or_outline_width(
 }
 
 // https://drafts.csswg.org/css-backgrounds/#compute-a-border-width
-fn snap_a_length_as_a_border_width(device_pixels_per_css_pixel: f64, length: CssPixels) -> CssPixels {
+pub(crate) fn snap_a_length_as_a_border_width(device_pixels_per_css_pixel: f64, length: CssPixels) -> CssPixels {
     // 1. Assert: len is non-negative.
     // NB: The caller guarantees this; negative widths are invalid at parse time.
 
@@ -2904,14 +2890,14 @@ pub struct FfiComputedAnimation {
     pub delay: f64,
     pub fill_mode: u8,
     pub composition: u8,
-    pub name: *const c_void,
+    pub name: *const CssString,
     pub timeline_kind: FfiAnimationTimelineKind,
     pub scroll_scroller: u8,
     pub scroll_axis: u8,
     /// The insets of a view() timeline.
     pub view_inset: FfiViewTimelineInset,
     /// The name of a named timeline, as a CSS string, or null.
-    pub timeline_name: *const c_void,
+    pub timeline_name: *const CssString,
     /// The edges of the animation attachment range, each a `TimelineRangeName` in the host's numbering and an offset
     /// from the start of that range: a length plus a percentage of the range.
     pub range_start_name: u8,
@@ -3470,6 +3456,20 @@ fn store_computed_value(longhand_table: &mut ComputedLonghandTable, entry: Compu
     longhand_table.set_computed(entry.property_id, computed, source_slot);
 }
 
+/// The background longhands whose lists are coordinated with the number of background-image layers when they compute.
+const BACKGROUND_LAYER_LONGHANDS: [u16; 7] = {
+    use crate::css::property_metadata::property_id as prop;
+    [
+        prop::BACKGROUND_ATTACHMENT,
+        prop::BACKGROUND_CLIP,
+        prop::BACKGROUND_ORIGIN,
+        prop::BACKGROUND_POSITION_X,
+        prop::BACKGROUND_POSITION_Y,
+        prop::BACKGROUND_REPEAT,
+        prop::BACKGROUND_SIZE,
+    ]
+};
+
 /// Drives the property computation loop: iterates every longhand in
 /// computation order, resolves logical pairing, reads the winning cascaded
 /// declarations straight from the store, selects between the cascaded,
@@ -3563,12 +3563,18 @@ pub(crate) unsafe fn drive_property_computation(
     let mut computed_float: Option<u16> = None;
     let mut computed_position: Option<u16> = None;
     debug_assert!(computed_property_words.is_none_or(|words| words.len() == LONGHAND_WORD_COUNT));
+    let is_selected = |property_id: u16| {
+        let property_index = usize::from(property_id - crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID);
+        computed_property_words.is_some_and(|words| words[property_index / 64] & (1 << (property_index % 64)) != 0)
+    };
+    // NB: The background layer longhands are coordinated with the number of background-image layers as they compute,
+    //     so a drive that evaluates background-image again evaluates them again as well.
+    let background_image_is_selected = is_selected(prop::BACKGROUND_IMAGE);
 
     for &property_id in computation_order {
         let required_driver_input = is_required_driver_input(property_id);
-        let property_index = usize::from(property_id - crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID);
-        let property_is_selected =
-            computed_property_words.is_some_and(|words| words[property_index / 64] & (1 << (property_index % 64)) != 0);
+        let property_is_selected = is_selected(property_id)
+            || (background_image_is_selected && BACKGROUND_LAYER_LONGHANDS.contains(&property_id));
         if !required_driver_input && !property_is_selected && computed_property_words.is_some() {
             continue;
         }
@@ -4316,6 +4322,18 @@ pub(crate) unsafe fn drive_property_computation(
                         NativeValue::Unsupported
                     }
                 }
+                // INTEROP: Preserve explicit right in declarations, but omit it from the computed value, as in
+                //          Chromium and WebKit.
+                (_, prop::TEXT_EMPHASIS_POSITION) => {
+                    if let StyleValueData::ValueList { values, .. } = value_data
+                        && let [horizontal, vertical] = values.as_slice()
+                        && matches!(vertical.data(), StyleValueData::Keyword { keyword: code } if *code == keyword::RIGHT)
+                    {
+                        NativeValue::StyleValue(Arc::new(horizontal.data().clone()))
+                    } else {
+                        NativeValue::Unchanged
+                    }
+                }
                 (_, prop::POSITION_AREA) => match compute_position_area(value_data) {
                     Some(value) => NativeValue::StyleValue(value),
                     None => NativeValue::Unchanged,
@@ -4546,14 +4564,14 @@ pub(crate) unsafe fn drive_property_computation(
                     clear_longhand_bit(&mut inherited_words, prop::OVERFLOW_Y);
                 }
             }
-        } else if property_id == prop::TEXT_ALIGN
+        } else if matches!(property_id, prop::TEXT_ALIGN | prop::TEXT_ALIGN_LAST)
             && let StyleValueData::Keyword { keyword: text_align } = value_data
         {
             let (has_parent_with_computed_values, parent_text_align, parent_direction_is_ltr) =
                 if let Some(snapshot) = snapshot {
-                    let parent_text_align = match snapshot.value(prop::TEXT_ALIGN) {
+                    let parent_text_align = match snapshot.value(property_id) {
                         Some(StyleValueData::Keyword { keyword }) => *keyword,
-                        _ => unreachable!("parent text-align must be a keyword"),
+                        _ => unreachable!("parent text-align and text-align-last must be keywords"),
                     };
                     let parent_direction_is_ltr = match snapshot.value(prop::DIRECTION) {
                         Some(StyleValueData::Keyword {
@@ -4565,9 +4583,11 @@ pub(crate) unsafe fn drive_property_computation(
                 } else {
                     (false, 0, true)
                 };
+            // https://drafts.csswg.org/css-text-4/#propdef-text-align-last
+            // Computed value: keyword as specified, except for match-parent which computes as defined above
             let adjustment = compute_text_align_adjustment(
                 *text_align,
-                is_th_element,
+                is_th_element && property_id == prop::TEXT_ALIGN,
                 has_parent_with_computed_values,
                 parent_text_align,
                 parent_direction_is_ltr,
@@ -4582,11 +4602,13 @@ pub(crate) unsafe fn drive_property_computation(
                     set_longhand_bit(&mut inherited_words, property_id);
                 }
             }
-            computed_text_align = Some(if adjustment.changed {
-                adjustment.keyword
-            } else {
-                *text_align
-            });
+            if property_id == prop::TEXT_ALIGN {
+                computed_text_align = Some(if adjustment.changed {
+                    adjustment.keyword
+                } else {
+                    *text_align
+                });
+            }
         } else if property_id == prop::COLOR_SCHEME
             && let StyleValueData::ColorScheme { scheme_codes, .. } = value_data
         {
@@ -4657,6 +4679,7 @@ pub(crate) unsafe fn drive_property_computation(
     let mut box_type_input = *box_type_input;
     box_type_input.display = display_before;
     box_type_input.float_value = computed_float.expect("float must be computed by the longhand driver");
+    box_type_input.writing_mode = computed_writing_mode_and_direction(longhand_table).0;
     box_type_input.position = computed_position.expect("position must be computed by the longhand driver");
     box_type_input.webkit_box_layout_transformation_applies =
         webkit_box_layout_transformation_applies(longhand_table, None);
@@ -4931,13 +4954,8 @@ fn calculated_offset(value: &StyleValueData) -> *const c_void {
 }
 
 /// The pixels of a computed length-percentage, resolving its percentages against `basis`.
-///
-/// # Safety
-/// `value` must point at live style value data.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_length_percentage_px(value: *const c_void, basis: f64) -> f64 {
-    // SAFETY: The caller passes a live style value.
-    let value = unsafe { &*value.cast::<StyleValueData>() };
+pub extern "C" fn rust_length_percentage_px(value: &StyleValueData, basis: f64) -> f64 {
     crate::css::computed_value_views::LengthPercentageRef::over(value)
         .to_px(CssPixels::nearest_value_for(basis))
         .to_double()
@@ -4986,13 +5004,8 @@ fn view_timeline_inset(value: Option<&StyleValueData>) -> FfiViewTimelineInset {
 }
 
 /// The insets a computed `view-timeline-inset` item describes, for a timeline the host builds from script.
-///
-/// # Safety
-/// `value` must point at live style value data.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_view_timeline_inset(value: *const c_void) -> FfiViewTimelineInset {
-    // SAFETY: Guaranteed by the caller.
-    let value = unsafe { &*value.cast::<StyleValueData>() };
+pub extern "C" fn rust_view_timeline_inset(value: &StyleValueData) -> FfiViewTimelineInset {
     let value = match value {
         StyleValueData::ValueList { values, separator, .. } if *separator == 1 => values.as_slice()[0].data(),
         value => value,
@@ -5005,7 +5018,7 @@ pub unsafe extern "C" fn rust_view_timeline_inset(value: *const c_void) -> FfiVi
 #[repr(C)]
 pub struct FfiTimelineDeclaration {
     /// The name, as a CSS string.
-    pub name: *const c_void,
+    pub name: *const CssString,
     pub is_view: bool,
     pub axis: u8,
     pub view_inset: FfiViewTimelineInset,
@@ -5076,7 +5089,7 @@ pub unsafe extern "C" fn rust_animation_values_timeline_declarations(
 pub unsafe extern "C" fn rust_animation_values_timeline_scope(
     values: &crate::css::computed_value_types::AnimationValues,
     context: *mut c_void,
-    scope: unsafe extern "C" fn(*mut c_void, *const c_void),
+    scope: unsafe extern "C" fn(*mut c_void, *const CssString),
 ) -> FfiTimelineScope {
     // SAFETY: A computed style group's handles point at retained style values it owns.
     let Some(value) = (unsafe { values.timeline_scope.pointer.cast::<StyleValueData>().as_ref() }) else {
@@ -5152,11 +5165,8 @@ pub extern "C" fn rust_animation_values_declare_timelines(
 }
 
 /// Whether a parsed `view-timeline-inset` value has a length in a unit that is not absolute.
-///
-/// # Safety
-/// `value` must point at live style value data.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_view_timeline_inset_has_relative_length(value: *const c_void) -> bool {
+pub extern "C" fn rust_view_timeline_inset_has_relative_length(value: &StyleValueData) -> bool {
     let is_absolute = |unit: u8| {
         matches!(
             length_unit_kinds().get(unit as usize),
@@ -5176,8 +5186,7 @@ pub unsafe extern "C" fn rust_view_timeline_inset_has_relative_length(value: *co
             _ => false,
         }
     }
-    // SAFETY: Guaranteed by the caller.
-    has_relative_length(unsafe { &*value.cast::<StyleValueData>() }, &is_absolute)
+    has_relative_length(value, &is_absolute)
 }
 
 /// The timeline a computed `animation-timeline` item asks for.
@@ -5186,7 +5195,7 @@ struct AnimationTimelineDescriptor {
     scroller: u8,
     axis: u8,
     view_inset: FfiViewTimelineInset,
-    name: *const c_void,
+    name: *const CssString,
 }
 
 fn animation_timeline_descriptor(value: &StyleValueData) -> AnimationTimelineDescriptor {
@@ -5300,17 +5309,12 @@ pub struct FfiAnimationRangeEdge {
 
 /// The edge a computed `animation-range-start` or `animation-range-end` value with a single item describes, for a range
 /// script sets. Answers false where the value has more than one item.
-///
-/// # Safety
-/// `value` must point at live style value data.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_animation_range_edge(
-    value: *const c_void,
+pub extern "C" fn rust_animation_range_edge(
+    value: &StyleValueData,
     is_end: bool,
     out: &mut FfiAnimationRangeEdge,
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    let value = unsafe { &*value.cast::<StyleValueData>() };
     let item = match value {
         StyleValueData::ValueList { values, separator, .. } if *separator == 1 => match values.as_slice() {
             [item] => item.data(),
@@ -5588,6 +5592,11 @@ fn keyword_from_style_value(value: &StyleValueData) -> u16 {
     *keyword
 }
 
+pub(crate) fn effective_writing_mode(table: &ComputedLonghandTable, overlay: Option<&AnimatedOverlay>) -> u8 {
+    keyword_to_writing_mode(effective_keyword(table, overlay, property_id::WRITING_MODE))
+        .unwrap_or(crate::css::css_enums::writing_mode::HORIZONTAL_TB)
+}
+
 pub(crate) fn effective_display(table: &ComputedLonghandTable, overlay: Option<&AnimatedOverlay>) -> FfiDisplay {
     let StyleValueData::Display { raw } = effective_longhand_data(table, overlay, property_id::DISPLAY) else {
         unreachable!("display must have a display value")
@@ -5620,6 +5629,9 @@ pub unsafe extern "C" fn rust_create_document_longhand_table(
             is_mathml_mtr: false,
             is_mathml_mtd: false,
             has_parent_display: false,
+            writing_mode: crate::css::css_enums::writing_mode::HORIZONTAL_TB,
+            parent_writing_mode: crate::css::css_enums::writing_mode::HORIZONTAL_TB,
+            is_svg_element: false,
             parent_display: FfiDisplay::block(),
             is_wbr_element: false,
             disallow_display_contents: false,
@@ -6114,20 +6126,15 @@ impl FfiHostAnimationSampleResult {
 }
 
 /// The custom properties a sample composed, with the names and values the rows point into.
-struct AnimatedCustomPropertyResults {
+pub struct AnimatedCustomPropertyResults {
     rows: Vec<FfiAnimatedCustomPropertyResult>,
     _retained: Vec<(RetainedUtf16FlyString, RetainedStyleValueData)>,
 }
 
 /// Release what `rust_sample_animation_effects` handed back for the animated custom properties.
-///
-/// # Safety
-/// `storage` must be null or a sample result's `animated_custom_properties_storage`, released once.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_release_animated_custom_property_results(storage: *mut c_void) {
-    if !storage.is_null() {
-        drop(unsafe { Box::from_raw(storage.cast::<AnimatedCustomPropertyResults>()) });
-    }
+pub extern "C" fn rust_release_animated_custom_property_results(storage: OwnedBox<AnimatedCustomPropertyResults>) {
+    drop(storage);
 }
 
 pub(crate) fn animation_length_resolution_context(
@@ -6615,6 +6622,7 @@ fn begin_animation_sample(
     if anim::animation_preparation_matches(Some(mutated_overlay), &composed, input.custom_property_environments) {
         anim::evaluate_animations(anim::ComputedAnimationBatch {
             context: input.animation_context(None, reference_box),
+            device_pixels_per_css_pixel: input.environment.device_pixels_per_css_pixel,
             sampled_effects: &composed,
             custom_property_environments: input.custom_property_environments,
             cache_preparation: true,
@@ -6782,6 +6790,7 @@ fn finish_animation_sample(
         && resolved.unfixed_random_sharings.is_empty();
     let custom_results = anim::evaluate_animations(anim::ComputedAnimationBatch {
         context: input.animation_context(Some(&length_contexts.remaining), reference_box),
+        device_pixels_per_css_pixel: input.environment.device_pixels_per_css_pixel,
         sampled_effects: &composed,
         custom_property_environments: input.custom_property_environments,
         cache_preparation,
@@ -7084,7 +7093,7 @@ pub(crate) fn expand_shorthands_with<Sink>(
     sink(property_id, data, has_style_sheet_context);
 }
 
-struct ShorthandExpansion {
+pub struct ShorthandExpansion {
     properties: Vec<FfiExpandedProperty>,
     _values: Vec<RetainedStyleValueData>,
 }
@@ -7108,18 +7117,12 @@ fn expand_shorthands(property_id: u16, data: &RetainedStyleValueData) -> Shortha
 
 /// Expands a declared property into one owned batch of longhand assignments, recursing through
 /// shorthand and pending-substitution values.
-///
-/// # Safety
-/// `data` must point to live Rust-owned style value data.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_expand_property_shorthands(
+pub extern "C" fn rust_expand_property_shorthands(
     property_id: u16,
-    data: *const c_void,
+    data: crate::css::ffi_support::ArcRef<'_, StyleValueData>,
 ) -> FfiShorthandExpansion {
-    // SAFETY: Guaranteed by the caller.
-    let data = unsafe {
-        RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(data.cast()))
-    };
+    let data = RetainedStyleValueData::from_arc(data.to_arc());
     let expansion = Box::new(expand_shorthands(property_id, &data));
     let properties = expansion.properties.as_ptr();
     let count = expansion.properties.len();
@@ -7130,11 +7133,9 @@ pub unsafe extern "C" fn rust_expand_property_shorthands(
     }
 }
 
-/// # Safety
-/// `storage` must be a live pointer returned by `rust_expand_property_shorthands`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_shorthand_expansion_destroy(storage: *mut c_void) {
-    drop(unsafe { Box::from_raw(storage.cast::<ShorthandExpansion>()) });
+pub extern "C" fn rust_shorthand_expansion_destroy(storage: OwnedBox<ShorthandExpansion>) {
+    drop(storage);
 }
 
 pub(crate) fn display_is_none(raw: u32) -> bool {
@@ -7158,6 +7159,11 @@ pub struct FfiBoxTypeTransformationInput {
     pub is_mathml_mtd: bool,
     pub has_parent_display: bool,
     pub parent_display: FfiDisplay,
+    /// The computed writing-mode of the element and of the box it would be the child of.
+    pub writing_mode: u8,
+    pub parent_writing_mode: u8,
+    /// Whether the element is an SVG element, whose boxes are not laid out by the CSS display types.
+    pub is_svg_element: bool,
     pub is_wbr_element: bool,
     pub disallow_display_contents: bool,
     pub rewrite_inline_flow: bool,
@@ -7186,6 +7192,7 @@ pub(crate) fn rust_box_type_transformation_input(
     target: FfiStyleAdjustmentTarget,
     has_parent_display: bool,
     parent_display: FfiDisplay,
+    parent_writing_mode: u8,
 ) -> FfiBoxTypeTransformationInput {
     use crate::css::style::bridge::element_adjustment_fact as fact;
 
@@ -7203,6 +7210,9 @@ pub(crate) fn rust_box_type_transformation_input(
         is_mathml_mtd: has(fact::IS_MATHML_MTD),
         has_parent_display,
         parent_display,
+        writing_mode: crate::css::css_enums::writing_mode::HORIZONTAL_TB,
+        parent_writing_mode,
+        is_svg_element: has(fact::IS_SVG_ELEMENT),
         is_wbr_element: adjust_element && has(fact::IS_WBR),
         disallow_display_contents: adjust_element && has(fact::DISALLOW_DISPLAY_CONTENTS),
         rewrite_inline_flow: adjust_element && has(fact::REWRITE_INLINE_FLOW),
@@ -7232,7 +7242,13 @@ pub extern "C" fn rust_animated_box_type_transformation_input(
         Some(node) => crate::css::style::engine_calls::with_engine(read, host, |engine| {
             engine.composition_box_type_transformation_input(node, pseudo_kind)
         }),
-        None => rust_box_type_transformation_input(0, FfiStyleAdjustmentTarget::Element, false, FfiDisplay::block()),
+        None => rust_box_type_transformation_input(
+            0,
+            FfiStyleAdjustmentTarget::Element,
+            false,
+            FfiDisplay::block(),
+            crate::css::css_enums::writing_mode::HORIZONTAL_TB,
+        ),
     }
 }
 
@@ -7482,6 +7498,30 @@ fn transform_box_type(input: &FfiBoxTypeTransformationInput) -> FfiBoxTypeTransf
         }
     }
 
+    // https://drafts.csswg.org/css-writing-modes-4/#block-flow
+    // If a box has a different 'writing-mode' value than its parent box (i.e. nearest ancestor without
+    // 'display: contents'):
+    if input.has_parent_display
+        && input.writing_mode != input.parent_writing_mode
+        && !input.is_svg_element
+        && new_display.is_outside_and_inside()
+    {
+        // - If the box would otherwise become an in-flow box with a computed 'display' of 'inline', its 'display'
+        //   computes instead to 'inline-block'.
+        // - If the box is a block container, then it establishes an independent block formatting context.
+        // - More generally, if its specified inner display type is 'flow', then its computed inner display type
+        //   becomes 'flow-root'.
+        // NB: Layout makes a block container with another writing mode than its parent box establish an
+        //     independent formatting context, so only the inline box's display changes here.
+        if new_display.is_flow_inside() && new_display.is_inline_outside() {
+            new_display = FfiDisplay::outside_and_inside(
+                new_display.outside,
+                crate::css::css_enums::display_inside::FLOW_ROOT,
+                new_display.list_item,
+            );
+        }
+    }
+
     FfiBoxTypeTransformation {
         set_float_none,
         changed_display: new_display != display_before_transformation,
@@ -7676,6 +7716,7 @@ fn finalize_animated_box_type(
     };
     box_type.position = effective_keyword(longhand_table, view, prop::POSITION);
     box_type.float_value = effective_keyword(longhand_table, view, prop::FLOAT);
+    box_type.writing_mode = effective_writing_mode(longhand_table, view);
     box_type.webkit_box_layout_transformation_applies = webkit_box_layout_transformation_applies(longhand_table, view);
     // An axis the overlay does not animate is adjusted from its keyword before the base adjusted it against the other
     // axis, which the overlay may animate out of that adjustment.
@@ -8019,60 +8060,6 @@ pub(crate) mod ffi_test_stubs {
         }
     }
     #[unsafe(no_mangle)]
-    extern "C" fn ladybird_gfx_path_destroy(path: *mut std::ffi::c_void) {
-        if !path.is_null() {
-            // SAFETY: Every stand-in path comes from the `Box<u8>` the deserializer stub leaked to the caller.
-            drop(unsafe { Box::from_raw(path.cast::<u8>()) });
-        }
-    }
-    #[unsafe(no_mangle)]
-    extern "C" fn ladybird_gfx_path_serialize(
-        _path: *const std::ffi::c_void,
-        append: unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, usize),
-        context: *mut std::ffi::c_void,
-    ) {
-        let stand_in_path_bytes = [7u8, 8, 9];
-        // SAFETY: The serializer hands its own sink and append function; the bytes are live for the call.
-        unsafe { append(context, stand_in_path_bytes.as_ptr(), stand_in_path_bytes.len()) };
-    }
-    // A stand-in path remembers the first byte it was created from, so tests can tell paths apart.
-    #[unsafe(no_mangle)]
-    extern "C" fn ladybird_gfx_path_create_from_serialized_bytes(
-        bytes: *const u8,
-        count: usize,
-    ) -> *mut std::ffi::c_void {
-        // SAFETY: The caller hands `count` readable bytes.
-        let content = if count == 0 { 0u8 } else { unsafe { *bytes } };
-        Box::into_raw(Box::new(content)).cast()
-    }
-    #[unsafe(no_mangle)]
-    extern "C" fn ladybird_gfx_path_equals(a: *const std::ffi::c_void, b: *const std::ffi::c_void) -> bool {
-        // SAFETY: Both stand-in paths are the leaked `Box<u8>` the stub above created.
-        unsafe { *a.cast::<u8>() == *b.cast::<u8>() }
-    }
-    #[unsafe(no_mangle)]
-    extern "C" fn ladybird_gfx_path_bounding_box(_path: *const std::ffi::c_void, out_x_y_width_height: *mut f32) {
-        let stand_in_bounding_box = [0.0f32, 0.0, 1.0, 1.0];
-        // SAFETY: The caller hands a writable array of four floats.
-        unsafe { std::ptr::copy_nonoverlapping(stand_in_bounding_box.as_ptr(), out_x_y_width_height, 4) };
-    }
-    #[unsafe(no_mangle)]
-    extern "C" fn ladybird_gfx_path_contains(
-        _path: *const std::ffi::c_void,
-        _x: f32,
-        _y: f32,
-        _winding_rule: i32,
-    ) -> bool {
-        false
-    }
-    #[unsafe(no_mangle)]
-    extern "C" fn ladybird_gfx_path_append_svg_string(
-        _path: *const std::ffi::c_void,
-        _append: unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, usize),
-        _context: *mut std::ffi::c_void,
-    ) {
-    }
-    #[unsafe(no_mangle)]
     extern "C" fn ladybird_gfx_process_next_structural_epoch() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -8190,6 +8177,9 @@ mod tests {
             is_mathml_mtr: false,
             is_mathml_mtd: false,
             has_parent_display: false,
+            writing_mode: crate::css::css_enums::writing_mode::HORIZONTAL_TB,
+            parent_writing_mode: crate::css::css_enums::writing_mode::HORIZONTAL_TB,
+            is_svg_element: false,
             parent_display: FfiDisplay::block(),
             is_wbr_element: false,
             disallow_display_contents: false,

@@ -18,6 +18,7 @@ use num_traits::{Signed, Zero};
 use crate::bytecode::executable::{Executable, StaticPropertyLookupCacheSite};
 use crate::compile::{CompiledEval, EvalContext, parse_eval};
 use crate::gc::class::{Extends, GcCell};
+use crate::gc::defer_gc::DeferGc;
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::gc::root::MarkedVec;
 use crate::hash_table::Utf16FlyStringHashTable;
@@ -57,7 +58,7 @@ use crate::runtime::private_environment::PrivateEnvironment;
 use crate::runtime::promise_capability::{new_promise_capability, try_or_reject};
 use crate::runtime::property_attributes::PropertyAttributes;
 use crate::runtime::property_descriptor::PropertyDescriptor;
-use crate::runtime::property_key::PropertyKey;
+use crate::runtime::property_key::{NonSymbolPropertyKey, PropertyKey};
 use crate::runtime::proxy_object::ProxyObject;
 use crate::runtime::realm::Realm;
 use crate::runtime::shared_function_instance_data::{
@@ -377,7 +378,7 @@ pub struct PropertyKeyGroups<'vm> {
     keys: MarkedVec<'vm, PropertyKey>,
     elements: Vec<MarkedVec<'vm, Value>>,
     /// Symbol keys are only kept in the marked list of keys and looked up one by one.
-    index_of_string_or_number_key: HashMap<PropertyKey, usize>,
+    index_of_string_or_number_key: HashMap<NonSymbolPropertyKey, usize>,
 }
 
 impl<'vm> PropertyKeyGroups<'vm> {
@@ -443,8 +444,8 @@ impl<'vm> KeyedGroups<'vm> for PropertyKeyGroups<'vm> {
         new_elements.push(value);
 
         // 3. Append group as the last element of groups.
-        if !key.is_symbol() {
-            self.index_of_string_or_number_key.insert(key.clone(), self.keys.len());
+        if let Some(key) = NonSymbolPropertyKey::new(key.clone()) {
+            self.index_of_string_or_number_key.insert(key, self.keys.len());
         }
         self.keys.push(key);
         self.elements.push(new_elements);
@@ -735,23 +736,23 @@ pub fn ordinary_create_from_constructor(
     constructor: Gc<FunctionObject>,
     intrinsic_default_prototype: IntrinsicDefaultPrototype,
 ) -> ThrowCompletionOr<Gc<Object>> {
-    ordinary_create_from_constructor_of(vm, realm, constructor, intrinsic_default_prototype, |prototype| {
+    ordinary_create_from_constructor_of(vm, realm, constructor, intrinsic_default_prototype, |_, prototype| {
         Object::new_with_prototype(vm, Object::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No)
     })
 }
 
 // 10.1.13 OrdinaryCreateFromConstructor ( constructor, intrinsicDefaultProto [ , internalSlotsList ] ), https://tc39.es/ecma262/#sec-ordinarycreatefromconstructor
 /// The form of OrdinaryCreateFromConstructor that creates an object with the internal slots of a T, which `create`
-/// makes from the prototype.
+/// builds from the prototype, as Heap::allocate() does.
 pub fn ordinary_create_from_constructor_of<T: GcCell + Extends<Object>>(
     vm: &Vm,
     realm: Gc<Realm>,
     constructor: Gc<FunctionObject>,
     intrinsic_default_prototype: IntrinsicDefaultPrototype,
-    create: impl FnOnce(Gc<Object>) -> T,
+    create: impl FnOnce(&DeferGc<'_>, Gc<Object>) -> T,
 ) -> ThrowCompletionOr<Gc<T>> {
     let prototype = get_prototype_from_constructor(vm, constructor, intrinsic_default_prototype)?;
-    Ok(realm.create_object(vm, create(prototype)))
+    Ok(realm.create_object(vm, |defer_gc| create(defer_gc, prototype)))
 }
 
 // 10.1.14 GetPrototypeFromConstructor ( constructor, intrinsicDefaultProto ), https://tc39.es/ecma262/#sec-getprototypefromconstructor
@@ -2103,13 +2104,17 @@ pub struct DisposeCapability {
 // 2.1.2 DisposableResource Records, https://tc39.es/proposal-explicit-resource-management/#sec-disposableresource-records
 #[derive(Clone, Copy, Trace)]
 pub struct DisposableResource {
-    pub resource_value: Option<Gc<Object>>, // [[ResourceValue]]
+    pub resource_value: Value, // [[ResourceValue]]
     #[gc(untraced)]
     pub hint: InitializeBindingHint, // [[Hint]]
     pub dispose_method: Option<Gc<FunctionObject>>, // [[DisposeMethod]]
 }
 
 // 2.1.3 NewDisposeCapability ( ), https://tc39.es/proposal-explicit-resource-management/#sec-newdisposecapability
+#[cfg_attr(
+    ladybird_gc_lints,
+    expect(gc_container_on_stack, reason = "a new capability holds no resources")
+)]
 pub fn new_dispose_capability() -> DisposeCapability {
     // 1. Let stack be a new empty List.
     // 2. Return the DisposeCapability Record { [[DisposableResourceStack]]: stack }.
@@ -2152,7 +2157,7 @@ pub fn add_disposable_resource(
     // 3. Append resource to disposeCapability.[[DisposableResourceStack]].
     // NB: Creating the resource can run JavaScript, so the capability is only borrowed to append to it.
     dispose_capability
-        .borrow_mut()
+        .borrow_mut(vm)
         .disposable_resource_stack
         .get_or_insert_with(Vec::new)
         .push(resource);
@@ -2168,25 +2173,32 @@ pub fn create_disposable_resource(
     hint: InitializeBindingHint,
     method: Option<Gc<FunctionObject>>,
 ) -> ThrowCompletionOr<DisposableResource> {
+    let mut value = value;
     let mut method = method;
 
     // 1. If method is not present, then
-    // a. If V is either null or undefined, then
-    //    i. Set V to undefined.
-    //    ii. Set method to undefined.
-    // b. Else,
-    if method.is_none() && !value.is_nullish() {
-        // i. If V is not an Object, throw a TypeError exception.
-        if !value.is_object() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&value]);
+    if method.is_none() {
+        // a. If V is either null or undefined, then
+        if value.is_nullish() {
+            // i. Set V to undefined.
+            value = Value::UNDEFINED;
+
+            // ii. Set method to undefined.
         }
+        // b. Else,
+        else {
+            // i. If V is not an Object, throw a TypeError exception.
+            if !value.is_object() {
+                return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&value]);
+            }
 
-        // ii. Set method to ? GetDisposeMethod(V, hint).
-        method = get_dispose_method(vm, value, hint)?;
+            // ii. Set method to ? GetDisposeMethod(V, hint).
+            method = get_dispose_method(vm, value, hint)?;
 
-        // iii. If method is undefined, throw a TypeError exception.
-        if method.is_none() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NoDisposeMethod, &[&value]);
+            // iii. If method is undefined, throw a TypeError exception.
+            if method.is_none() {
+                return vm.throw_completion(ErrorKind::TypeError, ErrorType::NoDisposeMethod, &[&value]);
+            }
         }
     }
     // 2. Else,
@@ -2195,7 +2207,7 @@ pub fn create_disposable_resource(
 
     // 3. Return the DisposableResource Record { [[ResourceValue]]: V, [[Hint]]: hint, [[DisposeMethod]]: method }.
     Ok(DisposableResource {
-        resource_value: value.is_object().then(|| value.as_object()),
+        resource_value: value,
         hint,
         dispose_method: method,
     })
@@ -2320,9 +2332,7 @@ pub fn dispose_resources(
             .expect("the disposable resource stack does not change while it is disposed of");
 
         // a. Let value be resource.[[ResourceValue]].
-        // NB: The resource keeps an undefined value as no object, which becomes null, so the method is called with null
-        //     as its this value when the value is undefined.
-        let value = resource.resource_value.map_or(Value::NULL, Value::from_object);
+        let value = resource.resource_value;
 
         // b. Let hint be resource.[[Hint]].
         let hint = resource.hint;
@@ -2344,20 +2354,21 @@ pub fn dispose_resources(
             // i. Let result be Completion(Call(method, value)).
             let result = call_function_object(vm, method, value, &[]);
 
+            let mut result = result;
+
             // ii. If result is a normal completion and hint is async-dispose, then
             if let Ok(result_value) = result
                 && hint == InitializeBindingHint::AsyncDispose
             {
                 // 1. Set result to Completion(Await(result.[[Value]])).
-                // NB: This drops a throw completion of the Await rather than handling it in step iii, so the rejection
-                //     of a promise an async-dispose method returns is lost.
-                let _ = r#await(vm, result_value);
+                result = r#await(vm, result_value);
 
                 // 2. Set hasAwaited to true.
                 has_awaited = true;
             }
+
             // iii. If result is a throw completion, then
-            else if let Err(throw) = result {
+            if let Err(throw) = result {
                 // 1. If completion is a throw completion, then
                 if completion.is_error() {
                     // a. Set result to result.[[Value]].
@@ -2411,7 +2422,7 @@ pub fn dispose_resources(
     //    collection, at this point.
 
     // 6. Set disposeCapability.[[DisposableResourceStack]] to a new empty List.
-    dispose_capability.borrow_mut().disposable_resource_stack = None;
+    dispose_capability.borrow_mut(vm).disposable_resource_stack = None;
 
     // 7. Return completion.
     completion

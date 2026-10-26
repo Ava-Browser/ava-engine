@@ -36,6 +36,7 @@
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/PaintTiming/PaintTiming.h>
 #include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/PictureInPicture/PictureInPictureWindow.h>
@@ -129,6 +130,10 @@ void HTMLVideoElement::adopted_from(DOM::Document& old_document)
         m_load_event_delayer.emplace(document());
 
     release_presented_video_frame_held_for_callbacks();
+
+    // NB: See determine_element_poster_frame().
+    if (old_document.is_temporary_document_for_fragment_parsing())
+        determine_element_poster_frame(attribute(HTML::AttributeNames::poster)).release_value_but_fixme_should_propagate_errors();
 }
 
 void HTMLVideoElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
@@ -252,6 +257,13 @@ Optional<CSSPixelSize> HTMLVideoElement::natural_element_size() const
 // https://html.spec.whatwg.org/multipage/media.html#attr-video-poster
 WebIDL::ExceptionOr<void> HTMLVideoElement::determine_element_poster_frame(Optional<Utf16String> const& poster)
 {
+    // AD-HOC: An element in a temporary document for fragment parsing does not fetch anything, so that markup parsed
+    //         into such a document, for example by the Sanitizer API, causes no network requests for elements that
+    //         are never inserted anywhere. The poster frame is determined once the element is adopted into another
+    //         document.
+    if (document().is_temporary_document_for_fragment_parsing())
+        return {};
+
     auto& realm = HTML::relevant_realm(*this);
     // 1. If there is an existing instance of this algorithm running for this video element, abort that instance of
     //    this algorithm without changing the poster frame.
@@ -295,11 +307,11 @@ WebIDL::ExceptionOr<void> HTMLVideoElement::determine_element_poster_frame(Optio
     request->set_use_url_credentials(true);
 
     // 6. Fetch request. This must delay the load event of the element's node document.
-    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DeliverStreamToConsumerAgent };
     m_load_event_delayer.emplace(document());
 
     // 7. If an image is thus obtained, the poster frame is that image. Otherwise, there is no poster frame.
-    fetch_algorithms_input.process_response = [weak_self = GC::Weak(*this)](auto response) {
+    fetch_algorithms_input.process_response = [weak_self = GC::Weak(*this), poster_url = request->url()](auto response) {
         if (!weak_self)
             return;
         auto& self = *weak_self;
@@ -321,19 +333,29 @@ WebIDL::ExceptionOr<void> HTMLVideoElement::determine_element_poster_frame(Optio
             return;
         }
 
-        auto on_image_data_read = GC::create_function(GC::Heap::the(), [weak_self](ByteBuffer image_data) {
+        auto on_image_data_read = GC::create_function(GC::Heap::the(), [weak_self, poster_url](ByteBuffer image_data) {
             if (!weak_self)
                 return;
             // 6. If an image is thus obtained, the poster frame is that image. Otherwise, there is no poster frame.
             (void)Platform::ImageCodecPlugin::the().decode_image(
                 image_data,
-                [weak_self](Web::Platform::DecodedImage& image) -> ErrorOr<void> {
+                [weak_self, poster_url](Web::Platform::DecodedImage& image) -> ErrorOr<void> {
                     if (!weak_self)
                         return {};
                     RefPtr<Gfx::Bitmap> poster_frame;
                     if (!image.frames.is_empty())
                         poster_frame = move(image.frames[0].bitmap);
+                    Optional<CSSPixelSize> natural_size;
+                    if (poster_frame)
+                        natural_size = CSSPixelSize { poster_frame->width(), poster_frame->height() };
                     finalize(*weak_self, move(poster_frame));
+
+                    // https://w3c.github.io/paint-timing/#sec-modifications-dom
+                    // When an Element element's associated image request has become completely available, run the
+                    // algorithm to process an image that finished loading passing in element and its associated image
+                    // request as inputs.
+                    if (natural_size.has_value())
+                        PaintTiming::process_an_image_that_finished_loading(*weak_self, { .url = Utf16String::from_utf8(poster_url.serialize()), .natural_size = natural_size });
                     return {};
                 },
                 [weak_self](auto&) {

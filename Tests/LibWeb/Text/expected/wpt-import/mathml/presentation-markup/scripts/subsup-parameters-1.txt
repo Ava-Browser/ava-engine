@@ -1,0 +1,15 @@
+Harness status: OK
+
+Found 10 tests
+
+10 Pass
+Pass	SpaceAfterScript
+Pass	SuperscriptShiftUp
+Pass	SuperscriptShiftUpCramped
+Pass	SubscriptShiftDown
+Pass	SubSuperscriptGapMin
+Pass	SuperscriptBottomMaxWithSubscript
+Pass	SubscriptTopMax
+Pass	SuperscriptBottomMin
+Pass	SubscriptBaselineDrop
+Pass	SuperscriptBaselineDrop

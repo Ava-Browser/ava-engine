@@ -45,6 +45,7 @@
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/ImageCodecPlugin.h>
+#include <LibWeb/ReferrerPolicy/AbstractOperations.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWebCommon/Infra/CharacterTypes.h>
 
@@ -182,7 +183,25 @@ RefPtr<CSS::StyleSheetState> HTMLLinkElement::sheet() const
 
 void HTMLLinkElement::finished_loading_critical_style_subresources(AnyFailed)
 {
+    // NB: The style sheet of an older fetch stays associated until a newer fetch's response is processed. That newer
+    //     fetch owns the document load event delayer, so the old sheet's imports must not release it.
+    if (m_loaded_style_sheet_fetch_generation != m_current_fetch_generation)
+        return;
+
     m_document_load_event_delayer.clear();
+
+    auto fetch_generation = exchange(m_fetch_generation_waiting_for_critical_subresources, {});
+    if (!fetch_generation.has_value())
+        return;
+
+    queue_an_element_task(Task::Source::Networking, [link = GC::Ref { *this }, fetch_generation = *fetch_generation] {
+        if (fetch_generation != link->m_current_fetch_generation || !link->m_stylesheet_processing_pending)
+            return;
+
+        // 2. Fire an event named load at el.
+        link->dispatch_event(create_event_for_element(*link, HTML::EventNames::load));
+        link->finish_processing_stylesheet_resource(fetch_generation);
+    });
 }
 
 bool HTMLLinkElement::has_loaded_icon() const
@@ -437,7 +456,7 @@ GC::Ptr<Fetch::Infrastructure::Request> HTMLLinkElement::create_link_request(HTM
     auto request = create_potential_CORS_request(*url, options.destination, options.crossorigin);
 
     // 6. Set request's policy container to options's policy container.
-    request->set_policy_container(GC::Ref { *options.policy_container });
+    request->set_policy_container(options.policy_container);
 
     // 7. Set request's integrity metadata to options's integrity.
     request->set_integrity_metadata(options.integrity);
@@ -519,7 +538,7 @@ void HTMLLinkElement::default_fetch_and_process_linked_resource(u64 fetch_genera
     }
 
     // 7. Fetch request with processResponseConsumeBody set to the following steps given response response and null, failure, or a byte sequence bodyBytes:
-    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::ConsumeForCallback };
     fetch_algorithms_input.process_response_consume_body = [this, fetch_generation](auto response, auto body_bytes) {
         // "if, since the resource in question was fetched, it has become appropriate to fetch it again"
         if (fetch_generation != m_current_fetch_generation)
@@ -791,7 +810,7 @@ void HTMLLinkElement::fetch_and_process_linked_prefetch_resource()
 
     // 6. Let processPrefetchResponse be the following steps given a response response and null, failure, or a byte
     //    sequence bytesOrNull:
-    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::ConsumeForCallback };
     fetch_algorithms_input.process_response_consume_body = [this, fetch_generation = m_current_fetch_generation](auto response, auto) {
         if (fetch_generation != m_current_fetch_generation)
             return;
@@ -1005,7 +1024,7 @@ void HTMLLinkElement::preload(LinkProcessingOptions& options, Function<void(Fetc
 
     // 11. Set controller to the result of fetching request, with processResponseConsumeBody set to the following steps
     //     given a response response and null, failure, or a byte sequence bodyBytes:
-    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::ConsumeForCallback };
     fetch_algorithms_input.process_response_consume_body = [&realm, options = GC::Ref { options }, process_response = move(process_response), entry, report_timing](GC::Ref<Fetch::Infrastructure::Response> response, Fetch::Infrastructure::FetchAlgorithms::BodyBytes body_bytes) {
         // FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
         //        https://github.com/whatwg/html/issues/9355
@@ -1466,7 +1485,7 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
             // location stays the URL it was linked at.
             CSS::Parser::Parser::parse_stylesheet_off_thread(
                 CSS::Parser::ParsingParams { document() }, maybe_decoded_string.release_value(),
-                [link = GC::make_root(*this), loaded_document = GC::make_root(document()), fetch_generation = m_current_fetch_generation, location = response.url_list().first(), base_url = response.url_list().last(), origin_clean](CSS::Parser::RustStyleSheetParse parsed) mutable {
+                [link = GC::make_root(*this), loaded_document = GC::make_root(document()), fetch_generation = m_current_fetch_generation, location = response.url_list().first(), base_url = response.url_list().last(), origin_clean, referrer_policy = ReferrerPolicy::parse_a_referrer_policy_from_a_referrer_policy_header(response)](CSS::Parser::RustStyleSheetParse parsed) mutable {
                     if (fetch_generation != link->m_current_fetch_generation || !link->m_stylesheet_processing_pending)
                         return;
                     // NB: An inactive document's element tasks cannot run. Release its result here.
@@ -1479,7 +1498,7 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
                     //     roots: the roots of a function that died would keep them alive through the collection that
                     //     finds it dead.
                     link->queue_an_element_task(Task::Source::Networking,
-                        [link = GC::Ref { *link }, loaded_document = GC::Ref { *loaded_document }, fetch_generation, location = move(location), base_url = move(base_url), parsed = move(parsed), origin_clean] {
+                        [link = GC::Ref { *link }, loaded_document = GC::Ref { *loaded_document }, fetch_generation, location = move(location), base_url = move(base_url), parsed = move(parsed), origin_clean, referrer_policy] {
                             if (fetch_generation != link->m_current_fetch_generation || !link->m_stylesheet_processing_pending)
                                 return;
                             if (&link->document() != loaded_document.ptr() || !loaded_document->is_fully_active()
@@ -1489,11 +1508,18 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
                                 return;
                             }
 
-                            CSS::Parser::Parser parser { CSS::Parser::ParsingParams { *loaded_document } };
-                            auto sheet = parser.create_css_stylesheet(parsed, location);
+                            // NB: The sheet records its referrer policy as it is created, before its imports start to load.
+                            auto sheet = CSS::StyleSheetState::create(parsed.native_rules(), loaded_document.ptr(), {}, location, referrer_policy);
                             if (base_url != location)
                                 sheet->set_base_url(move(base_url));
                             link->associate_style_sheet(*sheet, origin_clean);
+
+                            // NB: The sheet has to be associated before its critical subresources (@import rules)
+                            //     get fetched. Wait for them before firing load and unblocking scripts.
+                            if (sheet->loading_state() == CSS::StyleSheetState::LoadingState::Loading) {
+                                link->m_fetch_generation_waiting_for_critical_subresources = fetch_generation;
+                                return;
+                            }
 
                             // 2. Fire an event named load at el.
                             link->dispatch_event(create_event_for_element(*link, HTML::EventNames::load));
@@ -1522,6 +1548,7 @@ void HTMLLinkElement::associate_style_sheet(CSS::StyleSheetState& sheet, CSS::St
         (m_relationship & Relationship::Alternate && !m_explicitly_enabled) ? CSS::StyleScope::Alternate::Yes : CSS::StyleScope::Alternate::No,
         origin_clean, nullptr, nullptr);
     m_loaded_style_sheet = sheet;
+    m_loaded_style_sheet_fetch_generation = m_current_fetch_generation;
 
     // NB: Removing disabled explicitly enables the sheet, even if its title would disable it.
     if (m_explicitly_enabled)
@@ -1543,6 +1570,7 @@ void HTMLLinkElement::associate_empty_style_sheet(Fetch::Infrastructure::Respons
 
 void HTMLLinkElement::cancel_pending_stylesheet_processing()
 {
+    m_fetch_generation_waiting_for_critical_subresources = {};
     if (!m_stylesheet_processing_pending)
         return;
     m_stylesheet_processing_pending = false;
@@ -1632,7 +1660,7 @@ void HTMLLinkElement::load_fallback_favicon_if_needed(GC::Ref<DOM::Document> doc
     request->set_use_url_credentials(true);
 
     // 2. Let response be the result of fetching request.
-    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DeliverStreamToConsumerAgent };
     fetch_algorithms_input.process_response = [document, request](GC::Ref<Fetch::Infrastructure::Response> response) {
         auto& realm = document->relevant_settings_object().realm();
         auto global = GC::Ref { realm.global_object() };
@@ -1686,7 +1714,7 @@ HTMLLinkElement::LinkProcessingOptions::LinkProcessingOptions(
     URL::URL base_url,
     URL::Origin origin,
     GC::Ref<HTML::EnvironmentSettingsObject> environment,
-    GC::Ref<HTML::PolicyContainer> policy_container,
+    NonnullRefPtr<HTML::PolicyContainer> policy_container,
     GC::Ptr<Web::DOM::Document> document,
     Utf16String cryptographic_nonce_metadata,
     Fetch::Infrastructure::Request::Priority fetch_priority)
@@ -1707,7 +1735,6 @@ void HTMLLinkElement::LinkProcessingOptions::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(environment);
-    visitor.visit(policy_container);
     visitor.visit(document);
     visitor.visit(on_document_ready);
 }

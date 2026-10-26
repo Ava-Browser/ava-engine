@@ -68,6 +68,7 @@ pub struct InheritedBoxValues {
     pub writing_mode: u8,
     pub content_visibility: u8,
     pub image_rendering: u8,
+    pub text_orientation: u8,
 }
 
 impl ComputedStyleValueHandle {
@@ -333,6 +334,7 @@ impl_content_hash_by_field!(InheritedBoxValues {
     writing_mode,
     content_visibility,
     image_rendering,
+    text_orientation,
 });
 // The anchor-inset wrappers are pure derivatives of the anchor-inset fields, so payload equality
 // excludes them and the hash follows it field for field.
@@ -404,6 +406,29 @@ macro_rules! impl_computed_payload_clone_and_eq {
 
         impl_content_hash_by_field!($type { $($field),+ });
     };
+    // A style group whose payload holds values that layout does not read, each followed by `=> paint_only`, or values
+    // that layout reads only in part, each followed by `=>` and the function that compares that part.
+    ($type:ty { $($field:ident $(=> $layout_comparison:ident)?),+ $(,)? }) => {
+        impl_computed_payload_clone_and_eq!($type { $($field),+ });
+
+        impl StyleGroupLayoutInputs for $type {
+            fn layout_inputs_equal(&self, other: &Self) -> bool {
+                true $(&& layout_input_equal!(self.$field, other.$field $(, $layout_comparison)?))+
+            }
+        }
+    };
+}
+
+macro_rules! layout_input_equal {
+    ($first:expr, $second:expr) => {
+        $first == $second
+    };
+    ($first:expr, $second:expr, paint_only) => {
+        true
+    };
+    ($first:expr, $second:expr, $layout_inputs_equal:ident) => {
+        $layout_inputs_equal(&$first, &$second)
+    };
 }
 
 impl_computed_payload_clone_and_eq!(SizingValues {
@@ -430,6 +455,8 @@ impl_computed_payload_clone_and_eq!(AlignmentValues {
     justify_content,
     justify_items,
     justify_self,
+    align_self_overflow,
+    justify_self_overflow,
     column_gap,
     row_gap,
 });
@@ -633,11 +660,11 @@ impl_computed_payload_clone_and_eq!(InheritedTextValues {
     tab_size_length,
     tab_size_number,
     text_indent,
-    color,
-    color_style_value,
+    color => paint_only,
+    color_style_value => paint_only,
     font_smoothing,
-    webkit_text_fill_color,
-    webkit_text_fill_color_is_current_color,
+    webkit_text_fill_color => paint_only,
+    webkit_text_fill_color_is_current_color => paint_only,
     text_shadow,
     text_transform,
     text_wrap_style,
@@ -704,14 +731,14 @@ impl_computed_payload_clone_and_eq!(BackgroundValues {
     background_size,
 });
 impl_computed_payload_clone_and_eq!(BorderValues {
-    border_left,
-    border_top,
-    border_right,
-    border_bottom,
-    border_left_color_style_value,
-    border_top_color_style_value,
-    border_right_color_style_value,
-    border_bottom_color_style_value,
+    border_left => border_side_layout_inputs_equal,
+    border_top => border_side_layout_inputs_equal,
+    border_right => border_side_layout_inputs_equal,
+    border_bottom => border_side_layout_inputs_equal,
+    border_left_color_style_value => paint_only,
+    border_top_color_style_value => paint_only,
+    border_right_color_style_value => paint_only,
+    border_bottom_color_style_value => paint_only,
     border_left_computed_width,
     border_top_computed_width,
     border_right_computed_width,
@@ -772,9 +799,9 @@ impl_computed_payload_clone_and_eq!(MiscResetValues {
     outline_style,
     object_fit,
     column_height,
-    outline_color,
+    outline_color => paint_only,
     outline_width,
-    column_rule_color,
+    column_rule_color => paint_only,
     column_rule_width,
     outline_offset,
     user_select,
@@ -795,7 +822,7 @@ impl_computed_payload_clone_and_eq!(MiscResetValues {
     shape_margin,
     shape_outside,
     will_change,
-    implicit_will_change,
+    implicit_will_change => implicit_will_change_layout_inputs_equal,
 });
 impl_computed_payload_clone_and_eq!(FontValues {
     font_size,
@@ -870,7 +897,7 @@ impl_computed_payload_clone_and_eq!(ComputedFilter {
     operations
 });
 impl_computed_payload_clone_and_eq!(EffectsValues {
-    opacity,
+    opacity => paint_only,
     filter,
     backdrop_filter,
     mix_blend_mode,
@@ -878,7 +905,7 @@ impl_computed_payload_clone_and_eq!(EffectsValues {
     box_shadows,
     clip_is_rect,
     clip_edges,
-    opacity_style_value,
+    opacity_style_value => paint_only,
     filter_style_value,
     backdrop_filter_style_value,
     mix_blend_mode_style_value,
@@ -902,12 +929,13 @@ impl_computed_payload_clone_and_eq!(AnchorValues {
     position_visibility_no_overflow,
 });
 impl_computed_payload_clone_and_eq!(InheritedUIValues {
-    caret_color,
-    accent_color,
+    caret_color => paint_only,
+    accent_color => paint_only,
     cursor,
     pointer_events,
+    forced_color_adjust,
     interpolate_size,
-    scrollbar_color,
+    scrollbar_color => paint_only,
     color_scheme,
     color_schemes,
     color_scheme_only,
@@ -1383,11 +1411,118 @@ unsafe fn payload_content_hash(group: StyleGroup, payload: *const c_void, hasher
     with_style_group_type!(group, Payload => unsafe { payload_ref::<Payload>(payload) }.write_content_hash(hasher));
 }
 
-pub(crate) fn style_group_affects_layout(group_index: usize) -> bool {
-    !matches!(
-        style_group(group_index),
-        StyleGroup::Mask | StyleGroup::TextReset | StyleGroup::Background
-    )
+/// The values of a style group's payload that layout reads. A box whose style changes only the other values keeps the
+/// layout it cached, as only painting reads them.
+trait StyleGroupLayoutInputs: PartialEq {
+    fn layout_inputs_equal(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+fn border_side_layout_inputs_equal(
+    first: &crate::css::computed_value_types::ComputedBorderSide,
+    second: &crate::css::computed_value_types::ComputedBorderSide,
+) -> bool {
+    let crate::css::computed_value_types::ComputedBorderSide {
+        color: _,
+        line_style,
+        width,
+    } = first;
+    *line_style == second.line_style && *width == second.width
+}
+
+fn implicit_will_change_layout_inputs_equal(
+    first: &RetainedWillChangePropertyList,
+    second: &RetainedWillChangePropertyList,
+) -> bool {
+    use crate::css::property_metadata::property_id::{COLOR, OPACITY};
+    let names_only_paint_properties = |hints: &RetainedWillChangePropertyList| {
+        hints
+            .as_slice()
+            .iter()
+            .all(|&property| matches!(property, COLOR | OPACITY))
+    };
+    (names_only_paint_properties(first) && names_only_paint_properties(second)) || first == second
+}
+
+macro_rules! impl_style_group_read_whole_by_layout {
+    ($($type:ty),+ $(,)?) => {
+        $(impl StyleGroupLayoutInputs for $type {})+
+    };
+}
+
+impl_style_group_read_whole_by_layout!(
+    InheritedTableValues,
+    InheritedListValues,
+    InheritedSVGValues,
+    InheritedBoxValues,
+    FontValues,
+    AnimationValues,
+    SVGResetValues,
+    GridValues,
+    AnchorValues,
+    ContentValues,
+    TransformValues,
+    AlignmentValues,
+    SizingValues,
+    SurroundValues,
+    BoxValues,
+);
+
+macro_rules! impl_style_group_unread_by_layout {
+    ($($type:ty),+ $(,)?) => {
+        $(impl StyleGroupLayoutInputs for $type {
+            fn layout_inputs_equal(&self, _: &Self) -> bool {
+                true
+            }
+        })+
+    };
+}
+
+// Only painting reads these groups. Resource observers for background images register in apply_style, whatever layout
+// does. Hit testing also reads the mask. Text decorations resolve when the display list is built. Layout does not read
+// white-space-trim yet, so an implementation of it must remove TextResetValues from this list. EffectsValues is not
+// in this list, because filter and backdrop-filter make a containing block for fixed-position descendants.
+impl_style_group_unread_by_layout!(MaskValues, TextResetValues, BackgroundValues);
+
+/// Both payloads must be live payloads of the group's type.
+unsafe fn payload_layout_inputs_equal(group: StyleGroup, a: *const c_void, b: *const c_void) -> bool {
+    with_style_group_type!(group, Payload => {
+        // SAFETY: The caller guarantees live payloads of the group.
+        let (a, b) = unsafe { (payload_ref::<Payload>(a), payload_ref::<Payload>(b)) };
+        a.layout_inputs_equal(b)
+    })
+}
+
+/// Whether two records' group payloads hold the same values that layout reads (see [`StyleGroupLayoutInputs`]), so a
+/// box whose style moves from one record to the other keeps the layout it cached. The geometry of an SVG box can also
+/// depend on `color`, through `currentColor`.
+///
+/// # Safety
+/// Every payload must be a live payload of the group at its index.
+pub(crate) unsafe fn style_payloads_layout_inputs_equal(
+    a: &[*const c_void],
+    b: &[*const c_void],
+    is_svg_box: bool,
+) -> bool {
+    debug_assert_eq!(a.len(), group_index::COUNT);
+    debug_assert_eq!(b.len(), group_index::COUNT);
+    if is_svg_box {
+        // SAFETY: The caller guarantees live payloads of each group.
+        let (first, second) = unsafe {
+            (
+                payload_ref::<InheritedTextValues>(a[group_index::INHERITED_TEXT]),
+                payload_ref::<InheritedTextValues>(b[group_index::INHERITED_TEXT]),
+            )
+        };
+        if first.color != second.color {
+            return false;
+        }
+    }
+    (0..group_index::COUNT).all(|group| {
+        // SAFETY: The caller guarantees live payloads of each group.
+        a[group] == b[group] || unsafe { payload_layout_inputs_equal(style_group(group), a[group], b[group]) }
+    })
 }
 
 /// The style groups in `groups` whose payloads differ between two records, `[base, composed]` each: explicit
@@ -1937,22 +2072,6 @@ pub(crate) fn release_group_payload(group_index: usize, payload: *const c_void) 
     }
 }
 
-/// Compares two payloads of the same style group for value equality, letting
-/// C++ group structs that inherit a Rust-native payload layout reuse the Rust
-/// field-wise equality instead of hand-writing a second one.
-///
-/// # Safety
-/// `a` and `b` must be valid payloads of the given group type.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_group_payloads_equal(
-    group_index: usize,
-    a: *const c_void,
-    b: *const c_void,
-) -> bool {
-    // SAFETY: The caller guarantees live payloads of the group.
-    unsafe { style_group_payloads_equal(group_index, a, b) }
-}
-
 /// Clamps a border box size by the min and max sizes of a sizing group that resolve against the given basis, as
 /// resizing an element by its resizer does.
 #[unsafe(no_mangle)]
@@ -2123,6 +2242,7 @@ pub(crate) fn group_field_descriptors(group: usize) -> &'static [GroupFieldDescr
             COLUMN_RULE_WIDTH @ column_rule_width => CssPixelsNonNegative,
             USER_SELECT @ user_select => EnumKeyword(enums::keyword_to_user_select),
             OBJECT_POSITION => RequireInitialValue,
+            VIEW_TRANSITION_CLASS => RequireKeyword(k::NONE),
             VIEW_TRANSITION_NAME => RequireKeyword(k::NONE),
             TOUCH_ACTION => RequireInitialValue,
             SCROLL_BEHAVIOR @ scroll_behavior => EnumKeyword(enums::keyword_to_scroll_behavior),
@@ -2173,6 +2293,7 @@ pub(crate) fn group_field_descriptors(group: usize) -> &'static [GroupFieldDescr
             ACCENT_COLOR => RequireKeyword(k::AUTO),
             CURSOR => RequireKeyword(k::AUTO),
             POINTER_EVENTS @ pointer_events => EnumKeyword(enums::keyword_to_pointer_events),
+            FORCED_COLOR_ADJUST @ forced_color_adjust => EnumKeyword(enums::keyword_to_forced_color_adjust),
             INTERPOLATE_SIZE @ interpolate_size => EnumKeyword(enums::keyword_to_interpolate_size),
             SCROLLBAR_COLOR => RequireKeyword(k::AUTO),
             COLOR_SCHEME @ color_scheme => ResolvedU8,
@@ -2378,6 +2499,10 @@ impl StyleGroupMasks {
         }
         masks[index(DIRECTION)] |= logical_mapping_mask;
         masks[index(WRITING_MODE)] |= logical_mapping_mask;
+        // NB: The inherited UI group holds the used caret color, which `caret-color: auto` resolves against the
+        //     element's own color.
+        masks[index(crate::css::property_metadata::property_id::COLOR)] |=
+            1 << crate::css::table_group_builder::group_index::INHERITED_UI;
         Self { masks, output_masks }
     }
 
@@ -2662,7 +2787,7 @@ pub(crate) fn build_group_payload_with_rust_fill<T: StyleGroupPayload>(
     share_equal_group_payload(scratch.as_ref(), parent).unwrap_or_else(|| scratch.publish())
 }
 
-/// Builds an inherited box group payload from the five computed keyword
+/// Builds an inherited box group payload from the six computed keyword
 /// values, sharing instead of allocating whenever it can: the parent's
 /// payload when every field matches it, or the immortal default payload when
 /// every field holds its initial value. Every input is a canonical computed
@@ -2671,6 +2796,7 @@ pub(crate) fn build_group_payload_with_rust_fill<T: StyleGroupPayload>(
 /// The returned payload carries one reference for the caller; fresh payloads
 /// start at one, shared payloads are retained, and default payloads are
 /// intentionally leaked and never counted.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_inherited_box_group(
     group_index: usize,
     visibility: &RetainedStyleValueData,
@@ -2678,6 +2804,7 @@ pub(crate) fn build_inherited_box_group(
     writing_mode: &RetainedStyleValueData,
     content_visibility: &RetainedStyleValueData,
     image_rendering: &RetainedStyleValueData,
+    text_orientation: &RetainedStyleValueData,
     parent: Option<GroupPayloadRef<'_>>,
 ) -> *const c_void {
     use crate::css::style_value::StyleValueData;
@@ -2697,6 +2824,7 @@ pub(crate) fn build_inherited_box_group(
             crate::css::style_compute::keyword_to_content_visibility,
         ),
         image_rendering: keyword_code(image_rendering, crate::css::style_compute::keyword_to_image_rendering),
+        text_orientation: keyword_code(text_orientation, crate::css::style_compute::keyword_to_text_orientation),
     };
 
     share_or_publish_group_payload::<InheritedBoxValues>(group_index, built, parent)
@@ -2762,8 +2890,11 @@ impl ComputedSize {
             Some(StyleValueData::Calculated { .. }) => Self::retained(ComputedSizeKind::Calculated, data),
             Some(StyleValueData::Percentage { .. }) => Self::retained(ComputedSizeKind::Percentage, data),
             Some(StyleValueData::Length { .. }) => Self::retained(ComputedSizeKind::Length, data),
-            // FIXME: Support `anchor-size(..)`.
-            Some(StyleValueData::AnchorSize { .. }) => Self::keyword(ComputedSizeKind::None),
+            // NB: Layout resolves anchor-size() itself, through the calculation that wraps it.
+            Some(StyleValueData::AnchorSize { .. }) => Self {
+                kind: ComputedSizeKind::Calculated,
+                value: anchor_function_calculated_handle(data),
+            },
             _ => Self::keyword(ComputedSizeKind::Auto),
         }
     }
@@ -2853,6 +2984,8 @@ impl AlignmentValues {
             justify_content: justify_content::FLEX_START,
             justify_items: justify_items::LEGACY,
             justify_self: justify_self::AUTO,
+            align_self_overflow: crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT,
+            justify_self_overflow: crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT,
             column_gap: ComputedGap {
                 is_normal: true,
                 value: ComputedStyleValueHandle::empty(),
@@ -2862,6 +2995,15 @@ impl AlignmentValues {
                 value: ComputedStyleValueHandle::empty(),
             },
         }
+    }
+}
+
+/// A handle to the calculated style value wrapping the anchor() or anchor-size() value `data` holds.
+fn anchor_function_calculated_handle(data: &RetainedStyleValueData) -> ComputedStyleValueHandle {
+    // SAFETY: The caller matched `data` as live anchor() or anchor-size() style value data.
+    let calculated = unsafe { crate::css::calc::create_anchor_function_calculated(data.pointer().cast()) };
+    ComputedStyleValueHandle {
+        pointer: std::sync::Arc::into_raw(calculated).cast(),
     }
 }
 
@@ -2909,6 +3051,12 @@ impl ComputedLengthPercentageOrAuto {
             ) => Self {
                 is_auto: false,
                 value: ComputedStyleValueHandle::from_retained(data),
+            },
+            // NB: Layout resolves an anchor-size() margin itself, through the calculation that wraps it. Insets keep
+            //     their anchor functions in separate wrappers instead, and expose auto here.
+            Some(StyleValueData::AnchorSize { .. }) if !default_is_auto => Self {
+                is_auto: false,
+                value: anchor_function_calculated_handle(data),
             },
             _ if default_is_auto => Self::auto(),
             _ => Self::zero(),
@@ -3207,6 +3355,7 @@ impl InheritedUIValues {
                 predefined: crate::css::css_enums::cursor_predefined::AUTO,
             }]),
             pointer_events: crate::css::css_enums::pointer_events::AUTO,
+            forced_color_adjust: crate::css::css_enums::forced_color_adjust::AUTO,
             interpolate_size: crate::css::css_enums::interpolate_size::NUMERIC_ONLY,
             scrollbar_color: crate::css::computed_value_types::ComputedScrollbarColor {
                 thumb_color: 0,
@@ -3682,7 +3831,15 @@ fn alignment_position_keyword(data: &RetainedStyleValueData, is_content: bool, u
                     Some(StyleValueData::Keyword { keyword: k::LAST })
                 ) =>
             {
-                Some(unsupported)
+                // https://drafts.csswg.org/css-align-3/#baseline-values
+                // The fallback alignment for last baseline is safe self-end (for self-alignment) or safe end (for
+                // content-distribution).
+                // FIXME: Participate in last-baseline alignment instead of always using the fallback alignment.
+                if is_content {
+                    Some(unsupported)
+                } else {
+                    Some(k::SELF_END)
+                }
             }
             values => match values.last()?.optional_data()? {
                 StyleValueData::Keyword { keyword } => Some(*keyword),
@@ -3690,6 +3847,25 @@ fn alignment_position_keyword(data: &RetainedStyleValueData, is_content: bool, u
             },
         },
         _ => None,
+    }
+}
+
+/// The explicit overflow alignment of a computed self-alignment value.
+fn alignment_overflow(data: &RetainedStyleValueData) -> u8 {
+    use crate::css::css_enums::keyword as k;
+    use crate::css::style_value::StyleValueData;
+
+    let Some(StyleValueData::ValueList { values, .. }) = data.optional_data() else {
+        return crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT;
+    };
+    match values.as_slice().first().and_then(|value| value.optional_data()) {
+        Some(StyleValueData::Keyword { keyword: k::SAFE }) => crate::css::computed_value_types::OVERFLOW_ALIGNMENT_SAFE,
+        Some(StyleValueData::Keyword { keyword: k::UNSAFE }) => {
+            crate::css::computed_value_types::OVERFLOW_ALIGNMENT_UNSAFE
+        }
+        // NB: Last baseline computes to its fallback alignment, which is safe.
+        Some(StyleValueData::Keyword { keyword: k::LAST }) => crate::css::computed_value_types::OVERFLOW_ALIGNMENT_SAFE,
+        _ => crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT,
     }
 }
 
@@ -3746,6 +3922,8 @@ pub(crate) fn rust_build_alignment_group(
             justify_content: alignment_code(justify_content, css_enums::keyword_to_justify_content, true, k::NORMAL)?,
             justify_items: alignment_code(justify_items, css_enums::keyword_to_justify_items, false, k::LEGACY)?,
             justify_self: alignment_code(justify_self, css_enums::keyword_to_justify_self, false, k::AUTO)?,
+            align_self_overflow: alignment_overflow(align_self),
+            justify_self_overflow: alignment_overflow(justify_self),
             column_gap: ComputedGap::from_data(column_gap),
             row_gap: ComputedGap::from_data(row_gap),
         };
@@ -3830,7 +4008,10 @@ pub(crate) fn rust_build_surround_group(
 
     let build_or_reuse_group_payload = || {
         let anchor = |data: &RetainedStyleValueData| {
-            if matches!(data.optional_data(), Some(StyleValueData::Anchor { .. })) {
+            if matches!(
+                data.optional_data(),
+                Some(StyleValueData::Anchor { .. } | StyleValueData::AnchorSize { .. })
+            ) {
                 ComputedStyleValueHandle::from_retained(data)
             } else {
                 ComputedStyleValueHandle::empty()
@@ -3863,7 +4044,7 @@ pub(crate) fn rust_build_surround_group(
                 return ComputedStyleValueHandle::empty();
             }
             // SAFETY: The handle retains anchor style value data.
-            let calculated = unsafe { crate::css::calc::create_anchor_inset_calculated(handle.pointer.cast()) };
+            let calculated = unsafe { crate::css::calc::create_anchor_function_calculated(handle.pointer.cast()) };
             ComputedStyleValueHandle {
                 pointer: std::sync::Arc::into_raw(calculated).cast(),
             }
@@ -4033,7 +4214,9 @@ impl InheritedTableValues {
 
 impl InheritedBoxValues {
     fn initial() -> Self {
-        use crate::css::css_enums::{content_visibility, direction, image_rendering, visibility, writing_mode};
+        use crate::css::css_enums::{
+            content_visibility, direction, image_rendering, text_orientation, visibility, writing_mode,
+        };
 
         Self {
             visibility: visibility::VISIBLE,
@@ -4041,6 +4224,7 @@ impl InheritedBoxValues {
             writing_mode: writing_mode::HORIZONTAL_TB,
             content_visibility: content_visibility::VISIBLE,
             image_rendering: image_rendering::AUTO,
+            text_orientation: text_orientation::MIXED,
         }
     }
 }

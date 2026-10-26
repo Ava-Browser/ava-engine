@@ -161,7 +161,8 @@ public:
     void load_html(StringView);
     void load_navigation_error_page(StringView);
 
-    void reload();
+    void reload(BypassCache = BypassCache::No);
+    void reload_for_webdriver_bidi(BypassCache, Utf16String navigation_id);
     void stop_loading();
     bool is_loading() const { return m_is_loading; }
     // Whether the most recent load ran to completion, rather than being stopped or canceled.
@@ -309,9 +310,6 @@ public:
 
     void inspect_dom_tree();
     void inspect_storage(Web::StorageAPI::StorageEndpointType, u64 request_id);
-    Optional<StorageSetResult> set_session_storage_item(Utf16String const& key, Utf16String const& value);
-    Optional<Utf16String> remove_session_storage_item(Utf16String const& key);
-    bool clear_session_storage();
     void inspect_accessibility_tree();
     void request_accessibility_tree();
     void perform_accessibility_action(i64 node_id, String action);
@@ -435,8 +433,10 @@ public:
     JsonValue webdriver_session_history() const;
     void wait_for_webdriver_navigation_completion(Optional<u64> page_load_timeout, Function<void(Web::WebDriver::Response)>);
     void run_webdriver_content_command(u64 command_id, Web::WebDriver::SessionBrowsingContext, String const& name, JsonValue payload, Vector<String> arguments);
+    // https://w3c.github.io/webdriver-bidi/#commands
+    void run_webdriver_bidi_content_command(u64 command_id, Web::HTML::CrossProcessId navigable_id, String const& method, JsonValue params);
     void run_webdriver_commands_waiting_for_a_document(Badge<CanonicalTraversable>);
-    void did_complete_webdriver_content_command(Badge<WebContentPage>, u64 command_id, Web::WebDriver::Response);
+    void did_complete_webdriver_content_command(WebContentPage&, u64 command_id, Web::WebDriver::Response);
     void did_set_webdriver_current_browsing_context(Badge<WebContentPage>, u64 command_id, Web::HTML::CrossProcessId navigable_id);
     void enqueue_webdriver_mouse_event(Badge<WebContentPage>, Web::MouseEvent, Function<void()> on_handled);
     void did_lose_page(Badge<CanonicalTraversable>, WebContentPage&, WebContentProcessLost);
@@ -595,6 +595,7 @@ public:
     void activate_spelling_menu_action_for_testing(Badge<WebContentPage>, WebContentPage& requesting_page, Web::SpellingMenuActionForTesting, u32 guess_index);
 
     void did_request_spell_check(Badge<WebContentPage>, WebContentPage& requesting_page, u64 request_id, Utf16String text);
+    void did_request_writing_suggestion(Badge<WebContentPage>, WebContentPage& requesting_page, u64 request_id, Utf16String text, u32 caret_offset);
     void reset_spell_checking();
     void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<u64> text_fragment_generation_id);
     void did_generate_text_fragment_url(u64 request_id, Optional<URL::URL>);
@@ -975,10 +976,15 @@ protected:
         Function<void(bool)> on_complete;
     };
     HashMap<u64, PendingClosePreflightRequest> m_pending_close_preflight_requests;
+    enum class WebDriverProtocol : u8 {
+        Classic,
+        BiDi,
+    };
     struct PendingWebDriverCommand {
         NonnullRefPtr<WebContentPage> page;
         String name;
         Optional<Web::HTML::CrossProcessId> navigable_id;
+        WebDriverProtocol protocol { WebDriverProtocol::Classic };
     };
     HashMap<u64, PendingWebDriverCommand> m_pending_webdriver_commands;
     HashMap<u64, PendingWebDriverCommand> m_pending_webdriver_crash_commands;
@@ -987,9 +993,22 @@ protected:
         String name;
         JsonValue payload;
         Vector<String> arguments;
+        WebDriverProtocol protocol { WebDriverProtocol::Classic };
     };
     HashMap<u64, WebDriverCommandWaitingForADocument> m_webdriver_commands_waiting_for_a_document;
-    void run_webdriver_content_command(u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String const& name, JsonValue payload, Vector<String> arguments);
+    void run_webdriver_content_command(u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String const& name, JsonValue payload, Vector<String> arguments, WebDriverProtocol = WebDriverProtocol::Classic);
+    struct QueuedWebDriverInputCommand {
+        u64 command_id;
+        WebDriverCommandWaitingForADocument command;
+    };
+    Vector<QueuedWebDriverInputCommand> m_webdriver_input_commands;
+    JsonValue m_webdriver_input_state;
+    bool m_webdriver_input_command_running { false };
+    bool m_webdriver_input_state_was_lost { false };
+    void discard_webdriver_input_commands(bool process_crashed = false);
+    void dispatch_webdriver_content_command(u64, Optional<Web::HTML::CrossProcessId>, String const&, JsonValue, Vector<String>, WebDriverProtocol);
+    void complete_webdriver_input_command(u64, Web::WebDriver::Response);
+    void dispatch_next_webdriver_input_command();
     static bool webdriver_content_command_outlives_its_page(StringView name);
     bool complete_webdriver_content_command_after_navigation(u64 command_id, PendingWebDriverCommand const&);
     void complete_webdriver_content_commands_after_process_replacement(HashMap<u64, PendingWebDriverCommand> const&);

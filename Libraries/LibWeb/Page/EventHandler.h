@@ -35,6 +35,12 @@
 #include <LibWebCommon/PixelUnits.h>
 #include <LibWebCommon/UIEvents/KeyCode.h>
 
+namespace Web::HTML {
+
+enum class SequentialFocusDirection : u8;
+
+}
+
 namespace Web {
 
 struct AsyncScrollOperation {
@@ -106,6 +112,13 @@ public:
     [[nodiscard]] EventResult perform_paste_action();
     EventResult perform_paste_action(NonnullRefPtr<HTML::DragDataStore> const&);
 
+    enum class ClipboardActionTrigger {
+        User,
+        Script,
+    };
+    bool perform_copy_action(ClipboardActionTrigger);
+    bool perform_cut_action(ClipboardActionTrigger);
+
     void handle_gamepad_connected(Gamepad::GamepadDescription const&);
     void handle_gamepad_updated(Gamepad::GamepadState const&);
     void handle_gamepad_disconnected(Gamepad::GamepadHandle);
@@ -137,7 +150,7 @@ private:
     GC::Ptr<DOM::Node> scroll_target_for_key_input() const;
     int page_scroll_distance_for_key_input() const;
 
-    EventResult fire_keyboard_event(Utf16FlyString const& event_name, HTML::LocalNavigable&, UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat);
+    EventResult fire_keyboard_event(Utf16FlyString const& event_name, HTML::LocalNavigable&, UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, Optional<u32> key_code = {});
     [[nodiscard]] EventResult fire_text_input_event(HTML::LocalNavigable&, Utf16String const& data);
     [[nodiscard]] EventResult input_event(Utf16FlyString const& event_name, Utf16FlyString const& input_type, HTML::LocalNavigable&, Variant<u32, Utf16String> code_point_or_string, GC::Ptr<DOM::StaticRange> deletion_range = nullptr);
 
@@ -145,8 +158,7 @@ private:
     [[nodiscard]] EventResult perform_cut_action();
     EventResult insert_pasted_content(Utf16View plain_text, Optional<Utf16View> html);
 
-    EventResult focus_next_element();
-    EventResult focus_previous_element();
+    EventResult focus_sequentially(HTML::SequentialFocusDirection);
 
     struct MouseEventCoordinates {
         CSSPixelPoint page_offset;

@@ -1,0 +1,20 @@
+Harness status: OK
+
+Found 15 tests
+
+15 Pass
+Pass	child of non-cramped element
+Pass	child of cramped element
+Pass	child of msqrt
+Pass	child of mroot
+Pass	child of mfrac
+Pass	child of msub
+Pass	child of msup
+Pass	child of msubsup
+Pass	child of munder
+Pass	child of mover (non-accent overscript)
+Pass	child of munderover (non-accent overscript)
+Pass	accent child of mover (accent overscript)
+Pass	accent child of munderover (accent overscript)
+Pass	mmultiscripts
+Pass	element with specified CSS math-shift

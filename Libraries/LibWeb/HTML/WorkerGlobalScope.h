@@ -131,11 +131,12 @@ public:
 
     Web::Page* page() { return m_page.ptr(); }
 
-    GC::Ref<PolicyContainer> policy_container() const;
+    NonnullRefPtr<PolicyContainer> policy_container() const;
 
     bool is_closing() const { return m_closing; }
 
     void initialize_policy_container(GC::Ref<Fetch::Infrastructure::Response const> response, GC::Ref<EnvironmentSettingsObject> environment);
+    [[nodiscard]] bool check_embedder_policy(EnvironmentSettingsObject const& owner) const;
     [[nodiscard]] ContentSecurityPolicy::Directives::Directive::Result run_csp_initialization() const;
 
     auto& owner_set() { return m_owner_set; }
@@ -182,7 +183,7 @@ private:
 
     // https://html.spec.whatwg.org/multipage/workers.html#concept-workerglobalscope-policy-container
     // A WorkerGlobalScope object has an associated policy container (a policy container). It is initially a new policy container.
-    mutable GC::Ptr<PolicyContainer> m_policy_container;
+    mutable RefPtr<PolicyContainer> m_policy_container;
 
     // https://html.spec.whatwg.org/multipage/workers.html#concept-workerglobalscope-embedder-policy
     // A WorkerGlobalScope object has an associated embedder policy (an embedder policy).

@@ -53,6 +53,8 @@ pub(crate) struct RenderedText {
 pub(crate) struct PublishedTextSlot {
     pub(crate) generation: u8,
     pub(crate) first_letter: NodeSlotId,
+    /// Whether the slice ends where a writing suggestion shows — so a caret at the slice's end paints in front of it.
+    pub(crate) precedes_writing_suggestion: bool,
     pub(crate) rendered: Option<Arc<RenderedText>>,
 }
 
@@ -61,6 +63,7 @@ impl Default for PublishedTextSlot {
         Self {
             generation: 0,
             first_letter: NodeSlotId::INVALID,
+            precedes_writing_suggestion: false,
             rendered: None,
         }
     }
@@ -72,6 +75,7 @@ impl PartialEq for PublishedTextSlot {
     fn eq(&self, other: &Self) -> bool {
         self.generation == other.generation
             && self.first_letter == other.first_letter
+            && self.precedes_writing_suggestion == other.precedes_writing_suggestion
             && crate::cow_column::same_payload(self.rendered.as_ref(), other.rendered.as_ref(), |_, _| false)
     }
 }
@@ -146,6 +150,7 @@ pub(crate) struct TextChunkCacheKey {
     pub(crate) word_break: u8,
     pub(crate) font_variant_emoji: u8,
     pub(crate) frozen_font_list: std::sync::Arc<libgfx_rust::font::FrozenFontList>,
+    pub(crate) splits_at_orientation_changes: bool,
 }
 
 impl PartialEq for TextChunkCacheKey {
@@ -156,6 +161,7 @@ impl PartialEq for TextChunkCacheKey {
             && self.white_space_collapse == other.white_space_collapse
             && self.word_break == other.word_break
             && self.font_variant_emoji == other.font_variant_emoji
+            && self.splits_at_orientation_changes == other.splits_at_orientation_changes
             // A frozen cascade is immutable, so naming the same one is the whole of equality.
             && std::sync::Arc::ptr_eq(&self.frozen_font_list, &other.frozen_font_list)
     }
@@ -441,6 +447,7 @@ mod tests {
             word_break: 0,
             font_variant_emoji: 0,
             frozen_font_list: std::sync::Arc::new(libgfx_rust::font::FrozenFontList::empty()),
+            splits_at_orientation_changes: false,
         };
         let chunk = TextChunk {
             start: 0,

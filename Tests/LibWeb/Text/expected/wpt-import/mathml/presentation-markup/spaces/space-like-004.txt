@@ -1,0 +1,9 @@
+Harness status: OK
+
+Found 4 tests
+
+4 Pass
+Pass	complex space-like subtree
+Pass	complex space-like subtree, from in-flow children
+Pass	complex non-space-like subtree
+Pass	complex non-space-like subtree, from in-flow children

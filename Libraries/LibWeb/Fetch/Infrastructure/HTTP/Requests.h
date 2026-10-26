@@ -160,7 +160,7 @@ public:
 
     using BodyType = Variant<Empty, ByteBuffer, GC::Ref<Body>>;
     using OriginType = Variant<Origin, URL::Origin>;
-    using PolicyContainerType = Variant<PolicyContainer, GC::Ref<HTML::PolicyContainer>>;
+    using PolicyContainerType = Variant<PolicyContainer, NonnullRefPtr<HTML::PolicyContainer const>>;
     using ReferrerType = RequestReferrerType;
     using ReservedClientType = GC::Ptr<HTML::Environment>;
     using TraversableForUserPromptsType = Variant<TraversableForUserPrompts, GC::Ptr<HTML::EnvironmentSettingsObject>, GC::Ptr<HTML::Navigable>>;
@@ -223,7 +223,8 @@ public:
     void set_top_level_navigation_initiator_origin(Optional<URL::Origin> top_level_navigation_initiator_origin) { m_top_level_navigation_initiator_origin = move(top_level_navigation_initiator_origin); }
 
     [[nodiscard]] PolicyContainerType const& policy_container() const { return m_policy_container; }
-    void set_policy_container(PolicyContainerType policy_container) { m_policy_container = move(policy_container); }
+    void set_policy_container(PolicyContainerType);
+    void set_policy_container(NonnullRefPtr<HTML::PolicyContainer const>);
 
     [[nodiscard]] Mode mode() const { return m_mode; }
     void set_mode(Mode mode) { m_mode = mode; }
@@ -268,6 +269,9 @@ public:
 
     [[nodiscard]] bool user_agent_initiated() const { return m_user_agent_initiated; }
     void set_user_agent_initiated(bool user_agent_initiated) { m_user_agent_initiated = user_agent_initiated; }
+
+    [[nodiscard]] bool is_form_submission() const { return m_form_submission; }
+    void set_form_submission(bool form_submission) { m_form_submission = form_submission; }
 
     [[nodiscard]] bool render_blocking() const { return m_render_blocking; }
     void set_render_blocking(bool render_blocking) { m_render_blocking = render_blocking; }
@@ -317,7 +321,11 @@ public:
     [[nodiscard]] String serialize_origin() const;
     [[nodiscard]] ByteString byte_serialize_origin() const;
 
-    [[nodiscard]] GC::Ref<Request> clone(JS::Realm&) const;
+    enum class BodyCloning : u8 {
+        Tee,
+        FromSource,
+    };
+    [[nodiscard]] GC::Ref<Request> clone(JS::Realm&, BodyCloning) const;
 
     void add_range_header(u64 first, Optional<u64> const& last);
     void add_origin_header();
@@ -506,6 +514,10 @@ private:
     // NB: Not a Fetch concept. Fetch Metadata's "set site" sends Sec-Fetch-Site:none for a navigation whose URL
     //     the user agent itself supplied, and populating a history entry sets this from the entry's document state.
     bool m_user_agent_initiated { false };
+
+    // NB: Not a Fetch concept. Upgrade Insecure Requests asks whether a navigation request is a form submission, and
+    //     creating navigation params by fetching sets this from the navigation's CSP navigation type.
+    bool m_form_submission { false };
 
     // https://fetch.spec.whatwg.org/#request-render-blocking
     // A request has an associated boolean render-blocking. Unless stated otherwise, it is false.

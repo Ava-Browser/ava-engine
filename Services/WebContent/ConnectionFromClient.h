@@ -27,6 +27,7 @@
 #include <LibWeb/Loader/FileRequest.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/Timer.h>
+#include <LibWeb/StorageAPI/StorageAreaMirror.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/CSS/PreferredContrast.h>
 #include <LibWebCommon/CSS/PreferredMotion.h>
@@ -52,7 +53,8 @@
 namespace WebContent {
 
 class ConnectionFromClient final
-    : public IPC::ConnectionFromClient<WebContentClientEndpoint, WebContentServerEndpoint> {
+    : public IPC::ConnectionFromClient<WebContentClientEndpoint, WebContentServerEndpoint>
+    , public Web::StorageAPI::StorageAreaMirrorClient {
     C_OBJECT(ConnectionFromClient);
 
     friend class TestConnection;
@@ -105,6 +107,8 @@ private:
     virtual Messages::WebContentServer::GetWindowHandleResponse get_window_handle(Web::PageId page_id) override;
     virtual void set_window_handle(Web::PageId page_id, String handle) override;
     virtual void run_webdriver_command(Web::PageId page_id, u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String name, JsonValue payload, Vector<String> arguments) override;
+    virtual void run_webdriver_bidi_command(Web::PageId page_id, u64 command_id, Web::HTML::CrossProcessId navigable_id, String method, JsonValue params) override;
+    virtual void set_webdriver_bidi_session_state(Web::WebDriver::BiDiSessionState state) override;
     virtual void set_webdriver_session_config(Web::PageId page_id, Web::WebDriver::UserPromptHandler user_prompt_handler, Web::WebDriver::PageLoadStrategy page_load_strategy, bool strict_file_interactability, JsonValue timeouts) override;
     virtual void run_webdriver_user_prompt_handling(Web::PageId page_id, u64 request_id) override;
     virtual void did_handle_webdriver_mouse_event(Web::PageId page_id, u64 request_id) override;
@@ -126,7 +130,7 @@ private:
     virtual void run_navigation_unload_check(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, Web::HTML::UnloadPromptShown) override;
     virtual void create_navigation_params(Web::PageId page_id, Web::HTML::NavigationPopulationRequest) override;
     virtual void cancel_navigation_params_creation(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id) override;
-    virtual void deliver_posted_message(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor) override;
+    virtual void deliver_posted_message(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::MessageDescriptor) override;
     virtual void close_traversable_from_script(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void run_focusing_steps_for_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::FocusTrigger) override;
     virtual void focus_window_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
@@ -169,9 +173,17 @@ private:
     virtual void get_source(Web::PageId page_id) override;
     virtual void inspect_dom_tree(Web::PageId page_id) override;
     virtual void inspect_storage(Web::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, u64 request_id) override;
-    virtual Messages::WebContentServer::SetSessionStorageItemResponse set_session_storage_item(Web::PageId page_id, Utf16String key, Utf16String value) override;
-    virtual Messages::WebContentServer::RemoveSessionStorageItemResponse remove_session_storage_item(Web::PageId page_id, Utf16String key) override;
-    virtual Messages::WebContentServer::ClearSessionStorageResponse clear_session_storage(Web::PageId page_id) override;
+    // Web::StorageAPI::StorageAreaMirrorClient: the mirrors' link to the browser process, which owns the storage.
+    virtual Web::StorageAPI::StorageAreaConnection connect_to_storage_area(Web::PageId, Web::StorageAPI::StorageEndpointType, Web::HTML::EnvironmentId const&) override;
+    virtual void disconnect_from_storage_area(Web::StorageAPI::StorageAreaId) override;
+    virtual void set_storage_item(Web::StorageAPI::StorageAreaId, Utf16String const& key, Utf16String const& value, String const& document_url) override;
+    virtual void remove_storage_item(Web::StorageAPI::StorageAreaId, Utf16String const& key, String const& document_url) override;
+    virtual void clear_storage_area(Web::StorageAPI::StorageAreaId, String const& document_url) override;
+
+    virtual void storage_area_changed(Web::StorageAPI::StorageAreaId area_id, Optional<Utf16String> key, Optional<Utf16String> old_value, Optional<Utf16String> new_value, String url) override;
+    virtual void storage_area_write_acknowledged(Web::StorageAPI::StorageAreaId area_id) override;
+    virtual void storage_area_write_refused(Web::StorageAPI::StorageAreaId area_id, Vector<Utf16String> keys, Vector<Utf16String> values) override;
+    virtual void storage_area_reset(Web::StorageAPI::StorageAreaId area_id, Vector<Utf16String> keys, Vector<Utf16String> values) override;
     virtual void inspect_dom_node(Web::PageId page_id, WebView::DOMNodeProperties::Type, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element, JsonValue options) override;
     virtual void inspect_grid_layouts(Web::PageId page_id, Web::UniqueNodeID root_node_id) override;
     virtual void inspect_current_grid(Web::PageId page_id, Web::UniqueNodeID node_id) override;
@@ -239,6 +251,7 @@ private:
     virtual void set_browsing_behavior(Web::PageId page_id, WebView::BrowsingBehavior) override;
     virtual void set_enable_global_privacy_control(Web::PageId page_id, bool) override;
     virtual void set_spell_checking_available(Web::PageId page_id, bool available) override;
+    virtual void set_writing_suggestions_available(Web::PageId page_id, bool available) override;
     virtual void set_geolocation_emulated_position(Web::PageId page_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void geolocation_position_response(Web::PageId page_id, u64 request_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void permission_request_completed(Web::PageId page_id, u64 request_id, bool granted) override;
@@ -274,6 +287,7 @@ private:
 
     virtual void retrieved_clipboard_entries(Web::PageId page_id, u64 request_id, Vector<Web::Clipboard::SystemClipboardItem>) override;
     virtual void did_check_spelling(Web::PageId page_id, u64 request_id, Vector<Web::SpellingError> errors) override;
+    virtual void did_get_writing_suggestion(Web::PageId page_id, u64 request_id, Optional<Web::WritingSuggestion> suggestion) override;
     virtual void replace_context_menu_misspelling(Web::PageId page_id, Utf16String replacement) override;
     virtual void accept_spelling_word(Web::PageId page_id, Utf16String word) override;
     virtual void forget_accepted_spelling_words(Web::PageId page_id) override;
@@ -329,6 +343,7 @@ private:
     virtual void broadcast_channel_message(Web::HTML::BroadcastChannelMessage message) override;
     virtual void did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token) override;
     virtual void did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno) override;
+    virtual void did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource) override;
     virtual void did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token) override;
     virtual void did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token) override;
 

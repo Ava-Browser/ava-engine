@@ -158,6 +158,28 @@ BoxModelMetrics box_model(Layout::Node const& node)
     };
 }
 
+Optional<CSSPixels> anchor_resolved_size(Layout::Node const& node, CSS::PropertyID property_id)
+{
+    auto property = [&] {
+        switch (property_id) {
+        case CSS::PropertyID::MinWidth:
+            return Layout::RustFFI::FfiAnchorSizedProperty::MinWidth;
+        case CSS::PropertyID::MinHeight:
+            return Layout::RustFFI::FfiAnchorSizedProperty::MinHeight;
+        case CSS::PropertyID::MaxWidth:
+            return Layout::RustFFI::FfiAnchorSizedProperty::MaxWidth;
+        case CSS::PropertyID::MaxHeight:
+            return Layout::RustFFI::FfiAnchorSizedProperty::MaxHeight;
+        default:
+            VERIFY_NOT_REACHED();
+        }
+    }();
+    CSSPixels size;
+    if (!Layout::RustFFI::layout_script_anchor_resolved_size(node.document_host(), committed_row_slot(node), property, &size))
+        return {};
+    return size;
+}
+
 CSSPixels border_box_width(Layout::Node const& node)
 {
     auto border_box = box_model(node).border_box();
@@ -304,9 +326,12 @@ Compositing::SpatialNodeIndex own_scroll_node_index(Layout::Node const& node)
     return row.has_value() ? row->own_scroll_node_index : Compositing::VISUAL_VIEWPORT_NODE_INDEX;
 }
 
-Gfx::Path const* committed_svg_path(Layout::Node const& node)
+Optional<Gfx::FloatRect> committed_svg_path_bounding_box(Layout::Node const& node)
 {
-    return static_cast<Gfx::Path const*>(Layout::RustFFI::render_state_paintable_computed_svg_path(node.document_host(), committed_row_slot(node)));
+    Gfx::FloatRect bounding_box;
+    if (!Layout::RustFFI::render_state_paintable_computed_svg_path_bounding_box(node.document_host(), committed_row_slot(node), &bounding_box))
+        return {};
+    return bounding_box;
 }
 
 // The glyph cells a text content element's box committed for its own characters, one per code unit, copied out
@@ -617,7 +642,7 @@ Layout::RustFFI::FfiFocusedTextControlSelection resolve_focused_text_control_sel
     return selection;
 }
 
-Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(Layout::BegunRead const& read, DOM::Document const& document, Vector<u8>& path_bytes)
+Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(Layout::BegunRead const& read, DOM::Document const& document)
 {
     // https://html.spec.whatwg.org/multipage/interaction.html#focusable-area
     // The shapes of area elements in an image map associated with an img element that is being rendered and is not
@@ -639,13 +664,8 @@ Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(Layout::Begu
     auto area_computed_values = area_element->computed_style();
     if (!area_computed_values || area_computed_values->outline_style() != CSS::OutlineStyle::Auto)
         return outline;
-    auto path = area_element->shape_path(absolute_rect(*layout_node).size());
-    if (!path.has_value())
-        return outline;
-    path_bytes = path->serialize_to_bytes();
     outline.image = committed_row_slot(*layout_node);
-    outline.path_bytes = path_bytes.data();
-    outline.path_byte_count = path_bytes.size();
+    outline.area = DOM::NodeIdentity::of(*area_element).style_node().value();
     return outline;
 }
 
@@ -847,6 +867,20 @@ Vector<CSSPixelRect> client_rects(Layout::Node const& node, Layout::RustFFI::Ffi
             static_cast<Vector<CSSPixelRect>*>(context)->append(rect);
         });
     return rects;
+}
+
+bool has_sticky_positioned_inclusive_ancestor(Layout::Node const& node)
+{
+    return Layout::RustFFI::layout_script_has_sticky_positioned_inclusive_ancestor(node.document_host(), committed_row_slot(node));
+}
+
+CSSPixelPoint accumulated_sticky_offset(Layout::Node const& node, Layout::RustFFI::FfiRectToViewportTransform const& rect_to_viewport_transform)
+{
+    Layout::RustFFI::FfiOptionalCssPixelPoint result;
+    Layout::RustFFI::layout_script_accumulated_sticky_offset(node.document_host(), committed_row_slot(node), rect_to_viewport_transform, &result);
+    if (!result.has_value)
+        return {};
+    return { result.x, result.y };
 }
 
 CSSPixelRect bounding_client_rect(Layout::Node const& node, Layout::RustFFI::FfiRectToViewportTransform const& rect_to_viewport_transform)

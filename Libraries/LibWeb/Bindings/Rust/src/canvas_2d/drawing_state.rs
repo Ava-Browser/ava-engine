@@ -19,11 +19,36 @@ use crate::html::canvas_pattern::CanvasPattern;
 use crate::html::canvas_rendering_context2d::{
     CanvasDirection, CanvasLineCap, CanvasLineJoin, CanvasTextAlign, CanvasTextBaseline, ImageSmoothingQuality,
 };
+use crate::html::canvas_text_drawing_styles::{
+    CanvasFontKerning, CanvasFontStretch, CanvasFontVariantCaps, CanvasTextRendering,
+};
+
+/// A CSS color that a context was given: the color in sRGB, which the attribute that was set to it serializes, and the
+/// color converted to the color space of the context, which the context paints with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CanvasColor {
+    pub(crate) srgb: Color,
+    pub(crate) in_color_space: Color,
+}
+
+impl CanvasColor {
+    /// A color that is the same in every color space of a context.
+    pub(crate) const fn invariant(color: Color) -> Self {
+        Self {
+            srgb: color,
+            in_color_space: color,
+        }
+    }
+
+    pub(crate) fn alpha(self) -> u8 {
+        self.in_color_space.alpha()
+    }
+}
 
 /// https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fillstyle
 #[derive(Clone, Copy)]
 pub(crate) enum FillOrStrokeStyle {
-    Color(Color),
+    Color(CanvasColor),
     Gradient(Ref<CanvasGradient>),
     Pattern(Ref<CanvasPattern>),
 }
@@ -42,13 +67,6 @@ impl FillOrStrokeStyle {
     pub(crate) fn is_not_origin_clean(self) -> bool {
         matches!(self, Self::Pattern(pattern) if pattern.is_not_origin_clean())
     }
-
-    pub(crate) fn as_color(self) -> Option<Color> {
-        match self {
-            Self::Color(color) => Some(color),
-            Self::Gradient(_) | Self::Pattern(_) => None,
-        }
-    }
 }
 
 // SAFETY: Visits the gradient or the pattern, the cells that a style holds.
@@ -62,9 +80,9 @@ unsafe impl Trace for FillOrStrokeStyle {
     }
 }
 
-/// The letter spacing of a context, a CSS <length> as the context was given it.
+/// The letter spacing or the word spacing of a context, a CSS <length> as the context was given it.
 #[derive(Clone)]
-pub(crate) struct LetterSpacing {
+pub(crate) struct Spacing {
     pub(crate) length: StyleValue,
     pub(crate) serialized: Utf16String,
 }
@@ -78,7 +96,7 @@ pub(crate) struct DrawingState {
     pub(crate) shadow_offset_x: f32,
     pub(crate) shadow_offset_y: f32,
     pub(crate) shadow_blur: f32,
-    pub(crate) shadow_color: Color,
+    pub(crate) shadow_color: CanvasColor,
     /// The serialized filter graph of the current filter, which the states share.
     pub(crate) filter: Option<Rc<[u8]>>,
     /// The value of the filter attribute, unless it is "none".
@@ -98,20 +116,28 @@ pub(crate) struct DrawingState {
     pub(crate) text_align: CanvasTextAlign,
     pub(crate) text_baseline: CanvasTextBaseline,
     pub(crate) direction: CanvasDirection,
+    /// The language, https://html.spec.whatwg.org/multipage/canvas.html#concept-canvastextdrawingstyles-language
+    pub(crate) language: Utf16String,
     /// The letter spacing, unless it is 0px.
-    pub(crate) letter_spacing: Option<LetterSpacing>,
+    pub(crate) letter_spacing: Option<Spacing>,
+    /// The word spacing, unless it is 0px.
+    pub(crate) word_spacing: Option<Spacing>,
+    pub(crate) font_kerning: CanvasFontKerning,
+    pub(crate) font_stretch: CanvasFontStretch,
+    pub(crate) font_variant_caps: CanvasFontVariantCaps,
+    pub(crate) text_rendering: CanvasTextRendering,
 }
 
 impl Default for DrawingState {
     fn default() -> Self {
         Self {
             transform: AffineTransform::identity(),
-            fill_style: FillOrStrokeStyle::Color(Color::from_rgb(0, 0, 0)),
-            stroke_style: FillOrStrokeStyle::Color(Color::from_rgb(0, 0, 0)),
+            fill_style: FillOrStrokeStyle::Color(CanvasColor::invariant(Color::from_rgb(0, 0, 0))),
+            stroke_style: FillOrStrokeStyle::Color(CanvasColor::invariant(Color::from_rgb(0, 0, 0))),
             shadow_offset_x: 0.0,
             shadow_offset_y: 0.0,
             shadow_blur: 0.0,
-            shadow_color: Color::TRANSPARENT,
+            shadow_color: CanvasColor::invariant(Color::TRANSPARENT),
             filter: None,
             filter_string: None,
             line_width: 1.0,
@@ -128,7 +154,13 @@ impl Default for DrawingState {
             text_align: CanvasTextAlign::Start,
             text_baseline: CanvasTextBaseline::Alphabetic,
             direction: CanvasDirection::Inherit,
+            language: Utf16String::from_ascii(b"inherit"),
             letter_spacing: None,
+            word_spacing: None,
+            font_kerning: CanvasFontKerning::Auto,
+            font_stretch: CanvasFontStretch::Normal,
+            font_variant_caps: CanvasFontVariantCaps::Normal,
+            text_rendering: CanvasTextRendering::Auto,
         }
     }
 }

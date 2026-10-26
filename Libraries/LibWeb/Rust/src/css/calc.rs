@@ -13,6 +13,7 @@
 //! Nothing constructs these yet; the FFI construction surface follows with
 //! the C++ staging.
 
+use crate::css::ffi_support::{OwnedArc, OwnedBox};
 use std::sync::Arc;
 
 use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
@@ -1015,7 +1016,7 @@ pub(crate) fn de_percentify_calc_size_calculation(node: &Arc<CalcNode>) -> Optio
 
 /// Rebuilds a calculation with each leaf `replace` gives a replacement for replaced, or returns None where that
 /// would need to rebuild a kind of node other than the calc operators, min(), max() and clamp().
-fn map_calc_size_leaves(
+pub(crate) fn map_calc_size_leaves(
     node: &Arc<CalcNode>,
     replace: &dyn Fn(&CalcNode) -> Option<Arc<CalcNode>>,
 ) -> Option<Arc<CalcNode>> {
@@ -1246,12 +1247,9 @@ pub unsafe extern "C" fn rust_calc_node_create_variadic(
 }
 
 /// Creates a single-child node: kind selects negate (0) or invert (1).
-///
-/// # Safety
-/// `child` must be a valid transferred handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_node_create_unary(kind: u8, child: *const CalcNode) -> *const CalcNode {
-    let child = unsafe { Arc::from_raw(child) };
+pub extern "C" fn rust_calc_node_create_unary(kind: u8, child: OwnedArc<CalcNode>) -> *const CalcNode {
+    let child = child.into_arc();
     let node = match kind {
         0 => CalcNode::Negate(child),
         1 => CalcNode::Invert(child),
@@ -1260,26 +1258,22 @@ pub unsafe extern "C" fn rust_calc_node_create_unary(kind: u8, child: *const Cal
     handle(node)
 }
 
-/// # Safety
-/// All three children must be valid transferred handles.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_node_create_clamp(
-    min: *const CalcNode,
-    center: *const CalcNode,
-    max: *const CalcNode,
+pub extern "C" fn rust_calc_node_create_clamp(
+    min: OwnedArc<CalcNode>,
+    center: OwnedArc<CalcNode>,
+    max: OwnedArc<CalcNode>,
 ) -> *const CalcNode {
     handle(CalcNode::Clamp {
-        min: unsafe { Arc::from_raw(min) },
-        center: unsafe { Arc::from_raw(center) },
-        max: unsafe { Arc::from_raw(max) },
+        min: min.into_arc(),
+        center: center.into_arc(),
+        max: max.into_arc(),
     })
 }
 
-/// # Safety
-/// `node` must be a valid transferred handle; this releases it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_node_release(node: *const CalcNode) {
-    drop(unsafe { Arc::from_raw(node) });
+pub extern "C" fn rust_calc_node_release(node: OwnedArc<CalcNode>) {
+    drop(node);
 }
 
 /// https://drafts.csswg.org/css-values-4/#determine-the-type-of-a-calculation
@@ -2569,27 +2563,30 @@ pub(crate) fn length_percentage_calculated_style_value(
     }
 }
 
-/// Wraps a computed anchor() inset value into the calculated style value the
-/// layout engine resolves, matching what the C++ bridge built through
-/// CalculatedStyleValue::create with CalculationContext::for_property for the
-/// top/right/bottom/left properties: the anchor value as a non-math-function
-/// leaf of the length numeric type, percentages resolving as length, and no
-/// integer rounding. Those properties accept the full float range for both
-/// length and percentage, which equals the clamp fallback for an absent
-/// accepted-range entry, so the wrapper carries an empty range list.
+/// Wraps a computed anchor() or anchor-size() value into the calculated style
+/// value the layout engine resolves, matching what the C++ bridge built
+/// through CalculatedStyleValue::create with CalculationContext::for_property
+/// for the top/right/bottom/left properties: the anchor value as a
+/// non-math-function leaf of the length numeric type, percentages resolving as
+/// length, and no integer rounding. Those properties accept the full float
+/// range for both length and percentage, which equals the clamp fallback for
+/// an absent accepted-range entry, so the wrapper carries an empty range list.
 ///
 /// # Safety
-/// `anchor` must point at live anchor style value data.
+/// `anchor` must point at live anchor() or anchor-size() style value data.
 // NB: Same main-thread-only contract as `handle` above.
 #[allow(clippy::arc_with_non_send_sync)]
-pub(crate) unsafe fn create_anchor_inset_calculated(
+pub(crate) unsafe fn create_anchor_function_calculated(
     anchor: *const crate::css::style_value::StyleValueData,
 ) -> Arc<crate::css::style_value::StyleValueData> {
     use crate::css::style_value::StyleValueData;
 
     assert!(
-        matches!(unsafe { &*anchor }, StyleValueData::Anchor { .. }),
-        "anchor inset handle holds a non-anchor style value"
+        matches!(
+            unsafe { &*anchor },
+            StyleValueData::Anchor { .. } | StyleValueData::AnchorSize { .. }
+        ),
+        "anchor function handle holds a non-anchor style value"
     );
     unsafe { Arc::increment_strong_count(anchor) };
     let anchor_value = unsafe { RetainedStyleValueData::from_retained_pointer(anchor) };
@@ -4186,6 +4183,80 @@ pub(crate) enum AbsolutizedCalculation {
     Value(crate::css::style_value::StyleValueData),
 }
 
+/// Absolutizes the fallback value of an anchor() or anchor-size() function, which keeps its
+/// anchor query until style and layout interleaving resolves it. Returns the rebuilt function,
+/// none when nothing changed, or None when the fallback value cannot absolutize.
+pub(crate) fn absolutize_anchor_function(
+    value: &crate::css::style_value::StyleValueData,
+    length_context: &crate::css::style_compute::FfiLengthResolutionContext,
+    tree_counting: Option<(u64, u64)>,
+    random_base_values: &[crate::css::style_compute::FfiRandomBaseValue],
+) -> Option<Option<crate::css::style_value::StyleValueData>> {
+    use crate::css::style_value::StyleValueData;
+    let (StyleValueData::Anchor { fallback_value, .. } | StyleValueData::AnchorSize { fallback_value, .. }) = value
+    else {
+        return None;
+    };
+    let absolutized_fallback = match fallback_value.optional_data() {
+        None => return Some(None),
+        Some(StyleValueData::Length { value, unit }) => {
+            let result = crate::css::style_compute::absolutize_length_for_calc(*value, *unit as usize, length_context);
+            if !result.handled {
+                return None;
+            }
+            if !result.changed {
+                return Some(None);
+            }
+            StyleValueData::Length {
+                value: result.px,
+                unit: crate::css::style_compute::px_length_unit(),
+            }
+        }
+        Some(fallback @ StyleValueData::Calculated { .. }) => {
+            match absolutize_calculation_value(fallback, length_context, tree_counting, random_base_values)? {
+                AbsolutizedCalculation::Unchanged => return Some(None),
+                AbsolutizedCalculation::Percentage(value) => StyleValueData::Percentage { value },
+                AbsolutizedCalculation::Value(value) => value,
+            }
+        }
+        Some(fallback @ (StyleValueData::Anchor { .. } | StyleValueData::AnchorSize { .. })) => {
+            match absolutize_anchor_function(fallback, length_context, tree_counting, random_base_values)? {
+                Some(value) => value,
+                None => return Some(None),
+            }
+        }
+        Some(_) => return Some(None),
+    };
+    let fallback_value = RetainedStyleValueData::from_arc(Arc::new(absolutized_fallback));
+    Some(Some(match value {
+        StyleValueData::Anchor {
+            has_anchor_name,
+            anchor_name,
+            anchor_side,
+            ..
+        } => StyleValueData::Anchor {
+            has_anchor_name: *has_anchor_name,
+            anchor_name: anchor_name.clone(),
+            anchor_side: anchor_side.clone_retained(),
+            fallback_value,
+        },
+        StyleValueData::AnchorSize {
+            has_anchor_name,
+            anchor_name,
+            has_anchor_size,
+            anchor_size,
+            ..
+        } => StyleValueData::AnchorSize {
+            has_anchor_name: *has_anchor_name,
+            anchor_name: anchor_name.clone(),
+            has_anchor_size: *has_anchor_size,
+            anchor_size: *anchor_size,
+            fallback_value,
+        },
+        _ => unreachable!("the value was matched as an anchor function above"),
+    }))
+}
+
 /// Absolutizes a Calculated style value against a length resolution context, with no
 /// percentage basis. Tree-counting functions resolve from the supplied sibling facts, lengths
 /// resolve from the immutable context, and fixed random sharing resolves without external state.
@@ -4203,11 +4274,8 @@ pub(crate) fn absolutize_calculation_value(
         rust_calculation,
         resolve_as_is_number,
         resolve_as_base,
-        resolved_type,
         has_percentages_resolve_as,
-        percentages_resolve_as,
-        resolve_numbers_as_integers,
-        accepted_ranges,
+        ..
     } = value
     else {
         return None;
@@ -4272,9 +4340,22 @@ pub(crate) fn absolutize_calculation_value(
         }
         let source = external.source.data();
         let StyleValueData::TreeCountingFunction { function, .. } = source else {
-            if matches!(source, StyleValueData::Anchor { .. }) {
-                // anchor() stays unresolved until style and layout interleaving supplies
+            if matches!(
+                source,
+                StyleValueData::Anchor { .. } | StyleValueData::AnchorSize { .. }
+            ) {
+                // anchor() and anchor-size() stay unresolved until style and layout interleaving supplies
                 // an anchor resolver, matching the context-free computed-value pass.
+                if let Some(absolutized) =
+                    absolutize_anchor_function(source, length_context, tree_counting, random_base_values)?
+                {
+                    let mut length_type = CalcNumericType::default();
+                    length_type.exponents[BASE_TYPE_LENGTH] = Some(1);
+                    external.resolved_node = Some(Arc::new(CalcNode::NonMathFunction {
+                        value: RetainedStyleValueData::from_arc(Arc::new(absolutized)),
+                        numeric_type: length_type,
+                    }));
+                }
                 continue;
             }
             return None;
@@ -4303,30 +4384,173 @@ pub(crate) fn absolutize_calculation_value(
         &context,
         &externals,
         |evaluation_context, callbacks| {
-            let simplified = root.simplify(evaluation_context, callbacks);
-            if let Some(percentage) = percentage_dimension_mix(&simplified, evaluation_context) {
-                return AbsolutizedCalculation::Percentage(percentage);
-            }
-            if let Some(collapsed) =
-                collapse_absolutized_calculation(&simplified, *resolve_numbers_as_integers, accepted_ranges.as_slice())
-            {
-                return AbsolutizedCalculation::Value(collapsed);
-            }
-            if Arc::ptr_eq(&simplified, &root) {
-                return AbsolutizedCalculation::Unchanged;
-            }
-            AbsolutizedCalculation::Value(StyleValueData::Calculated {
-                rust_calculation: CalcNodeHandle::from_arc(simplified),
-                resolve_as_is_number: *resolve_as_is_number,
-                resolve_as_base: *resolve_as_base,
-                resolved_type: *resolved_type,
-                has_percentages_resolve_as: *has_percentages_resolve_as,
-                percentages_resolve_as: *percentages_resolve_as,
-                resolve_numbers_as_integers: *resolve_numbers_as_integers,
-                accepted_ranges: accepted_ranges.clone(),
-            })
+            computed_calculation_from_simplified(
+                value,
+                &root,
+                root.simplify(evaluation_context, callbacks),
+                evaluation_context,
+            )
         },
     ))
+}
+
+/// The computed value form of the Calculated style value `value`, whose tree `root` simplified to `simplified`.
+fn computed_calculation_from_simplified(
+    value: &crate::css::style_value::StyleValueData,
+    root: &Arc<CalcNode>,
+    simplified: Arc<CalcNode>,
+    evaluation_context: &CalcEvaluationContext,
+) -> AbsolutizedCalculation {
+    use crate::css::style_value::StyleValueData;
+    let StyleValueData::Calculated {
+        resolve_as_is_number,
+        resolve_as_base,
+        resolved_type,
+        has_percentages_resolve_as,
+        percentages_resolve_as,
+        resolve_numbers_as_integers,
+        accepted_ranges,
+        ..
+    } = value
+    else {
+        unreachable!("computed_calculation_from_simplified requires calculated value data");
+    };
+    if let Some(percentage) = percentage_dimension_mix(&simplified, evaluation_context) {
+        return AbsolutizedCalculation::Percentage(percentage);
+    }
+    if let Some(collapsed) =
+        collapse_absolutized_calculation(&simplified, *resolve_numbers_as_integers, accepted_ranges.as_slice())
+    {
+        return AbsolutizedCalculation::Value(collapsed);
+    }
+    // https://drafts.csswg.org/css-values-4/#functional-numeric
+    // "the value of a numeric function is clamped to the range allowed in the context it is used
+    // at computed value time if possible, and at used value time otherwise."
+    // NB: A lone percentage stays a calculation (see collapse_absolutized_calculation), but its
+    //     range is already known, so it is clamped now like a calculation that collapses.
+    let simplified = match &*simplified {
+        CalcNode::Numeric(leaf @ CalcNumericValue::Percentage(..)) => {
+            let clamped = CalcSerializer::clamp_and_censor_numeric_leaf(
+                *leaf,
+                *resolve_numbers_as_integers,
+                accepted_ranges.as_slice(),
+            );
+            if clamped == *leaf {
+                simplified
+            } else {
+                Arc::new(CalcNode::Numeric(clamped))
+            }
+        }
+        _ => simplified,
+    };
+    if Arc::ptr_eq(&simplified, root) {
+        return AbsolutizedCalculation::Unchanged;
+    }
+    AbsolutizedCalculation::Value(StyleValueData::Calculated {
+        rust_calculation: CalcNodeHandle::from_arc(simplified),
+        resolve_as_is_number: *resolve_as_is_number,
+        resolve_as_base: *resolve_as_base,
+        resolved_type: *resolved_type,
+        has_percentages_resolve_as: *has_percentages_resolve_as,
+        percentages_resolve_as: *percentages_resolve_as,
+        resolve_numbers_as_integers: *resolve_numbers_as_integers,
+        accepted_ranges: accepted_ranges.clone(),
+    })
+}
+
+/// Replaces the anchor() and anchor-size() functions of a computed `<length-percentage>` with their fallback values,
+/// as where they are unresolvable. Returns the rebuilt value, none when it holds no anchor functions, or None when one
+/// of them has no fallback value.
+/// https://drafts.csswg.org/css-anchor-position-1/#anchor-size-resolution
+/// If no fallback value is specified, it makes the declaration referencing it invalid at computed-value time.
+#[allow(clippy::arc_with_non_send_sync)]
+pub(crate) fn substitute_unresolvable_anchor_functions(
+    value: &crate::css::style_value::StyleValueData,
+) -> Option<Option<RetainedStyleValueData>> {
+    use crate::css::style_value::StyleValueData;
+    match value {
+        StyleValueData::Anchor { fallback_value, .. } | StyleValueData::AnchorSize { fallback_value, .. } => {
+            let fallback = fallback_value.optional_data()?;
+            Some(Some(
+                substitute_unresolvable_anchor_functions(fallback)?.unwrap_or_else(|| fallback_value.clone()),
+            ))
+        }
+        StyleValueData::Calculated {
+            rust_calculation,
+            resolve_as_is_number,
+            resolve_as_base,
+            has_percentages_resolve_as,
+            ..
+        } if rust_calculation.node().contains_anchor_function() => {
+            let root = rust_calculation.node_arc();
+            let mut externals = Vec::new();
+            collect_external_resolutions(&root, &mut externals);
+            for external in &mut externals {
+                if external.kind != CalcExternalResolutionKind::NonMathFunction
+                    || !matches!(
+                        external.source.data(),
+                        StyleValueData::Anchor { .. } | StyleValueData::AnchorSize { .. }
+                    )
+                {
+                    continue;
+                }
+                let substituted = substitute_unresolvable_anchor_functions(external.source.data())?
+                    .expect("an anchor function is always substituted");
+                external.resolved_node = Some(length_percentage_calc_node(substituted.data())?);
+            }
+            let context = FfiCalcResolutionContext {
+                basis_kind: 0,
+                basis_value: 0.0,
+                basis_unit: 0,
+                length_resolution_context: std::ptr::null(),
+                element_facts: std::ptr::null(),
+            };
+            let resolve_as =
+                resolve_as_from_fields(*has_percentages_resolve_as, *resolve_as_is_number, *resolve_as_base);
+            let computed = with_ffi_evaluation(resolve_as, &context, &externals, |evaluation_context, callbacks| {
+                computed_calculation_from_simplified(
+                    value,
+                    &root,
+                    root.simplify(evaluation_context, callbacks),
+                    evaluation_context,
+                )
+            });
+            Some(Some(match computed {
+                AbsolutizedCalculation::Unchanged => unreachable!("substituting an anchor function changes the tree"),
+                AbsolutizedCalculation::Percentage(value) => {
+                    RetainedStyleValueData::from_arc(Arc::new(StyleValueData::Percentage { value }))
+                }
+                AbsolutizedCalculation::Value(value) => RetainedStyleValueData::from_arc(Arc::new(value)),
+            }))
+        }
+        _ => Some(None),
+    }
+}
+
+/// Whether a `<length-percentage>` is or holds an anchor() or anchor-size() function.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_value_contains_anchor_function(value: &crate::css::style_value::StyleValueData) -> bool {
+    use crate::css::style_value::StyleValueData;
+    match value {
+        StyleValueData::Anchor { .. } | StyleValueData::AnchorSize { .. } => true,
+        StyleValueData::Calculated { rust_calculation, .. } => rust_calculation.node().contains_anchor_function(),
+        _ => false,
+    }
+}
+
+/// The value of a computed `<length-percentage>` whose anchor() and anchor-size() functions are unresolvable: one
+/// strong reference to it with the functions replaced by their fallback values, or null when it holds no anchor
+/// functions or when one of them has no fallback value, which `is_invalid` tells apart.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_value_with_unresolvable_anchor_functions(
+    value: &crate::css::style_value::StyleValueData,
+    is_invalid: &mut bool,
+) -> *const crate::css::style_value::StyleValueData {
+    let substituted = substitute_unresolvable_anchor_functions(value);
+    *is_invalid = substituted.is_none();
+    substituted
+        .flatten()
+        .map_or(std::ptr::null(), RetainedStyleValueData::into_pointer)
 }
 
 /// A calculation leaf for a length-percentage style value, or None for other kinds.
@@ -4601,7 +4825,11 @@ impl CalcNode {
 
     pub(crate) fn contains_anchor_function(&self) -> bool {
         if let CalcNode::NonMathFunction { value, .. } = self
-            && matches!(value.data(), crate::css::style_value::StyleValueData::Anchor { .. })
+            && matches!(
+                value.data(),
+                crate::css::style_value::StyleValueData::Anchor { .. }
+                    | crate::css::style_value::StyleValueData::AnchorSize { .. }
+            )
         {
             return true;
         }
@@ -4686,7 +4914,7 @@ pub struct FfiCalcReification {
     pub storage: *mut std::ffi::c_void,
 }
 
-struct CalcReificationStorage {
+pub struct CalcReificationStorage {
     nodes: Box<[FfiCalcReificationNode]>,
     children: Box<[usize]>,
 }
@@ -4801,12 +5029,7 @@ pub extern "C" fn rust_calc_describe_for_typed_om(
     }
 }
 
-/// # Safety
-/// `storage` must be null or a value returned by `rust_calc_describe_for_typed_om` that has not
-/// already been released.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_reification_release(storage: *mut std::ffi::c_void) {
-    if !storage.is_null() {
-        drop(unsafe { Box::from_raw(storage.cast::<CalcReificationStorage>()) });
-    }
+pub extern "C" fn rust_calc_reification_release(storage: OwnedBox<CalcReificationStorage>) {
+    drop(storage);
 }

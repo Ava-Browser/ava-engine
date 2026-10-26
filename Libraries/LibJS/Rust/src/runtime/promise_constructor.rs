@@ -111,7 +111,7 @@ fn run_promise_all_resolve_element_job(
     value: Value,
 ) -> ThrowCompletionOr<Value> {
     // 5. Set values[thisIndex] to value.
-    values.set(index, value);
+    values.set(vm, index, value);
 
     // 6. Set remainingElementsCount.[[Value]] to remainingElementsCount.[[Value]] - 1.
     // 7. If remainingElementsCount.[[Value]] = 0, then
@@ -296,7 +296,7 @@ fn perform_promise_common(
         };
 
         // c. Append undefined to values.
-        values.append(Value::UNDEFINED);
+        values.append(vm, Value::UNDEFINED);
 
         // d. Let nextPromise be ? Call(promiseResolve, constructor, « next »).
         let next_promise = call(vm, promise_resolve, constructor, &[next])?;
@@ -603,17 +603,14 @@ define_native_function_class!(
 
 impl PromiseConstructor {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<PromiseConstructor> {
-        realm.create_object(
-            vm,
-            PromiseConstructor {
-                base: NativeFunction::new_with_name(
-                    vm,
-                    Self::CLASS,
-                    vm.names.Promise.as_string().clone(),
-                    realm.function_prototype(),
-                ),
-            },
-        )
+        realm.create_object(vm, |_| PromiseConstructor {
+            base: NativeFunction::new_with_name(
+                vm,
+                Self::CLASS,
+                vm.names.Promise.as_string().clone(),
+                realm.function_prototype(),
+            ),
+        })
     }
 
     fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
@@ -745,7 +742,7 @@ impl PromiseConstructor {
             realm,
             new_target,
             |intrinsics, vm| intrinsics.promise_prototype(vm),
-            |prototype| Promise::new(vm, Promise::CLASS, prototype),
+            |defer_gc, prototype| Promise::new(defer_gc, vm, Promise::CLASS, prototype),
         )?;
 
         // 8. Let resolvingFunctions be CreateResolvingFunctions(promise).
@@ -833,35 +830,35 @@ impl PromiseConstructor {
             args.push(vm.argument(index));
         }
 
-        // 1. Let C be the this value.
+        // 1. Let ctor be the this value.
         let constructor = vm.this_value();
 
-        // 2. If C is not an Object, throw a TypeError exception.
+        // 2. If ctor is not an Object, throw a TypeError exception.
         if !constructor.is_object() {
             return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&constructor]);
         }
 
-        // 3. Let promiseCapability be ? NewPromiseCapability(C).
-        let promise_capability = new_promise_capability(vm, constructor)?;
-
-        // 4. Let status be Completion(Call(callback, undefined, args)).
+        // 3. Let status be Completion(Call(callback, undefined, args)).
         let status = call(vm, callback, Value::UNDEFINED, &args.to_vec());
 
         match status {
-            // 5. If status is an abrupt completion, then
+            // 4. If status is an abrupt completion, then
             Err(throw) => {
-                // a. Perform ? Call(promiseCapability.[[Reject]], undefined, « status.[[Value]] »).
+                // a. Let promiseCapability be ? NewPromiseCapability(ctor).
+                let promise_capability = new_promise_capability(vm, constructor)?;
+
+                // b. Perform ? Call(promiseCapability.[[Reject]], undefined, « status.[[Value]] »).
                 call_function_object(vm, promise_capability.reject(), Value::UNDEFINED, &[throw.value()])?;
+
+                // c. Return promiseCapability.[[Promise]].
+                Ok(Value::from_object(promise_capability.promise()))
             }
-            // 6. Else,
+            // 5. Else,
             Ok(value) => {
-                // a. Perform ? Call(promiseCapability.[[Resolve]], undefined, « status.[[Value]] »).
-                call_function_object(vm, promise_capability.resolve(), Value::UNDEFINED, &[value])?;
+                // a. Return ? PromiseResolve(ctor, ! status).
+                Ok(Value::from_object(promise_resolve(vm, constructor.as_object(), value)?))
             }
         }
-
-        // 7. Return promiseCapability.[[Promise]].
-        Ok(Value::from_object(promise_capability.promise()))
     }
 
     // 27.2.4.9 Promise.withResolvers ( ), https://tc39.es/ecma262/#sec-promise.withResolvers

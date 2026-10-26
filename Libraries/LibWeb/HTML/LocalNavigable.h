@@ -10,6 +10,7 @@
 #include <AK/Assertions.h>
 #include <AK/HashTable.h>
 #include <AK/OwnPtr.h>
+#include <AK/Time.h>
 #include <AK/Tuple.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
@@ -82,7 +83,7 @@ public:
     using NullOrError = NavigationParamsNullOrError;
     using NavigationParamsVariant = HTML::NavigationParamsVariant;
 
-    void initialize_navigable(NonnullRefPtr<DocumentState> document_state, GC::Ptr<Navigable> parent, GC::Ref<DOM::Document> document, VisibilityState system_visibility_state);
+    void initialize_navigable(NonnullRefPtr<DocumentState> document_state, GC::Ptr<Navigable> parent, GC::Ref<DOM::Document> document, VisibilityState system_visibility_state, bool is_stand_in = false);
     void inherit_page_state_from(LocalNavigable const& parent);
     void set_id_for_session_history_reconstruction(CrossProcessId id) { set_id(id); }
 
@@ -194,7 +195,7 @@ public:
     void adopt_navigation_started_in_ui_process(Utf16String navigation_id);
     void navigate_to_a_javascript_url_from_ui_process(URL::URL const&, HistoryHandlingBehavior, URL::Origin const& initiator_origin, NavigationSourceSnapshot const&, UserNavigationInvolvement, ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type, Utf16String navigation_id);
     void navigate_to_a_fragment(URL::URL const&, HistoryHandlingBehavior, UserNavigationInvolvement, GC::Ptr<DOM::Element> source_element, Optional<StorageSerializationRecord> navigation_api_state, Utf16String navigation_id, GC::Ptr<NavigationAPIMethodTracker> api_method_tracker, Optional<URL::Origin> initiator_origin);
-    void deliver_posted_message_from_another_process(PostedMessageDescriptor);
+    void deliver_posted_message_from_another_process(MessageDescriptor);
     void run_navigation_unload_check(Utf16String const& navigation_id, UnloadPromptShown, GC::Ref<GC::Function<void(bool)>> completion_steps);
     void continue_navigation_at_population(NavigationPopulationRequest, NavigationPopulationResult);
 
@@ -222,6 +223,13 @@ public:
     [[nodiscard]] virtual bool has_been_destroyed() const override { return m_has_been_destroyed; }
     virtual void set_has_been_destroyed() override;
     void remove_from_all_local_navigables();
+
+    // https://html.spec.whatwg.org/multipage/document-sequences.html#allowed-to-perform-a-navigation-or-history-update
+    enum class NavigationOrHistoryUpdatePermission : u8 {
+        Allowed,
+        Blocked,
+    };
+    NavigationOrHistoryUpdatePermission allowed_to_perform_a_navigation_or_history_update();
 
     virtual bool is_local_navigable() const override { return true; }
 
@@ -571,6 +579,9 @@ private:
     NavigationObserver::NavigationObserversList m_navigation_observers;
 
     bool m_has_been_destroyed { false };
+
+    MonotonicTime m_navigation_or_history_update_rate_limit_window_start { MonotonicTime::now_coarse() };
+    u32 m_navigation_or_history_updates_in_rate_limit_window { 0 };
     GC::Ptr<WindowProxy> m_window_proxy_after_unload;
     GC::Ptr<RemoteNavigable> m_provisional_for;
 

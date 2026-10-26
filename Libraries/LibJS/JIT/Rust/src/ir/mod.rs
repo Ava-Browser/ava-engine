@@ -421,8 +421,8 @@ impl Comparison {
 /// `CheckShape`, `CheckValue`, `CheckClosure`, `CheckAccessorFunction`,
 /// `CheckElements`, `CheckTypedArray`, `CheckArray`, `CheckNonNegativeInt32`,
 /// `CheckIdentityComparable`, `CheckAppendableArray`, `CheckBounds`,
-/// `CheckTypedArrayStorage`, `CheckNotHole`), and a `Refine` on the edge of a
-/// branch, has that input as its value, refined:
+/// `CheckTypedArrayStorage`, `CheckNotHole`, `CheckInitialized`), and a
+/// `Refine` on the edge of a branch, has that input as its value, refined:
 /// known to pass. Nodes that rely on the check take the refined value as their
 /// input instead of the input itself, so that the check is a data dependency
 /// of theirs: passes move or share them exactly when they can move or share
@@ -515,6 +515,10 @@ pub enum Op {
     CallIntrinsic {
         intrinsic: Intrinsic,
     },
+    /// Splices a plain packed array through the runtime, or returns the
+    /// empty value without observable effects. Inputs: the tagged receiver,
+    /// int32 start and delete count, and the tagged values to insert.
+    CallArraySplice,
     /// ToObject of input 0, a primitive other than undefined and null, as
     /// the builtin function input 1 makes it (in its realm), through the
     /// runtime, or the empty value where that is not the running realm.
@@ -558,11 +562,16 @@ pub enum Op {
     /// holding an arguments object the code never created), the node reads
     /// its operands from the frame and writes the result there, like a
     /// `Generic` node.
+    ///
+    /// The callee it calls is its call feedback's `DirectCallTarget`, or
+    /// with `target`, the graph's `direct_call_targets[target]`, a function
+    /// the code holds as a constant.
     CallDirect {
         executable: u32,
         pc: u32,
         inlined_frame_bytes: u32,
         stores_operands: bool,
+        target: Option<u32>,
     },
     /// The `Call` instruction at `pc` of `executable`, like `Generic`, but
     /// calling its call feedback's `NativeCallTarget` directly, in the
@@ -708,6 +717,10 @@ pub enum Op {
     /// `LoadElementAt` finds there) from here on. Exits with
     /// `ExitKind::OutOfBounds` where it is one.
     CheckNotHole,
+    /// The tagged input 0, the value of a binding or local variable, which
+    /// is known to be initialized (not the empty value) from here on. Exits
+    /// with `ExitKind::Uninitialized` where it is not.
+    CheckInitialized,
     /// The address of the cell in the tagged input 0, as a `Repr::Pointer`.
     /// Nodes accessing an object take it as an extra input, so that one
     /// decoding of the tagged value serves all of them.
@@ -876,10 +889,12 @@ pub enum Op {
         part: AccessorPart,
     },
     /// Loads the named property at `offset` of the object in input 0. Exits
-    /// if the property holds an accessor. An optional input 1 is the
-    /// object's `CellAddress`.
+    /// if the property holds an accessor, unless checks before it ensure
+    /// that it `holds_data`. An optional input 1 is the object's
+    /// `CellAddress`.
     LoadNamed {
         offset: u32,
+        holds_data: bool,
     },
     /// Adds a property to the object in input 0 (whose `CellAddress` is
     /// input 2), made by an `AllocateObject` with room for it, which has the
@@ -893,10 +908,12 @@ pub enum Op {
         property_count: u32,
     },
     /// Stores input 1 into the named property at `offset` of the object in
-    /// input 0, which already exists. Exits if the property holds an accessor.
-    /// An optional input 2 is the object's `CellAddress`.
+    /// input 0, which already exists. Exits if the property holds an accessor,
+    /// unless checks before it ensure that it `holds_data`. An optional input
+    /// 2 is the object's `CellAddress`.
     StoreNamed {
         offset: u32,
+        holds_data: bool,
     },
 
     // Control nodes. Each block ends with exactly one of these.
@@ -1380,6 +1397,13 @@ impl Op {
                 allocates: true,
                 ..P::PURE
             },
+            Op::CallArraySplice => P {
+                is_call: true,
+                allocates: true,
+                reads: Locations::NAMED.union(Locations::ELEMENTS_AND_COUNTS),
+                writes: Locations::ELEMENTS_AND_COUNTS,
+                ..P::PURE
+            },
             Op::CheckInt32
             | Op::CheckFloat64Int32
             | Op::CheckNumber
@@ -1415,7 +1439,7 @@ impl Op {
                 writes: Locations::ELEMENTS,
                 ..P::PURE
             },
-            Op::CheckBounds | Op::CheckNotHole | Op::CheckTypedArrayStorage => P::PURE,
+            Op::CheckBounds | Op::CheckNotHole | Op::CheckInitialized | Op::CheckTypedArrayStorage => P::PURE,
             Op::AllocateObject { .. } => P {
                 allocates: true,
                 ..P::PURE
@@ -1671,6 +1695,7 @@ impl Op {
             Op::ToBoolean => "ToBoolean",
             Op::PrimitiveToString => "PrimitiveToString",
             Op::CallIntrinsic { .. } => "CallIntrinsic",
+            Op::CallArraySplice => "CallArraySplice",
             Op::ToObject => "ToObject",
             Op::ArrayCreate => "ArrayCreate",
             Op::Generic { .. } => "Generic",
@@ -1702,6 +1727,7 @@ impl Op {
             Op::LoadElementAt { .. } => "LoadElementAt",
             Op::StoreElementAt { .. } => "StoreElementAt",
             Op::CheckNotHole => "CheckNotHole",
+            Op::CheckInitialized => "CheckInitialized",
             Op::CellAddress => "CellAddress",
             Op::AllocateObject { .. } => "AllocateObject",
             Op::InitializeNamed { .. } => "InitializeNamed",
@@ -1811,7 +1837,8 @@ impl Op {
             | Op::CheckAppendableArray
             | Op::CheckBounds
             | Op::CheckTypedArrayStorage
-            | Op::CheckNotHole => Some(0),
+            | Op::CheckNotHole
+            | Op::CheckInitialized => Some(0),
             _ => None,
         }
     }
@@ -1843,6 +1870,7 @@ impl Op {
             Op::CheckObject => Some(ExitKind::NotObject),
             Op::CheckElements { .. } | Op::CheckTypedArray => Some(ExitKind::BadElements),
             Op::CheckBounds | Op::CheckNotHole | Op::CheckTypedArrayStorage => Some(ExitKind::OutOfBounds),
+            Op::CheckInitialized => Some(ExitKind::Uninitialized),
             Op::CheckInt32 | Op::CheckFloat64Int32 => Some(ExitKind::NotInt32),
             Op::CheckArray => Some(ExitKind::BadType),
             Op::CheckNonNegativeInt32 => Some(ExitKind::Overflow),
@@ -1858,8 +1886,8 @@ impl Op {
             | Op::CheckPrototypeChainValid { .. }
             | Op::LoadGlobalBinding { .. }
             | Op::StoreGlobalBinding { .. }
-            | Op::LoadNamed { .. }
-            | Op::StoreNamed { .. }
+            | Op::LoadNamed { holds_data: false, .. }
+            | Op::StoreNamed { holds_data: false, .. }
             | Op::ShapeSwitch { .. } => Some(ExitKind::BadShape),
             _ => None,
         }
@@ -2063,6 +2091,8 @@ pub struct Graph {
     /// Immutable properties of embedded typed arrays. Their fixed lengths
     /// require a valid cached storage offset before each access.
     pub typed_array_constants: Vec<(u64, crate::snapshot::TypedArraySnapshot)>,
+    /// The targets of `Op::CallDirect` nodes that call function constants.
+    pub direct_call_targets: Vec<crate::snapshot::DirectCallTarget>,
     /// The most bytes of interpreter stack that materializing the frames of
     /// inlined calls, and the frames of direct and native calls on top of
     /// them, take at once. Compiled code checks at entry that they fit.
@@ -2379,6 +2409,41 @@ impl Graph {
             id = self.node(id).inputs[index];
         }
         id
+    }
+
+    /// Whether `id` is `value`, or refines it through any number of
+    /// refinements.
+    pub fn refines(&self, mut id: NodeId, value: NodeId) -> bool {
+        while id != value {
+            let Some(index) = self.node(id).op.refined_input() else {
+                return false;
+            };
+            id = self.node(id).inputs[index];
+        }
+        true
+    }
+
+    /// Whether `id` always has the value of `value`, because it refines
+    /// `value` or a phi whose inputs all have that value.
+    pub fn has_value_of(&self, id: NodeId, value: NodeId) -> bool {
+        let mut pending = vec![id];
+        let mut seen = Vec::new();
+        while let Some(mut node) = pending.pop() {
+            while node != value
+                && let Some(index) = self.node(node).op.refined_input()
+            {
+                node = self.node(node).inputs[index];
+            }
+            if node == value || seen.contains(&node) {
+                continue;
+            }
+            seen.push(node);
+            if !matches!(self.node(node).op, Op::Phi) {
+                return false;
+            }
+            pending.extend(self.node(node).inputs.iter().copied());
+        }
+        true
     }
 }
 

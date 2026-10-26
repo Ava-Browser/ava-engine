@@ -13,9 +13,8 @@
 use core::ptr::NonNull;
 
 use ak::Utf16String;
-use libcompositing_rust::display_list::canvas_2d::Compositing;
 use libcompositing_rust::display_list::canvas_2d_recorder::AlphaType;
-use libgfx_rust::{AffineTransform, CompositingAndBlendingOperator, FloatRect, IntRect, ScalingMode};
+use libgfx_rust::{IntPoint, IntRect};
 use libjs_rust::api::{ErrorKind, ErrorType};
 
 use super::image_data::{ImageData, ImageDataSettings};
@@ -166,7 +165,13 @@ impl ContextState {
         // SAFETY: The rows of the source rectangle are inside the pixels of the ImageData, and nothing runs script
         //         while they are copied.
         let Some(frame) = (unsafe {
-            image_frame_from_pixels(first_row, source_pitch, destination_rect.width, destination_rect.height)
+            image_frame_from_pixels(
+                first_row,
+                source_pitch,
+                destination_rect.width,
+                destination_rect.height,
+                image_data.predefined_color_space().into(),
+            )
         }) else {
             return Err(cx
                 .vm()
@@ -175,40 +180,15 @@ impl ContextState {
                 .into());
         };
 
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "the rectangle is in floats, as the C++ had it"
-        )]
-        let destination = FloatRect::new(
-            destination_rect.x as f32,
-            destination_rect.y as f32,
-            destination_rect.width as f32,
-            destination_rect.height as f32,
-        );
-        let frame_rect = IntRect {
-            x: 0,
-            y: 0,
-            width: destination_rect.width,
-            height: destination_rect.height,
-        };
         let lent_frame = LentImageFrame(NonNull::new(frame.as_raw().cast_mut()).expect("an image frame has a frame"));
         self.record(|recorder| {
-            recorder.save();
-            recorder.set_transform(AffineTransform::identity());
-            // NB: Step 7 sets each destination pixel to the source pixel: putImageData replaces the pixels (including
-            //     their alpha), rather than compositing them. The copy operator makes a transparent source pixel
-            //     overwrite an opaque destination pixel, rather than leave it unchanged.
-            recorder.draw_image_frame(
+            recorder.put_image_frame(
                 &lent_frame,
-                destination,
-                frame_rect,
-                ScalingMode::NearestNeighbor,
-                &Compositing {
-                    compositing_and_blending_operator: CompositingAndBlendingOperator::Copy,
-                    ..Compositing::default()
+                IntPoint {
+                    x: destination_rect.x,
+                    y: destination_rect.y,
                 },
             );
-            recorder.restore();
         });
 
         self.did_draw();
@@ -236,7 +216,13 @@ impl<K: CanvasKind> RenderingContext2D<K> {
         //    settings, and defaultColorSpace set to this's color space.
         // 4. Initialize the image data of newImageData to transparent black.
         // 5. Return newImageData.
-        ImageData::create(cx, absolute_magnitude(sw), absolute_magnitude(sh), Some(&settings))
+        ImageData::create(
+            cx,
+            absolute_magnitude(sw),
+            absolute_magnitude(sh),
+            Some(&settings),
+            Some(self.context_attributes.color_space),
+        )
     }
 
     /// https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-createimagedata-imagedata
@@ -248,11 +234,10 @@ impl<K: CanvasKind> RenderingContext2D<K> {
         // 1. Let newImageData be a new ImageData object.
         // 2. Initialize newImageData given the value of imageData's width attribute, the value of imageData's height
         //    attribute, and defaultColorSpace set to the value of imageData's colorSpace attribute.
-        // FIXME: Set defaultColorSpace to the value of image_data's colorSpace attribute
         // 3. Initialize the image data of newImageData to transparent black.
         // 4. Return newImageData.
         let (width, height) = image_data.size();
-        ImageData::create(cx, width, height, None)
+        ImageData::create(cx, width, height, None, Some(image_data.predefined_color_space()))
     }
 
     /// https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-getimagedata
@@ -286,7 +271,13 @@ impl<K: CanvasKind> RenderingContext2D<K> {
         // 3. Let imageData be a new ImageData object.
         // 4. Initialize imageData given sw, sh, settings set to settings, and defaultColorSpace set to this's color
         //    space.
-        let image_data = ImageData::create(cx, width, height, Some(&settings))?;
+        let image_data = ImageData::create(
+            cx,
+            width,
+            height,
+            Some(&settings),
+            Some(self.context_attributes.color_space),
+        )?;
 
         // 5. Let the source rectangle be the rectangle whose corners are the four points (sx, sy), (sx+sw, sy),
         //    (sx+sw, sy+sh), (sx, sy+sh).
@@ -314,7 +305,12 @@ impl<K: CanvasKind> RenderingContext2D<K> {
         // NOTE: Internally we must use premultiplied alpha, but ImageData should hold unpremultiplied alpha. This
         //       conversion might result in a loss of precision, but is according to spec.
         //       See: https://html.spec.whatwg.org/multipage/canvas.html#premultiplied-alpha-and-the-2d-rendering-context
-        let Some(readback) = self.read_pixels(readback_rect, AlphaType::Unpremultiplied) else {
+        // NB: The readback converts the pixels to the color space of imageData, which step 6 does below.
+        let Some(readback) = self.read_pixels(
+            readback_rect,
+            AlphaType::Unpremultiplied,
+            image_data.predefined_color_space().into(),
+        ) else {
             return Ok(image_data);
         };
 

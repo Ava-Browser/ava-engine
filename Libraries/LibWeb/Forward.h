@@ -156,13 +156,6 @@ class ClipboardItem;
 
 }
 
-namespace Web::Compression {
-
-class CompressionStream;
-class DecompressionStream;
-
-}
-
 namespace Web::ContentSecurityPolicy {
 
 class Policy;
@@ -174,30 +167,7 @@ class Violation;
 
 namespace Web::ContentSecurityPolicy::Directives {
 
-class BaseUriDirective;
-class ChildSourceDirective;
-class ConnectSourceDirective;
-class DefaultSourceDirective;
 class Directive;
-class FontSourceDirective;
-class FormActionDirective;
-class FrameAncestorsDirective;
-class FrameSourceDirective;
-class ImageSourceDirective;
-class ManifestSourceDirective;
-class MediaSourceDirective;
-class ObjectSourceDirective;
-class ReportToDirective;
-class ReportUriDirective;
-class SandboxDirective;
-class ScriptSourceAttributeDirective;
-class ScriptSourceDirective;
-class ScriptSourceElementDirective;
-class StyleSourceAttributeDirective;
-class StyleSourceDirective;
-class StyleSourceElementDirective;
-class WebRTCDirective;
-class WorkerSourceDirective;
 
 }
 
@@ -236,7 +206,6 @@ class AnglePercentage;
 class AngleStyleValue;
 class BackgroundSizeStyleValue;
 class BlurFilterStyleValue;
-class BorderImageSliceStyleValue;
 class CalculatedStyleValue;
 class CustomPropertyData;
 class ColorFilterStyleValue;
@@ -317,7 +286,6 @@ class DimensionStyleValue;
 class Display;
 class DisplayStyleValue;
 class DropShadowFilterStyleValue;
-class EdgeStyleValue;
 class FilterStyleValue;
 class Flex;
 class FlexStyleValue;
@@ -331,6 +299,8 @@ class Frequency;
 class FrequencyPercentage;
 class FrequencyStyleValue;
 class FunctionStyleValue;
+class Highlight;
+class HighlightRegistry;
 class HueRotateFilterStyleValue;
 class ImageSetStyleValue;
 class ImageStyleValue;
@@ -338,7 +308,6 @@ class IntegerStyleValue;
 class KeywordStyleValue;
 class Length;
 class LengthBox;
-class LengthOrAuto;
 class LengthPercentage;
 class LengthPercentageOrAuto;
 class LengthStyleValue;
@@ -349,15 +318,12 @@ class Number;
 class NumberStyleValue;
 class NumericType;
 class OpacityValueStyleValue;
-class OpenTypeTaggedStyleValue;
 class PendingSubstitutionStyleValue;
 class Percentage;
 class PercentageStyleValue;
-class PositionStyleValue;
 class PropertyNameAndID;
 class Ratio;
 class RatioStyleValue;
-class RepeatStyleStyleValue;
 class Resolution;
 class ResolutionStyleValue;
 class Screen;
@@ -464,6 +430,7 @@ using StyleValueVector = Vector<ValueComparingNonnullRefPtr<StyleValue const>>;
 
 namespace Web::CSS::Parser::ValueParserFFI {
 
+struct DeclarationBlock;
 struct FfiMediaFeatureValue;
 
 }
@@ -553,14 +520,9 @@ class EditCommand;
 class EditingHistory;
 class SpellCheckController;
 class SpellingMarkers;
+class WritingSuggestionController;
 class UndoStep;
 enum class HistoryAction : u8;
-
-}
-
-namespace Web::Encoding {
-
-class TextEncoderStream;
 
 }
 
@@ -578,7 +540,9 @@ class FileSystemEntry;
 
 namespace Web::EventTiming {
 
+class EventCounts;
 class PerformanceEventTiming;
+struct WindowEventTimingState;
 
 }
 
@@ -817,6 +781,8 @@ class RadioButtonGroupRegistry;
 class RadioNodeList;
 class RemoteNavigable;
 class RemoteWindow;
+class Sanitizer;
+struct SanitizerConfiguration;
 class ScriptRegistry;
 class SessionHistoryEntry;
 class SharedResourceRequest;
@@ -996,6 +962,18 @@ class Notification;
 
 }
 
+namespace Web::LargestContentfulPaint {
+
+class LargestContentfulPaint;
+
+}
+
+namespace Web::PaintTiming {
+
+class PerformancePaintTiming;
+
+}
+
 namespace Web::Painting {
 
 class BoxViewRepaintAccess;
@@ -1100,23 +1078,11 @@ class SpeechSynthesisVoice;
 
 namespace Web::Streams {
 
-class ReadableByteStreamController;
 class ReadableStream;
-class ReadableStreamAsyncIterator;
-class ReadableStreamBYOBReader;
-class ReadableStreamBYOBRequest;
-class ReadableStreamDefaultController;
 class ReadableStreamDefaultReader;
-class ReadableStreamGenericReaderMixin;
-class ReadIntoRequest;
 class ReadRequest;
 class TransformStream;
-class TransformStreamDefaultController;
 class WritableStream;
-class WritableStreamDefaultController;
-class WritableStreamDefaultWriter;
-
-struct PullIntoDescriptor;
 
 }
 
@@ -1225,23 +1191,6 @@ class PerformanceMeasure;
 namespace Web::ViewTransition {
 
 class ViewTransition;
-
-}
-
-namespace Web::WebAssembly {
-
-class Global;
-class Instance;
-class Memory;
-class Module;
-class Table;
-class Tag;
-
-namespace Detail {
-
-class WebAssemblyCache;
-
-}
 
 }
 
@@ -1358,6 +1307,7 @@ struct FormDataEntry;
 namespace Web::TrustedTypes {
 
 class TrustedHTML;
+class TrustedHTMLParserOptions;
 class TrustedScript;
 class TrustedScriptURL;
 class TrustedTypePolicy;

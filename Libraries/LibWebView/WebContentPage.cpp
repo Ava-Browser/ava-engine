@@ -10,8 +10,8 @@
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/StatsLog.h>
-#include <LibDevTools/StorageHelpers.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
+#include <LibWebCommon/Geolocation/GeolocationPositionErrorCode.h>
 #include <LibWebCommon/HTML/BrowsingContext.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/WebDriver/Error.h>
@@ -30,6 +30,7 @@
 #include <LibWebView/NavigationLoader.h>
 #include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/RequestServerManager.h>
+#include <LibWebView/StorageAreaRegistry.h>
 #include <LibWebView/StorageJar.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
@@ -37,6 +38,7 @@
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
 #include <LibWebView/WebContentTestClient.h>
+#include <LibWebView/WebDriverBiDi.h>
 #include <LibWebView/WebUI.h>
 #include <LibWebView/WorkerProcessManager.h>
 
@@ -311,6 +313,9 @@ bool WebContentPage::continue_navigation_population_in_selected_process(Web::HTM
     auto navigation = navigable->navigation_with_id(navigation_id);
     if (!navigation || !navigation->state.has<CanonicalNavigation::AcquiringResponseBody>())
         return false;
+
+    navigation->loader()->obtain_the_response_policies(*navigable);
+    navigation->loader()->check_the_responses_adherence_to_its_embedder_policy(*navigable);
 
     NonnullRefPtr history_entry = *navigation->history_entry;
     auto host_or_error = navigable->obtain_page_to_populate_document(history_entry, *navigation->loader(), *this);
@@ -710,12 +715,43 @@ void WebContentPage::did_request_navigation_of_navigable(Web::HTML::CrossProcess
     target->begin_navigation(move(navigation));
 }
 
-void WebContentPage::did_post_message_to_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor message)
+void WebContentPage::did_post_message_to_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor posted_message)
 {
-    // The window post message steps queue their task on the target window in the process hosting its document.
+    // https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps
+    // 2. Let incumbentSettings be the incumbent settings object.
+    // NB: The posting process determined it. Any page of that process can host it, since the request comes through the
+    //     page holding the target's tab.
+    auto incumbent_settings = client().hosted_environment(posted_message.incumbent_settings_id);
+
+    // 8. Queue a global task on the posted message task source given targetWindow to run the following steps:
+    // NB: The process hosting targetWindow's document queues it, with the origin and source given here.
     auto endpoint = endpoint_hosting_navigable_represented_by(navigable_id);
     if (!endpoint)
         return;
+
+    // 8.2. Let origin be incumbentSettings's origin.
+    // AD-HOC: For a window whose document this process no longer holds, which a same-origin document can still call
+    //         into, the origin the posting process gives is taken if that process hosts a document of that origin.
+    Optional<URL::Origin> origin;
+    if (incumbent_settings.has_value())
+        origin = incumbent_settings->origin();
+    else if (client().hosts_a_document_of_origin(posted_message.source_origin))
+        origin = move(posted_message.source_origin);
+    if (!origin.has_value())
+        return;
+
+    // 8.3. Let source be the WindowProxy object corresponding to incumbentSettings's global object (a Window object).
+    // NB: The source must be a navigable the posting process hosts.
+    Optional<Web::HTML::CrossProcessId> source_navigable_id;
+    if (posted_message.source_navigable_id.has_value() && client().hosted_navigable(*posted_message.source_navigable_id).has_value())
+        source_navigable_id = posted_message.source_navigable_id;
+
+    Web::HTML::MessageDescriptor message {
+        .serialize_with_transfer_result = move(posted_message.serialize_with_transfer_result),
+        .target_origin = move(posted_message.target_origin),
+        .source_origin = origin.release_value(),
+        .source_navigable_id = source_navigable_id,
+    };
     endpoint->async_deliver_posted_message(navigable_id, move(message));
 }
 
@@ -798,6 +834,8 @@ void WebContentPage::did_create_child_frame(Web::HTML::CrossProcessId parent_fra
     }
 
     hosted_state.container.document_active_sandboxing_flag_set = container_document->active_sandboxing_flag_set();
+    hosted_state.container.document_embedder_policy = container_document->embedder_policy();
+    hosted_state.container.document_permissions_policy = container_document->permissions_policy();
     traversable.adopt_nested_history_for_created_child(*parent_navigable, *container_document, frame_id);
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#create-a-new-child-navigable
@@ -1235,47 +1273,34 @@ void WebContentPage::did_request_document_cookie_version_index(Web::HTML::Enviro
     }
 }
 
-Messages::WebContentClient::DidRequestStorageItemResponse WebContentPage::did_request_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key)
-{
-    auto canonical_key = canonical_storage_key(environment_id);
-    auto* storage_jar = this->storage_jar(storage_endpoint);
-    if (!canonical_key.has_value() || !storage_jar)
-        return Optional<Utf16String> {};
-    return storage_jar->get_item(storage_endpoint, *canonical_key, bottle_key);
-}
-
-Messages::WebContentClient::DidSetStorageItemResponse WebContentPage::did_set_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key, Utf16String value)
-{
-    auto canonical_key = canonical_storage_key(environment_id);
-    auto* storage_jar = this->storage_jar(storage_endpoint);
-    if (!canonical_key.has_value() || !storage_jar)
-        return WebView::StorageOperationError::QuotaExceededError;
-    return storage_jar->set_item(storage_endpoint, *canonical_key, bottle_key, value);
-}
-
-void WebContentPage::did_remove_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key)
-{
-    auto canonical_key = canonical_storage_key(environment_id);
-    auto* storage_jar = this->storage_jar(storage_endpoint);
-    if (canonical_key.has_value() && storage_jar)
-        storage_jar->remove_item(storage_endpoint, *canonical_key, bottle_key);
-}
-
-Messages::WebContentClient::DidRequestStorageKeysResponse WebContentPage::did_request_storage_keys(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id)
-{
-    auto canonical_key = canonical_storage_key(environment_id);
-    auto* storage_jar = this->storage_jar(storage_endpoint);
-    if (!canonical_key.has_value() || !storage_jar)
-        return Vector<Utf16String> {};
-    return storage_jar->get_all_keys(storage_endpoint, *canonical_key);
-}
-
-void WebContentPage::did_clear_storage(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id)
+void WebContentPage::clear_storage_for_testing(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id)
 {
     auto canonical_key = canonical_storage_key(environment_id);
     auto* storage_jar = this->storage_jar(storage_endpoint);
     if (canonical_key.has_value() && storage_jar)
         storage_jar->clear_storage_key(storage_endpoint, *canonical_key);
+}
+
+Messages::WebContentClient::ConnectToStorageAreaResponse WebContentPage::connect_to_storage_area(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id)
+{
+    auto canonical_key = canonical_storage_key(environment_id);
+    auto* storage_jar = this->storage_jar(storage_endpoint);
+    if (!canonical_key.has_value() || !storage_jar)
+        return { {}, {}, {}, 0 };
+
+    auto connection = StorageAreaRegistry::the().connect(client(), *storage_jar, storage_endpoint, *canonical_key);
+    if (!connection.has_value())
+        return { {}, {}, {}, 0 };
+
+    Vector<Utf16String> keys;
+    Vector<Utf16String> values;
+    keys.ensure_capacity(connection->items.size());
+    values.ensure_capacity(connection->items.size());
+    for (auto& item : connection->items) {
+        keys.unchecked_append(move(item.key));
+        values.unchecked_append(move(item.value));
+    }
+    return { connection->id, move(keys), move(values), connection->usage };
 }
 
 void WebContentPage::did_change_needs_beforeunload_check(bool needs_beforeunload_check)
@@ -1350,7 +1375,19 @@ void WebContentPage::webdriver_did_set_current_browsing_context(u64 command_id, 
 
 void WebContentPage::webdriver_command_complete(u64 command_id, Web::WebDriver::Response response)
 {
-    view().did_complete_webdriver_content_command({}, command_id, move(response));
+    view().did_complete_webdriver_content_command(*this, command_id, move(response));
+}
+
+void WebContentPage::webdriver_bidi_event(Web::HTML::CrossProcessId navigable_id, String name, JsonValue params)
+{
+    if (auto* webdriver_bidi = WebDriverBiDi::the())
+        webdriver_bidi->did_receive_event(*this, navigable_id, name, move(params));
+}
+
+void WebContentPage::webdriver_bidi_navigation_event(Web::HTML::CrossProcessId navigable_id, String name, Optional<Utf16String> navigation_id, URL::URL url)
+{
+    if (auto* webdriver_bidi = WebDriverBiDi::the())
+        webdriver_bidi->did_receive_navigation_event(*this, navigable_id, name, move(navigation_id), move(url));
 }
 
 void WebContentPage::did_update_resource_count(i32 count_waiting)
@@ -1488,8 +1525,26 @@ void WebContentPage::did_request_color_picker(Color current_color)
     view().did_request_color_picker({}, *this, current_color);
 }
 
+bool WebContentPage::hosts_a_document_allowed_to_use(Web::PermissionsPolicy::PolicyControlledFeature feature) const
+{
+    auto is_allowed = false;
+    traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
+        auto const& document = navigable.active_document();
+        if (document.host() != this)
+            return IterationDecision::Continue;
+        auto value = Web::PermissionsPolicy::check_permissions_policy(document.permissions_policy(), feature, document.origin(), document.origin());
+        is_allowed = value == Web::PermissionsPolicy::FeatureValue::Enabled;
+        return is_allowed ? IterationDecision::Break : IterationDecision::Continue;
+    });
+    return is_allowed;
+}
+
 void WebContentPage::did_request_geolocation_position(u64 request_id)
 {
+    if (!hosts_a_document_allowed_to_use(Web::PermissionsPolicy::PolicyControlledFeature::Geolocation)) {
+        async_geolocation_position_response(request_id, {}, to_underlying(Web::Geolocation::GeolocationPositionErrorCode::PermissionDenied));
+        return;
+    }
     if (view().on_request_geolocation_position)
         view().on_request_geolocation_position(*this, request_id);
 }
@@ -1884,32 +1939,6 @@ void WebContentPage::did_receive_network_response_headers(u64 request_id, u32 st
     }
 }
 
-void WebContentPage::did_change_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String url, Optional<Utf16String> key, Optional<Utf16String> old_value, Optional<Utf16String> new_value)
-{
-    if (displays_tab()) {
-        auto host = DevTools::storage_host_for_url(url);
-        if (!host.has_value())
-            return;
-
-        DevTools::DevToolsDelegate::StorageChange::Type type;
-        if (!key.has_value())
-            type = DevTools::DevToolsDelegate::StorageChange::Type::Cleared;
-        else if (!old_value.has_value())
-            type = DevTools::DevToolsDelegate::StorageChange::Type::Added;
-        else if (!new_value.has_value())
-            type = DevTools::DevToolsDelegate::StorageChange::Type::Deleted;
-        else
-            type = DevTools::DevToolsDelegate::StorageChange::Type::Changed;
-
-        view().notify_storage_changed({
-            .storage_endpoint = storage_endpoint,
-            .host = host.release_value(),
-            .type = type,
-            .key = key.has_value() ? Optional<String> { key->to_utf8() } : Optional<String> {},
-        });
-    }
-}
-
 void WebContentPage::did_update_indexed_database(String update)
 {
     if (displays_tab())
@@ -1932,6 +1961,11 @@ void WebContentPage::did_request_clipboard_entries(u64 request_id)
 void WebContentPage::did_request_spell_check(u64 request_id, Utf16String text)
 {
     view().did_request_spell_check({}, *this, request_id, move(text));
+}
+
+void WebContentPage::did_request_writing_suggestion(u64 request_id, Utf16String text, u32 caret_offset)
+{
+    view().did_request_writing_suggestion({}, *this, request_id, move(text), caret_offset);
 }
 
 void WebContentPage::did_request_set_system_focus(bool has_system_focus)
@@ -2831,10 +2865,10 @@ void WebContentPage::did_request_stop_loading_for_testing()
         view().stop_loading();
 }
 
-void WebContentPage::did_request_reload_for_testing()
+void WebContentPage::did_request_reload_for_testing(bool bypass_cache)
 {
     if (displays_tab())
-        view().reload();
+        view().reload(bypass_cache ? BypassCache::Yes : BypassCache::No);
 }
 
 // The tab's Back and Forward buttons, which traverse the history with no source document.

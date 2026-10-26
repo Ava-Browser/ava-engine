@@ -27,12 +27,13 @@ use super::allocation::{
     allocation_infos, closure_template_snapshots, closure_templates, function_environment_template,
     lexical_environment_templates,
 };
-use super::code::{CapturedBindingAccesses, InlinedFunction, SnapshotExecutable};
+use super::code::{CapturedBindingAccesses, InlinedFunction, SnapshotExecutable, speculated_cache_size};
 use super::runtime_info::RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS;
 use crate::bytecode::executable::{Executable, PropertyLookupCacheEntryData, PropertyLookupCacheTier};
 use crate::bytecode::feedback::{CallFeedback, CallFeedbackForwarding, call_feedback_flags};
 use crate::bytecode::instruction::instruction_length_from_bytes;
 use crate::gc::class::Extends;
+use crate::gc::defer_gc::{DeferGc, Deferred};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::environment::DeclarativeEnvironment;
@@ -41,9 +42,7 @@ use crate::layout::function_object::{
     DirectGetterFunction, EcmascriptFunctionObject, FunctionObject, RawNativeFunction,
 };
 use crate::layout::object::{Object, TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID, TypedArrayBase};
-use crate::layout::property_lookup_cache::{
-    GlobalVariableCache, PropertyLookupCache, PropertyLookupCacheEntry, PropertyLookupCacheEntryType,
-};
+use crate::layout::property_lookup_cache::{GlobalVariableCache, PropertyLookupCache, PropertyLookupCacheEntryType};
 use crate::layout::value::Value;
 use crate::layout_forward::RawNativeFunctionPointer;
 use crate::runtime::array_constructor::ArrayConstructor;
@@ -79,10 +78,10 @@ const MAX_INLINED_CONSTRUCT_INSTRUCTION_COUNT: u32 = 50;
 
 /// A snapshot with the cells it refers to, which must stay alive (and in place) until the job's code is installed or
 /// the job is abandoned.
-pub struct CapturedSnapshot {
+pub struct CapturedSnapshot<'d> {
     pub snapshot: Box<Snapshot>,
-    pub cells: Vec<Gc<CellHeader>>,
-    pub snapshot_executables: Vec<SnapshotExecutable>,
+    pub cells: Deferred<'d, Vec<Gc<CellHeader>>>,
+    pub snapshot_executables: Deferred<'d, Vec<SnapshotExecutable>>,
 }
 
 /// An executable of the snapshot.
@@ -97,6 +96,7 @@ struct Entry {
 
 struct SnapshotBuilder<'vm> {
     vm: &'vm Vm,
+    _defer_gc: &'vm DeferGc<'vm>,
     cells: Vec<Gc<CellHeader>>,
     entries: Vec<Entry>,
     indices: HashMap<InlinedFunction, u32>,
@@ -181,11 +181,12 @@ fn intrinsic_of(vm: &Vm, cell: Option<Gc<CellHeader>>) -> Option<Intrinsic> {
 }
 
 /// The intrinsics the compiler knows by their native functions (of any realm).
-static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 23] = [
+static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 24] = [
     (&function_prototype::APPLY_FUNCTION, Intrinsic::FunctionPrototypeApply),
     (&function_prototype::CALL_FUNCTION, Intrinsic::FunctionPrototypeCall),
     (&array_prototype::PUSH_FUNCTION, Intrinsic::ArrayPrototypePush),
     (&array_prototype::SLICE_FUNCTION, Intrinsic::ArrayPrototypeSlice),
+    (&array_prototype::SPLICE_FUNCTION, Intrinsic::ArrayPrototypeSplice),
     (
         &object_prototype::HAS_OWN_PROPERTY_FUNCTION,
         Intrinsic::ObjectPrototypeHasOwnProperty,
@@ -256,6 +257,30 @@ fn prototype_property_object(entry: &PropertyLookupCacheEntryData) -> Option<Gc<
     value.is_object().then(|| value.as_object())
 }
 
+/// Whether the own property an entry reads or writes is writable in the shape of the object, which makes it a data
+/// property for as long as the object keeps the shape (see `Object::storage_set()`). Loads of the properties of
+/// prototypes always check, as they are guarded by no check of the object they load from.
+fn property_holds_data(entry: &PropertyLookupCacheEntryData) -> bool {
+    if !matches!(
+        entry.entry_type,
+        PropertyLookupCacheEntryType::GetOwnProperty | PropertyLookupCacheEntryType::ChangeOwnProperty
+    ) {
+        return false;
+    }
+    let Some(shape) = entry.shape else {
+        return false;
+    };
+    let mut writable = false;
+    shape.for_each_property_in_insertion_order(|_, metadata| {
+        if metadata.offset != entry.property_offset {
+            return core::ops::ControlFlow::Continue(());
+        }
+        writable = metadata.attributes.is_writable();
+        core::ops::ControlFlow::Break(())
+    });
+    writable
+}
+
 /// The value the prototype of a GetPropertyInPrototypeChain or ChangePropertyInPrototypeChain entry holds in the
 /// property, if the entry still applies.
 fn prototype_property_value(entry: &PropertyLookupCacheEntryData) -> Option<Value> {
@@ -278,13 +303,12 @@ fn prototype_property_value(entry: &PropertyLookupCacheEntryData) -> Option<Valu
 
 /// The function of the accessor an entry calls: for a GetPropertyInPrototypeChain
 /// entry, the getter of the accessor its prototype holds in the property, for a ChangePropertyInPrototypeChain entry
-/// its setter, and for a GetOwnProperty entry the getter of the accessor the interpreter last called the getter of.
-fn entry_accessor_function(slot: &PropertyLookupCacheEntry) -> Option<Gc<FunctionObject>> {
-    let entry = slot.get();
+/// its setter, and for a GetOwnProperty entry the getter the interpreter last called.
+fn entry_accessor_function(entry: &PropertyLookupCacheEntryData) -> Option<Gc<FunctionObject>> {
     let (accessor, setter) = match entry.entry_type {
-        PropertyLookupCacheEntryType::GetOwnProperty if entry.key == 0 => (slot.accessor.get()?, false),
+        PropertyLookupCacheEntryType::GetOwnProperty if entry.key == 0 => return entry.getter,
         entry_type => {
-            let value = prototype_property_value(&entry)?;
+            let value = prototype_property_value(entry)?;
             if !value.is_accessor() {
                 return None;
             }
@@ -299,11 +323,10 @@ fn entry_accessor_function(slot: &PropertyLookupCacheEntry) -> Option<Gc<Functio
 
 /// Whether the property of an entry held an accessor: the accessor the interpreter last called the getter of for a
 /// GetOwnProperty entry, or the value its prototype holds in the property for entries of a prototype.
-fn entry_holds_accessor(slot: &PropertyLookupCacheEntry) -> bool {
-    let entry = slot.get();
+fn entry_holds_accessor(entry: &PropertyLookupCacheEntryData) -> bool {
     match entry.entry_type {
-        PropertyLookupCacheEntryType::GetOwnProperty if entry.key == 0 => slot.accessor.get().is_some(),
-        _ => prototype_property_value(&entry).is_some_and(|value| value.is_accessor()),
+        PropertyLookupCacheEntryType::GetOwnProperty if entry.key == 0 => entry.getter.is_some(),
+        _ => prototype_property_value(entry).is_some_and(|value| value.is_accessor()),
     }
 }
 
@@ -434,7 +457,7 @@ impl SnapshotBuilder<'_> {
                 .and_then(|value| value.as_accessor().cached_value_key())
                 .and_then(|key| entry.shape?.lookup(&PropertyKey::from_symbol(key)))
                 .map(|metadata| metadata.offset);
-            let accessor_function = entry_accessor_function(slot).map(|function| {
+            let accessor_function = entry_accessor_function(&entry).map(|function| {
                 let cell = self.cell(function);
                 AccessorFunctionSnapshot {
                     cached_value_offset,
@@ -444,7 +467,7 @@ impl SnapshotBuilder<'_> {
                         Some(Value::from_object(function.upcast::<Object>()).as_cell()),
                         caller,
                     ),
-                    native: self.native_accessor_target(function, cell, entry.direct_getter_validated),
+                    native: self.native_accessor_target(function, cell, entry.getter == Some(function)),
                 }
             });
             entries.push(PropertyCacheEntrySnapshot {
@@ -461,7 +484,7 @@ impl SnapshotBuilder<'_> {
                 prototype_chain_valid: entry
                     .prototype_chain_validity
                     .is_some_and(|validity| validity.is_valid()),
-                key: (entry.key != 0).then(|| self.cell(Value(entry.key).as_cell())),
+                key: (entry.key != 0).then(|| self.cell(Value::from_bits(entry.key).as_cell())),
                 key_value: entry.key,
                 prototype_property: self.optional_cell(prototype_property),
                 prototype_property_intrinsic: intrinsic_of(
@@ -471,8 +494,23 @@ impl SnapshotBuilder<'_> {
                 prototype_property_inline_executable: prototype_property.and_then(|object| {
                     self.inline_executable_index(Some(Value::from_object(object).as_cell()), caller)
                 }),
+                prototype_property_direct_call: prototype_property
+                    .and_then(|object| self.prototype_method_direct_call(object)),
+                // NB: Watching a slot allocates, which collects no garbage while the snapshot is taken. Slots
+                //     replaced while watched are checked instead, as invalidated code learns nothing, while the
+                //     check learns from its exit.
+                prototype_property_watchpoint: prototype_property
+                    .and(entry.prototype)
+                    .filter(|holder| !holder.shape().was_slot_replaced(entry.property_offset))
+                    .and_then(|holder| {
+                        holder
+                            .shape()
+                            .watch_slot_for_replacements(self.vm, entry.property_offset)
+                    })
+                    .map(|set| self.cell(set)),
                 accessor_function,
-                holds_accessor: entry_holds_accessor(slot),
+                property_holds_data: property_holds_data(&entry),
+                holds_accessor: entry_holds_accessor(&entry),
             });
         }
         if sees_primitives {
@@ -822,6 +860,42 @@ impl SnapshotBuilder<'_> {
         Some(Some(index))
     }
 
+    fn direct_call_target_snapshot(
+        &mut self,
+        function: Gc<EcmascriptFunctionObject>,
+        environment: Option<u32>,
+        closures: bool,
+    ) -> DirectCallTarget {
+        let executable = function.inline_call_executable();
+        let entry = self
+            .vm
+            .jit
+            .entry_table
+            .as_ref()
+            .expect("the VM has a JIT entry table while the JIT is on")
+            .entry_address(executable.head.jit_entry_slot.get());
+        DirectCallTarget {
+            function: self.inlined_function(function),
+            executable: self.cell(executable),
+            entry,
+            registers_and_locals_count: executable.registers_and_locals_count(),
+            registers_and_locals_and_constants_count: executable.head.registers_and_locals_and_constants_count.get(),
+            function_fields: function_frame_fields(function),
+            environment,
+            closures,
+        }
+    }
+
+    /// The target through which JIT code may call `object`, a method a prototype held, directly, if it can and its
+    /// calls need no function environment (whose template would belong to the executable of the call).
+    fn prototype_method_direct_call(&mut self, object: Gc<Object>) -> Option<DirectCallTarget> {
+        let function = as_ecmascript_function_object(object)?;
+        if !function.can_inline_call() || function.function_environment_needed() {
+            return None;
+        }
+        Some(self.direct_call_target_snapshot(function, None, false))
+    }
+
     fn call_feedback(&mut self, call: &CallFeedback, entry: &Entry) -> CallFeedbackSnapshot {
         let target = call.target();
         let flags = call.flags.get();
@@ -850,28 +924,7 @@ impl SnapshotBuilder<'_> {
             && let Some(environment) = self.direct_call_environment(function)
             && !(closures && environment.is_some())
         {
-            let executable = function.inline_call_executable();
-            let function_fields = function_frame_fields(function);
-            let entry = self
-                .vm
-                .jit
-                .entry_table
-                .as_ref()
-                .expect("the VM has a JIT entry table while the JIT is on")
-                .entry_address(executable.head.jit_entry_slot.get());
-            snapshot.direct_call = Some(DirectCallTarget {
-                function: self.inlined_function(function),
-                executable: self.cell(executable),
-                entry,
-                registers_and_locals_count: executable.registers_and_locals_count(),
-                registers_and_locals_and_constants_count: executable
-                    .head
-                    .registers_and_locals_and_constants_count
-                    .get(),
-                function_fields,
-                environment,
-                closures,
-            });
+            snapshot.direct_call = Some(self.direct_call_target_snapshot(function, environment, closures));
         } else if let Some(function) = native_call_target(self.vm, call) {
             let entry = function
                 .native_function(self.vm)
@@ -998,7 +1051,7 @@ impl SnapshotBuilder<'_> {
                     handler_offset: handler.handler_offset,
                 })
                 .collect(),
-            exit_sites: executable.jit_exit_sites(),
+            exit_sites: executable.jit_exit_sites_for_recompile(),
             builtin_exit_sites: if entry.function.is_none() {
                 executable
                     .jit_builtin_exit_sites()
@@ -1203,13 +1256,14 @@ fn captured_binding_accesses(executable: &Executable) -> CapturedBindingAccesses
 /// Captures the snapshot of a compile job for `executable`, whose frames run `function` in `realm`, or the top-level
 /// code of a script or of a module without one, in the running frame. `osr_pc` is the loop back edge whose tier-up
 /// budget ran out, if a loop triggered the compile.
-pub fn capture_snapshot(
+pub fn capture_snapshot<'d>(
     vm: &Vm,
     executable: Gc<Executable>,
     function: Option<Gc<EcmascriptFunctionObject>>,
     realm: Gc<Realm>,
     osr_pc: Option<u32>,
-) -> CapturedSnapshot {
+    defer_gc: &'d DeferGc<'_>,
+) -> CapturedSnapshot<'d> {
     let compiled_function_fields = match function {
         Some(function) => function_frame_fields(function),
         None => FunctionFrameFields {
@@ -1218,11 +1272,11 @@ pub fn capture_snapshot(
         },
     };
     // NB: These allocate (and so may collect garbage), which they do before anything is captured.
-    let allocation = allocation_infos(vm, realm);
+    let allocation = allocation_infos(vm, realm, defer_gc);
     // NB: Closures that top-level code creates have its environments, which the code does not know.
     let closure_templates = match function {
-        Some(function) => closure_templates(vm, executable, function),
-        None => (0..executable.shared_function_data_count()).map(|_| None).collect(),
+        Some(function) => closure_templates(vm, executable, function, defer_gc),
+        None => defer_gc.cover((0..executable.shared_function_data_count()).map(|_| None).collect()),
     };
     let closure_samples = closure_templates
         .iter()
@@ -1230,7 +1284,8 @@ pub fn capture_snapshot(
         .collect::<Vec<_>>();
     let mut builder = SnapshotBuilder {
         vm,
-        cells: allocation.cells.clone(),
+        _defer_gc: defer_gc,
+        cells: (*allocation.cells).clone(),
         entries: vec![Entry {
             executable,
             function: None,
@@ -1246,7 +1301,8 @@ pub fn capture_snapshot(
         lexical_environment_templates: Vec::new(),
         construct_this_shapes: HashMap::new(),
     };
-    builder.closure_templates = closure_template_snapshots(closure_templates, |sample| builder.cell(sample));
+    builder.closure_templates =
+        closure_template_snapshots(closure_templates.into_inner(), |sample| builder.cell(sample), defer_gc);
     builder.lexical_environment_templates =
         lexical_environment_templates(vm, executable, realm, |cell| builder.cell(cell));
     // NB: executable_snapshot() appends the inlining candidates it finds.
@@ -1275,7 +1331,7 @@ pub fn capture_snapshot(
         executables.push(builder.executable_snapshot(&entry));
         index += 1;
     }
-    let mut runtime = super::runtime_info::runtime_info(vm, realm, allocation);
+    let mut runtime = super::runtime_info::runtime_info(vm, realm, allocation, defer_gc);
     // NB: Code that embeds the prototypes of the runtime info lists them as embedded cells.
     builder.cell(realm.array_prototype());
     builder.cell(realm.object_prototype());
@@ -1319,16 +1375,24 @@ pub fn capture_snapshot(
     };
     CapturedSnapshot {
         snapshot: Box::new(snapshot),
-        cells: builder.cells,
-        snapshot_executables: builder
-            .entries
-            .iter()
-            .map(|entry| SnapshotExecutable {
-                executable: entry.executable,
-                function: entry.function,
-                known_exit_sites: entry.executable.jit_exit_site_count(),
-                known_builtin_exit_sites: entry.executable.jit_builtin_exit_site_count(),
-            })
-            .collect(),
+        cells: defer_gc.cover(builder.cells),
+        snapshot_executables: defer_gc.cover(
+            builder
+                .entries
+                .iter()
+                .map(|entry| SnapshotExecutable {
+                    executable: entry.executable,
+                    function: entry.function,
+                    known_exit_sites: entry.executable.jit_exit_site_count(),
+                    known_builtin_exit_sites: entry.executable.jit_builtin_exit_site_count(),
+                    property_cache_sizes: entry
+                        .executable
+                        .property_lookup_caches()
+                        .iter()
+                        .map(speculated_cache_size)
+                        .collect(),
+                })
+                .collect(),
+        ),
     }
 }

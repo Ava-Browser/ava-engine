@@ -109,6 +109,7 @@ pub mod order;
 mod ordering;
 mod partial_view;
 mod planning;
+pub(crate) mod position_try;
 mod prefix;
 pub mod program;
 mod program_updates;
@@ -919,6 +920,9 @@ pub struct RetainedState {
     /// The `@keyframes` each of the document's style scopes defines, as the host's rule caches
     /// resolved them, which an animation definition's keyframes are resolved from.
     animation_keyframes: crate::fork::ForkShared<animations::AnimationKeyframes>,
+    /// The `@position-try` rules each of the document's style scopes defines, as the host's rule caches resolved
+    /// them, which the position options of an absolutely positioned box are made from.
+    position_try_rules: crate::fork::ForkShared<position_try::PositionTryRules>,
     /// The animation effects the host holds for each element, described for sampling.
     animation_effect_descriptions: crate::fork::ForkShared<effect_descriptions::AnimationEffectDescriptions>,
     /// The font metrics of the record the host holds for the document element, which a `rem` the
@@ -963,6 +967,10 @@ pub struct RetainedState {
     /// Beside them, each published host's matches for the element-backed pseudo-elements, which
     /// the elements backing them cascade from while the host's answer is not installed.
     batch_backing_pseudo_matches: HashMap<StyleNodeID, Vec<RuleMatch>>,
+    /// The same matches of each shadow host, as its last published answer held them under the program version beside
+    /// them. A host's answer is never retained, and the elements backing its pseudo-elements are styled in the
+    /// transactions after the host's, which cascade from these rather than matching the host again.
+    shadow_host_backing_pseudo_matches: HashMap<StyleNodeID, (ProgramVersion, Vec<RuleMatch>)>,
     engine_cold_record_cache: crate::fork::ForkShared<HashMap<publication::ColdRecordKey, publication::ColdRecord>>,
     engine_cold_record_donors:
         crate::fork::ForkShared<HashMap<publication::ColdRecordDonorKey, Vec<publication::ColdRecordDonor>>>,
@@ -1023,6 +1031,9 @@ pub struct RetainedState {
     relational_arrival_keys_version: u64,
     selector_programs_need_sweep: bool,
     routing: Arc<RoutingRegistry>,
+    /// The rules of a user-agent sheet being published, in the order they are routed, which are routed together as the
+    /// publication ends; see `route_user_agent_rules`.
+    deferred_user_agent_routes: Option<Vec<(RuleID, SelectorProgramID)>>,
     /// Exact selector changes and refresh requests emitted by the current transaction.
     selector_truth_changes: SelectorTruthChanges,
     already_planned_selector_truth: DeltaBatch<AlreadyPlannedSelectorTruthCandidate>,

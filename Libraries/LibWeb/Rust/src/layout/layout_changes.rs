@@ -8,6 +8,7 @@
 //! a node by its slot or its identity and queues the change on the document's host; it does not reach the arena.
 
 use super::LayoutNodeArena;
+use super::math_formatting_context::FfiMathAttributeFacts;
 use super::node_data::{NodeFlag, NodeSlotId};
 use super::svg_formatting_context::{FfiFloatPoint, FfiSvgAttributeFacts};
 use super::tree_mutation::{HostCalls, HostWorkDue, OwedHostWork};
@@ -28,11 +29,6 @@ pub(crate) enum LayoutChange {
     },
     /// The whole layout tree is built again.
     SetNeedsFullLayoutTreeUpdate,
-    /// What the node's content is sized from changed: its fragment caches and intrinsic sizes, and those of its
-    /// ancestors, are stale.
-    ResetCachedIntrinsicSizesOfSelfAndAncestors {
-        node: NodeSlotId,
-    },
     /// The box takes `marks`.
     MarkBox {
         target: super::tree_update_marks::MarkedBox,
@@ -45,6 +41,8 @@ pub(crate) enum LayoutChange {
         mark: super::tree_update_marks::FfiLayoutTreeUpdateMark,
     },
     RecordPartialRelayoutEscape,
+    /// https://drafts.csswg.org/css-anchor-position-1/#record-the-last-successful-position-option
+    RecordLastSuccessfulPositionOptions,
     /// The DOM node identified by `old` took `new`. Its rows, and those of the pseudo-elements `generated_for` lists,
     /// take the new identity along with their bindings, and the old one leaves every row carrying it. The host clears the
     /// layout tree update marks the new one's previous holder left as it queues the change.
@@ -65,6 +63,8 @@ pub(crate) enum LayoutChange {
         element: StyleNodeID,
         offset: CssPixelPoint,
     },
+    /// The writing suggestion showing after the caret, or none.
+    SetWritingSuggestion(Option<super::layout_node_arena::PublishedWritingSuggestion>),
     /// What the pseudo-element of kind `generated_for` on `generator` has scrolled to.
     SetPseudoElementScrollOffset {
         generator: StyleNodeID,
@@ -81,6 +81,11 @@ pub(crate) enum LayoutChange {
         element: StyleNodeID,
         facts: Box<FfiSvgAttributeFacts>,
         points: Box<[FfiFloatPoint]>,
+    },
+    /// The parsed MathML attributes a MathML element published, which its layout reads.
+    MathAttributeFacts {
+        element: StyleNodeID,
+        facts: Box<FfiMathAttributeFacts>,
     },
     /// The resources an SVG graphics element's style names: its mask, clip path, fill and stroke.
     SvgStyleReferences {
@@ -117,7 +122,8 @@ pub(crate) enum LayoutChange {
         kind: super::node_data::CompositorAnimationFrameKind,
         value: bool,
     },
-    /// The row takes the style record `record`, whose payloads `payloads` holds.
+    /// The row takes the style record `record`, whose payloads `payloads` holds. Where the move changes what layout reads
+    /// of the row's style, the sizes the row and its ancestors cached are measured again.
     SetNodeStyle {
         node: NodeSlotId,
         record: u64,
@@ -158,21 +164,22 @@ impl LayoutChange {
     pub(crate) fn row_write(&self) -> crate::render_state::RowWrite {
         use crate::render_state::RowWrite;
         match self {
-            Self::InvalidateSearchableText => RowWrite::None,
+            Self::InvalidateSearchableText | Self::RecordLastSuccessfulPositionOptions => RowWrite::None,
             Self::StyleNodeChanged { .. } => RowWrite::Identities,
             Self::SetNodeFlag { flag, .. } if *flag as u32 & NodeFlag::IDENTITY != 0 => RowWrite::Identities,
             Self::SetNodeStyle { .. } => RowWrite::NamedStyles,
             Self::SetNeedsLayoutUpdate { .. }
             | Self::SetNeedsFullLayoutTreeUpdate
-            | Self::ResetCachedIntrinsicSizesOfSelfAndAncestors { .. }
             | Self::MarkBox { .. }
             | Self::ApplyLayoutTreeUpdateMark { .. }
             | Self::RecordPartialRelayoutEscape
             | Self::SetAnchorNameElements { .. }
             | Self::SetElementScrollOffset { .. }
+            | Self::SetWritingSuggestion(_)
             | Self::SetPseudoElementScrollOffset { .. }
             | Self::SetIdentityInFocusedTextControl { .. }
             | Self::SvgAttributeFacts { .. }
+            | Self::MathAttributeFacts { .. }
             | Self::SvgStyleReferences { .. }
             | Self::SetDocumentIsDecodedSvg(_)
             | Self::SetNodeFlag { .. }
@@ -198,6 +205,7 @@ impl LayoutChange {
             Self::MarkBox { marks, .. } => marks.may_lay_out(),
             Self::SetIdentityInFocusedTextControl { .. }
             | Self::InvalidateSearchableText
+            | Self::RecordLastSuccessfulPositionOptions
             | Self::PinBoundBoxStyleRecordForDetachment { .. }
             | Self::PinNodeStyleRecordForHost { .. }
             | Self::ReleaseNodeStyleRecordPinForHost { .. }
@@ -229,15 +237,10 @@ impl LayoutChange {
                 }
             }
             Self::SetNeedsFullLayoutTreeUpdate => arena.set_needs_full_layout_tree_update(true),
-            Self::ResetCachedIntrinsicSizesOfSelfAndAncestors { node } => {
-                if arena.slot_is_live(node) {
-                    arena.bump_fragment_cache_epoch_of_self_and_ancestors(node);
-                    arena.reset_cached_intrinsic_sizes_of_self_and_ancestors(node);
-                }
-            }
             Self::MarkBox { target, marks } => marks.apply(arena, target),
             Self::ApplyLayoutTreeUpdateMark { node, mark } => arena.apply_layout_tree_update_mark(node, mark),
             Self::RecordPartialRelayoutEscape => arena.record_partial_relayout_escape(),
+            Self::RecordLastSuccessfulPositionOptions => arena.record_last_successful_position_options(),
             Self::StyleNodeChanged {
                 old,
                 new,
@@ -259,6 +262,7 @@ impl LayoutChange {
                 elements,
             } => arena.set_anchor_name_elements(scope_host, anchor_name, elements.iter().copied()),
             Self::SetElementScrollOffset { element, offset } => arena.set_element_scroll_offset(element, offset),
+            Self::SetWritingSuggestion(suggestion) => arena.set_writing_suggestion(suggestion),
             Self::SetPseudoElementScrollOffset {
                 generator,
                 generated_for,
@@ -270,6 +274,7 @@ impl LayoutChange {
             Self::SvgAttributeFacts { element, facts, points } => {
                 arena.set_style_node_svg_attribute_facts(element, *facts, &points);
             }
+            Self::MathAttributeFacts { element, facts } => arena.set_style_node_math_attribute_facts(element, *facts),
             Self::SvgStyleReferences { element, references } => {
                 arena.set_style_node_svg_style_references(element, references);
             }
@@ -295,11 +300,20 @@ impl LayoutChange {
                 arena.set_node_needs_compositor_animation_frame(node, kind, value);
             }
             Self::SetNodeStyle { node, record, payloads } => {
+                // A style the arena derived is replaced only to be derived again, which decides the relayout itself.
+                let previous_payloads = (arena.slot_is_live(node) && !arena.node_style_record_is_derived(node))
+                    .then(|| arena.data(node).style.get());
                 if arena.set_node_style(node, record, payloads) {
                     arena.refresh_style_flags(node);
                 }
                 arena.publish_new_size_container_geometry(node);
                 arena.enroll_node_for_svg_paint_resources_sync(node);
+                if previous_payloads
+                    .is_some_and(|previous| !arena.style_move_keeps_layout_inputs(node, previous, payloads))
+                {
+                    arena.bump_fragment_cache_epoch_of_self_and_ancestors(node);
+                    arena.reset_cached_intrinsic_sizes_of_self_and_ancestors(node);
+                }
             }
             Self::PinBoundBoxStyleRecordForDetachment {
                 style_node,
@@ -457,21 +471,12 @@ pub extern "C" fn render_state_set_needs_layout_update(
 /// Detaches what is left of the boxes of the `count` nodes `style_nodes` names as they leave the document (see
 /// [`super::tree_builder::detach_remaining_rows_for_removal`]), as a write queued for the render state: the host pays what it owes
 /// once the job that applies it is done. An identity of 0 names no node.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread, and `style_nodes` must point at `count` identities.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_detach_remaining_rows_for_removal(
-    host: &DocumentHost,
-    style_nodes: *const u32,
-    count: usize,
-) {
-    if count == 0 {
+pub extern "C" fn render_state_detach_remaining_rows_for_removal(host: &DocumentHost, style_nodes: ak::Span<'_, u32>) {
+    let style_nodes = style_nodes.as_slice();
+    if style_nodes.is_empty() {
         return;
     }
-    // SAFETY: Guaranteed by the caller.
-    let style_nodes = unsafe { ak::slice_from_raw_parts(style_nodes, count) };
     host.queue_change(ArenaChange::DetachForRemoval(style_nodes.into()));
 }
 
@@ -481,36 +486,31 @@ pub extern "C" fn render_state_set_needs_full_layout_tree_update(host: &Document
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn render_state_reset_cached_intrinsic_sizes_of_self_and_ancestors(
-    host: &DocumentHost,
-    node: NodeSlotId,
-) {
-    queue(host, LayoutChange::ResetCachedIntrinsicSizesOfSelfAndAncestors { node });
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn render_state_record_partial_relayout_escape(host: &DocumentHost) {
     queue(host, LayoutChange::RecordPartialRelayoutEscape);
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread, and `generated_for` must point at `count` readable
-/// pseudo-element kinds.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_style_node_changed(
+pub extern "C" fn render_state_record_last_successful_position_options(host: &DocumentHost) {
+    // NB: A document that laid out no box with position options records nothing, which the host knows right after the
+    //     round that laid it out.
+    if host
+        .known_arena_facts()
+        .is_some_and(|facts| !facts.may_have_position_options)
+    {
+        return;
+    }
+    queue(host, LayoutChange::RecordLastSuccessfulPositionOptions);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_style_node_changed(
     host: &DocumentHost,
     old: u32,
     new: u32,
-    generated_for: *const u8,
-    count: usize,
+    generated_for: ak::Span<'_, u8>,
 ) {
-    let generated_for = if count == 0 {
-        SmallVec::new()
-    } else {
-        // SAFETY: Guaranteed by the caller.
-        SmallVec::from_slice(unsafe { ak::slice_from_raw_parts(generated_for, count) })
-    };
+    let generated_for = SmallVec::from_slice(generated_for.as_slice());
     let new = StyleNodeID::from_raw(new);
     let change = LayoutChange::StyleNodeChanged {
         old: StyleNodeID::from_raw(old),
@@ -523,28 +523,22 @@ pub unsafe extern "C" fn render_state_style_node_changed(
     }
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread, and `elements` must point at `count` readable
-/// element identities.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_anchor_name_elements(
+pub extern "C" fn render_state_set_anchor_name_elements(
     host: &DocumentHost,
     scope_host: u32,
     anchor_name: usize,
-    elements: *const u32,
-    count: usize,
+    elements: ak::Span<'_, u32>,
 ) {
-    let elements: &[u32] = if count == 0 {
-        &[]
-    } else {
-        // SAFETY: Guaranteed by the caller.
-        unsafe { ak::slice_from_raw_parts(elements, count) }
-    };
     let change = LayoutChange::SetAnchorNameElements {
         scope_host: StyleNodeID::from_raw(scope_host),
         anchor_name,
-        elements: elements.iter().copied().filter_map(StyleNodeID::from_raw).collect(),
+        elements: elements
+            .as_slice()
+            .iter()
+            .copied()
+            .filter_map(StyleNodeID::from_raw)
+            .collect(),
     };
     queue(host, change);
 }
@@ -556,6 +550,37 @@ pub extern "C" fn render_state_set_element_scroll_offset(host: &DocumentHost, el
     };
     let offset = offset.into();
     queue(host, LayoutChange::SetElementScrollOffset { element, offset });
+}
+
+/// Publishes the writing suggestion showing after the caret: `remainder` is what it would add at `offset` in the text
+/// node `text`. A zero `text` publishes that none shows.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on the document's thread, and `remainder` must point at `length` readable code
+/// units.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_set_writing_suggestion(
+    host: &DocumentHost,
+    text: u32,
+    offset: usize,
+    remainder: *const u16,
+    length: usize,
+) {
+    let suggestion = StyleNodeID::from_raw(text).map(|text| {
+        let remainder: &[u16] = if length == 0 {
+            &[]
+        } else {
+            // SAFETY: Guaranteed by the caller.
+            unsafe { ak::slice_from_raw_parts(remainder, length) }
+        };
+        super::layout_node_arena::PublishedWritingSuggestion {
+            text,
+            offset,
+            remainder: remainder.to_vec(),
+        }
+    });
+    queue(host, LayoutChange::SetWritingSuggestion(suggestion));
 }
 
 #[unsafe(no_mangle)]
@@ -586,31 +611,20 @@ pub extern "C" fn render_state_set_identity_in_focused_text_control(host: &Docum
 
 /// Publishes what the SVG element `element` names parses to. A `<polyline>` or `<polygon>` passes its `points` list
 /// beside the facts, since it is the one geometry attribute that is not a fixed number of values.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on the document's thread, and `points` must point at `count` readable points.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_set_svg_attribute_facts(
+pub extern "C" fn render_state_set_svg_attribute_facts(
     host: &DocumentHost,
     element: u32,
     facts: FfiSvgAttributeFacts,
-    points: *const FfiFloatPoint,
-    count: usize,
+    points: ak::Span<'_, FfiFloatPoint>,
 ) {
     let Some(element) = StyleNodeID::from_raw(element) else {
         return;
     };
-    let points = if count == 0 {
-        &[][..]
-    } else {
-        // SAFETY: Guaranteed by the caller.
-        unsafe { ak::slice_from_raw_parts(points, count) }
-    };
     let change = LayoutChange::SvgAttributeFacts {
         element,
         facts: Box::new(facts),
-        points: points.into(),
+        points: points.as_slice().into(),
     };
     queue(host, change);
 }
@@ -635,6 +649,25 @@ pub extern "C" fn render_state_set_svg_style_references(
         references: [mask, clip_path, fill, stroke],
     };
     queue(host, change);
+}
+
+/// Publishes the MathML attributes an element parsed, which the layout of its box reads.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_set_math_attribute_facts(
+    host: &DocumentHost,
+    element: u32,
+    facts: FfiMathAttributeFacts,
+) {
+    let Some(element) = StyleNodeID::from_raw(element) else {
+        return;
+    };
+    queue(
+        host,
+        LayoutChange::MathAttributeFacts {
+            element,
+            facts: Box::new(facts),
+        },
+    );
 }
 
 #[unsafe(no_mangle)]

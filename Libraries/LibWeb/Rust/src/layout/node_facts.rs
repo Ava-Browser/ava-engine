@@ -443,6 +443,7 @@ pub(crate) fn node_creates_block_formatting_context(
     data: &NodeData,
     style: Option<ComputedValuesView<'_>>,
     parent_is_flex_or_grid_container: bool,
+    parent_writing_mode: impl FnOnce() -> Option<u8>,
 ) -> bool {
     if kind_is_replaced_box(data.kind.get()) {
         return false;
@@ -457,6 +458,16 @@ pub(crate) fn node_creates_block_formatting_context(
         }
         if (style.is_floating() && !has_flag(data, NodeFlag::IsFlexItem))
             || style.own_style_establishes_block_formatting_context()
+        {
+            return true;
+        }
+        // https://drafts.csswg.org/css-writing-modes-4/#block-flow
+        // If a box has a different 'writing-mode' value than its parent box (i.e. nearest ancestor without
+        // 'display: contents'):
+        // - If the box is a block container, then it establishes an independent block formatting context.
+        if display.is_flow_inside()
+            && !display.is_inline_outside()
+            && parent_writing_mode().is_some_and(|writing_mode| writing_mode != style.writing_mode())
         {
             return true;
         }
@@ -476,6 +487,11 @@ pub(crate) fn node_creates_block_formatting_context(
             && display.is_block_outside()
             && display.is_flow_inside()
         {
+            return true;
+        }
+        // NB: MathML layout lays out each of its in-flow children as an atomic box, so a block container among them,
+        //     like an anonymous wrapper around text, establishes an independent formatting context.
+        if has_ancestor_fact(data, AncestorFact::ParentUsesMathLayout) && display.is_block_outside() {
             return true;
         }
     }
@@ -747,7 +763,7 @@ impl<'pass> NodeFacts<'pass> {
     #[inline]
     pub(crate) fn new(callbacks: &LayoutPass<'pass>, node: Node) -> Self {
         let data = callbacks.node_data(node);
-        let style_payloads = callbacks.arena().style_payloads(node);
+        let style_payloads = callbacks.style_payloads_if_styled(node);
         Self {
             callbacks: *callbacks,
             node,
@@ -780,6 +796,13 @@ impl<'pass> NodeFacts<'pass> {
         self.style_payloads
     }
 
+    /// The writing mode of the box's parent box, which it lays out its contents in if it has another one.
+    pub(crate) fn parent_writing_mode(&self) -> Option<u8> {
+        self.parent_data()
+            .and_then(node_style_view)
+            .map(|style| style.writing_mode())
+    }
+
     fn parent_data(&self) -> Option<&'pass NodeData> {
         let parent = self.data().parent.get();
         (!parent.is_invalid()).then(|| self.callbacks.node_data(parent))
@@ -791,6 +814,7 @@ impl<'pass> NodeFacts<'pass> {
                 .expect("styled node must publish its style container before layout"),
         )
         .for_kind(self.data().kind.get())
+        .in_frame(self.callbacks.frame)
     }
 
     pub(super) fn computed_values_view_if_styled(&self) -> Option<ComputedValuesView<'pass>> {
@@ -807,7 +831,28 @@ impl<'pass> NodeFacts<'pass> {
     }
 
     #[inline]
+    /// The natural and default sizes of the box's replaced content, as width and height in the frame of the pass.
     fn replaced_content(&self) -> crate::layout::FfiReplacedContentFacts {
+        let facts = self.physical_replaced_content();
+        if !self.callbacks.frame.is_transposed() {
+            return facts;
+        }
+        crate::layout::FfiReplacedContentFacts {
+            has_auto_content_width: facts.has_auto_content_height,
+            auto_content_width: facts.auto_content_height,
+            has_auto_content_height: facts.has_auto_content_width,
+            auto_content_height: facts.auto_content_width,
+            auto_content_aspect_ratio_numerator: facts.auto_content_aspect_ratio_denominator,
+            auto_content_aspect_ratio_denominator: facts.auto_content_aspect_ratio_numerator,
+            has_default_preferred_width: facts.has_default_preferred_height,
+            default_preferred_width: facts.default_preferred_height,
+            has_default_preferred_height: facts.has_default_preferred_width,
+            default_preferred_height: facts.default_preferred_width,
+            text_entry_content_is_ordinary_box: facts.text_entry_content_is_ordinary_box,
+        }
+    }
+
+    fn physical_replaced_content(&self) -> crate::layout::FfiReplacedContentFacts {
         if self.data().kind.get() == NodeKind::SVGSVGBox {
             return self.svg_root_replaced_content();
         }
@@ -844,15 +889,15 @@ impl<'pass> NodeFacts<'pass> {
         // An <object> showing the document is sized from what its <svg> document element would be
         // without size containment.
         if is_document_element_box {
-            arena.note_document_svg_root_natural_size(
-                self.node,
-                NaturalSize {
-                    width: width.map(CssPixels::raw_value),
-                    height: height.map(CssPixels::raw_value),
-                    aspect_ratio: aspect_ratio
-                        .map(|(numerator, denominator)| (numerator.raw_value(), denominator.raw_value())),
-                },
-            );
+            let natural_size = NaturalSize {
+                width: width.map(CssPixels::raw_value),
+                height: height.map(CssPixels::raw_value),
+                aspect_ratio: aspect_ratio
+                    .map(|(numerator, denominator)| (numerator.raw_value(), denominator.raw_value())),
+            };
+            self.callbacks.scratch().note_host_findings(|findings| {
+                findings.document_svg_root_natural_size = Some((self.node, natural_size));
+            });
         }
         if !size_contained {
             set_auto_content_size(
@@ -1073,6 +1118,7 @@ impl<'pass> NodeFacts<'pass> {
             self.data(),
             self.computed_values_view_if_styled(),
             self.parent_is_flex_or_grid_container(),
+            || self.parent_writing_mode(),
         )
     }
 
@@ -1108,8 +1154,19 @@ impl<'pass> NodeFacts<'pass> {
         has_flag(self.data(), NodeFlag::ProducesLineBoxFragmentWhenEmpty)
     }
 
+    /// Whether the node is the text of a text control, such as a textarea's value. Only that text and the text directly
+    /// in an editing host produce a line box fragment when empty, and no editing host is in a user agent shadow tree.
+    pub(crate) fn is_text_control_text(&self) -> bool {
+        has_flag(self.data(), NodeFlag::IsInUserAgentShadowTree) && self.produces_line_box_fragment_when_empty()
+    }
+
     pub(crate) fn uses_button_layout(&self) -> bool {
         has_flag(self.data(), NodeFlag::UsesButtonLayout)
+    }
+
+    /// Whether the box is generated for a MathML element whose tag name selects a MathML layout algorithm.
+    pub(crate) fn uses_math_layout(&self) -> bool {
+        self.callbacks.arena().math_layout_kind(self.node).uses_math_layout()
     }
 
     // https://drafts.csswg.org/css2/#propdef-vertical-align

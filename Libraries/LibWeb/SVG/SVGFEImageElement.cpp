@@ -27,6 +27,15 @@ void SVGFEImageElement::visit_edges(Cell::Visitor& visitor)
     SVGFilterPrimitiveStandardAttributes::visit_edges(visitor);
     SVGURIReferenceMixin::visit_edges(visitor);
     visitor.visit(m_resource_request);
+    visitor.visit(m_preserve_aspect_ratio);
+}
+
+// https://drafts.fxtf.org/filter-effects/#dom-svgfeimageelement-preserveaspectratio
+GC::Ref<SVGAnimatedPreserveAspectRatio> SVGFEImageElement::preserve_aspect_ratio_for_bindings()
+{
+    if (!m_preserve_aspect_ratio)
+        m_preserve_aspect_ratio = SVGAnimatedPreserveAspectRatio::create(*this);
+    return *m_preserve_aspect_ratio;
 }
 
 void SVGFEImageElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
@@ -45,8 +54,27 @@ void SVGFEImageElement::attribute_changed(Utf16FlyString const& name, Optional<U
     }
 }
 
+void SVGFEImageElement::adopted_from(DOM::Document& old_document)
+{
+    Base::adopted_from(old_document);
+
+    // NB: See process_href().
+    if (old_document.is_temporary_document_for_fragment_parsing()) {
+        auto href = get_attribute_ns(Optional<Utf16FlyString> {}, SVG::AttributeNames::href);
+        if (!href.has_value())
+            href = get_attribute_ns(Namespace::XLink, SVG::AttributeNames::href);
+        process_href(href);
+    }
+}
+
 void SVGFEImageElement::process_href(Optional<Utf16String> const& href)
 {
+    // AD-HOC: An element in a temporary document for fragment parsing does not fetch anything, so that markup parsed
+    //         into such a document, for example by the Sanitizer API, causes no network requests for elements that
+    //         are never inserted anywhere. The URL is processed once the element is adopted into another document.
+    if (document().is_temporary_document_for_fragment_parsing())
+        return;
+
     if (!href.has_value()) {
         m_href = {};
         return;
@@ -56,7 +84,7 @@ void SVGFEImageElement::process_href(Optional<Utf16String> const& href)
     if (!m_href.has_value())
         return;
 
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), *m_href);
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), *m_href, HTML::CORSSettingAttribute::NoCORS);
     m_resource_request->add_callbacks(
         [this, resource_request = GC::Root { m_resource_request }] {
             document().note_svg_paint_resources_changed();

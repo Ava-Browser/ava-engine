@@ -754,6 +754,9 @@ pub mod element_construction_fact {
     pub const IS_DOCUMENT_ELEMENT: u32 = 1 << 6;
     pub const IS_SVG_RESOURCE_ELEMENT: u32 = 1 << 7;
     pub const IS_SVG_GEOMETRY_ELEMENT: u32 = 1 << 8;
+    /// The layout algorithm a MathML element's tag name selects, as a `MathLayoutKind` in these bits.
+    pub const MATHML_LAYOUT_KIND_SHIFT: u32 = 16;
+    pub const MATHML_LAYOUT_KIND_MASK: u32 = 0x1f << MATHML_LAYOUT_KIND_SHIFT;
 }
 
 /// Which principal box an element asks for before its computed style has a say. The element's own
@@ -1244,32 +1247,62 @@ unsafe impl Sync for FfiAppliedAnimationDefinition {}
 /// The host publishes a scope whenever its rule cache is built, and keeps a reference to every set
 /// the row names until it replaces or gives the row up. The row is written as the host's other
 /// writes are, ahead of the next job, which is the first that resolves keyframes from it.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread, and each buffer must hold the
-/// count it is given.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_set_tree_scope_animation_keyframes(
+pub extern "C" fn style_engine_set_tree_scope_animation_keyframes(
     host: &DocumentHost,
     tree_scope: u32,
     shadow_root_identity: usize,
-    name_lengths: *const u32,
-    name_units: *const u16,
-    name_unit_count: usize,
-    keyframe_sets: *const usize,
-    count: usize,
+    name_lengths: ak::Span<'_, u32>,
+    name_units: ak::Span<'_, u16>,
+    keyframe_sets: ak::Span<'_, usize>,
 ) {
-    // SAFETY: Guaranteed by the caller.
-    let row = unsafe {
-        super::animations::AnimationKeyframes::row(
-            ak::slice_from_raw_parts(name_lengths, count),
-            ak::slice_from_raw_parts(name_units, name_unit_count),
-            ak::slice_from_raw_parts(keyframe_sets, count),
-        )
-    };
+    assert_eq!(
+        name_lengths.as_slice().len(),
+        keyframe_sets.as_slice().len(),
+        "each keyframes name has a set"
+    );
+    let row = super::animations::AnimationKeyframes::row(
+        name_lengths.as_slice(),
+        name_units.as_slice(),
+        keyframe_sets.as_slice(),
+    );
     let write = super::engine_calls::EngineWrite::AnimationKeyframes {
         tree_scope: TreeScopeID(tree_scope),
         shadow_root_identity,
+        row,
+    };
+    super::engine_calls::queue(host, write);
+}
+
+/// Replaces the `@position-try` row of one style scope: each name the scope defines, packed into one buffer of code
+/// units with a length each, with the declarations of the rule that name resolves to. An empty row gives the scope's
+/// row up.
+///
+/// # Safety
+/// Each declaration pointer must be a live `Arc<DeclarationBlockData>` the call borrows.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_set_tree_scope_position_try_rules(
+    host: &DocumentHost,
+    tree_scope: u32,
+    name_lengths: ak::Span<'_, u32>,
+    name_units: ak::Span<'_, u16>,
+    declarations: ak::Span<'_, *const c_void>,
+) {
+    assert_eq!(
+        name_lengths.as_slice().len(),
+        declarations.as_slice().len(),
+        "each @position-try name has declarations"
+    );
+    // SAFETY: Guaranteed by the caller.
+    let row = unsafe {
+        super::position_try::PositionTryRules::row(
+            name_lengths.as_slice(),
+            name_units.as_slice(),
+            declarations.as_slice(),
+        )
+    };
+    let write = super::engine_calls::EngineWrite::PositionTryRules {
+        tree_scope: TreeScopeID(tree_scope),
         row,
     };
     super::engine_calls::queue(host, write);
@@ -1469,24 +1502,18 @@ pub unsafe extern "C" fn style_engine_set_element_animation_effect_descriptions(
 /// Whether the engine describes one of an element's animation lists as holding exactly these
 /// versions of its effects, in this order, so that the host need not describe them again. Only
 /// the host describes them, so it knows without asking.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread, and `versions` must hold `count`
-/// elements.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_describes_animation_effects(
+pub extern "C" fn style_engine_describes_animation_effects(
     host: &DocumentHost,
     node: u32,
     slot: u8,
-    versions: *const FfiAnimationEffectVersion,
-    count: usize,
+    versions: ak::Span<'_, FfiAnimationEffectVersion>,
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
     StyleNodeID::from_raw(node).is_some_and(|node| {
         host.engine_memo()
             .described
             .borrow()
-            .describe(node, slot, unsafe { ak::slice_from_raw_parts(versions, count) })
+            .describe(node, slot, versions.as_slice())
     })
 }
 
@@ -1757,22 +1784,17 @@ pub(crate) fn declares_transitions(declarations: &[crate::css::declaration_block
 
 /// Registers an element's native inline declaration block, or clears it when null.
 /// Returns whether the declarations can define transitions.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread. A non-null `block` must borrow a
-/// live `DeclarationBlock`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_set_element_inline_style_properties(
+pub extern "C" fn style_engine_set_element_inline_style_properties(
     host: &DocumentHost,
     node: u32,
-    block: *const c_void,
+    block: Option<&crate::css::declaration_block::DeclarationBlock>,
 ) -> bool {
     use crate::css::declaration_block::DeclarationBlock;
     let Some(node) = StyleNodeID::from_raw(node) else {
         return false;
     };
-    // SAFETY: Guaranteed by the caller.
-    let data = unsafe { block.cast::<DeclarationBlock>().as_ref() }.map(DeclarationBlock::data);
+    let data = block.map(DeclarationBlock::data);
     let has_transitions = data.as_ref().is_some_and(|data| declares_transitions(&data.properties));
     super::engine_calls::queue(host, super::engine_calls::EngineWrite::InlineStyle { node, data });
     has_transitions
@@ -2599,10 +2621,10 @@ pub enum FfiDemandedPseudoElement {
     SliderFill = 14,
     SliderThumb = 15,
     SliderTrack = 16,
-    ViewTransitionGroup = 19,
-    ViewTransitionImagePair = 20,
-    ViewTransitionNew = 21,
-    ViewTransitionOld = 22,
+    ViewTransitionGroup = 20,
+    ViewTransitionImagePair = 21,
+    ViewTransitionNew = 22,
+    ViewTransitionOld = 23,
 }
 
 /// The answer to a record demand: the record, or that the pseudo-element read generates no box
@@ -2805,19 +2827,15 @@ pub extern "C" fn style_engine_next_declaration_block_version(host: &DocumentHos
 /// sheet `sheet`, and answers whether they declare transitions. The host is told first, with no engine borrowed.
 ///
 /// # Safety
-/// `host` must be a live document host, on its document's thread, and `rule` live. The callback
-/// must not mutate the native rule graph, and must remain valid for this call.
+/// The callback must not mutate the native rule graph, and must remain valid for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_native_rule_declarations_changed(
     host: &DocumentHost,
     sheet: u32,
-    rule: *const c_void,
+    rule: &crate::css::rule::NativeRule,
     context: *mut c_void,
     notify: unsafe extern "C" fn(*mut c_void),
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    // SAFETY: Guaranteed by the caller.
-    let rule = unsafe { &*rule.cast::<crate::css::rule::NativeRule>() };
     let Some(identity) = rule
         .declaration_owner_identity()
         .filter(|&identity| host.published_rules().contains(sheet, identity))
@@ -2836,19 +2854,13 @@ pub unsafe extern "C" fn style_engine_native_rule_declarations_changed(
 
 /// The native identity of the first rule after an inserted native subtree that the host published to the sheet
 /// `sheet`, or 0 for none, without creating CSSOM objects.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread, and `native` a live native sheet.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_native_rule_successor(
+pub extern "C" fn style_engine_native_rule_successor(
     host: &DocumentHost,
     sheet: u32,
-    native: *const c_void,
+    native: &crate::css::style_sheet::NativeStyleSheet,
     identity: u64,
 ) -> u64 {
-    // SAFETY: Guaranteed by the caller.
-    // SAFETY: Guaranteed by the caller.
-    let native = unsafe { &*native.cast::<crate::css::style_sheet::NativeStyleSheet>() };
     host.published_rules().successor(sheet, native, identity)
 }
 

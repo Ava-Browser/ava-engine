@@ -10,8 +10,6 @@
 //! The output stays ASCII until the first non-ASCII code unit forces UTF-16 storage, matching
 //! AK::Utf16String's ASCII-or-UTF16 representation, then moves a native string owner to C++.
 
-use std::ffi::c_void;
-
 mod shorthand;
 
 use crate::css::css_enums::keyword;
@@ -2028,6 +2026,16 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
 
             // https://drafts.csswg.org/css-color-5/#serial-relative-color
             if let Some(origin) = origin_color.optional_data() {
+                if color_base.color_type == crate::css::color_conversion::ALPHA {
+                    sink.push_ascii("alpha(from ");
+                    serialize_style_value(sink, origin, mode);
+                    if let Some(alpha) = alpha.optional_data() {
+                        sink.push_ascii(" / ");
+                        serialize_style_value(sink, alpha, mode);
+                    }
+                    sink.push_ascii(")");
+                    return;
+                }
                 if descriptor.behavior == SerializationBehavior::ColorFunction {
                     sink.push_ascii("color(from ");
                     serialize_style_value(sink, origin, mode);
@@ -2058,6 +2066,19 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
                 descriptor.behavior,
                 SerializationBehavior::SrgbLegacy | SerializationBehavior::SrgbModern
             ) {
+                // https://drafts.csswg.org/css-color-4/#css-serialization-of-srgb
+                // However, the legacy color syntax with comma separators cannot represent none. If the value has
+                // at least one missing color component, the serialization form is chosen to preserve those
+                // components as the none keyword, based on the color function of the declared value.
+                if color_function_has_missing_component(value) {
+                    return serialize_srgb_value_with_missing_components(
+                        sink,
+                        color_base.color_type,
+                        &channels,
+                        alpha,
+                        mode,
+                    );
+                }
                 if !mode.is_resolved() && *has_name {
                     with_fly_string_units(name, |units| push_units_ascii_lowercased(sink, &units));
                     return;
@@ -2106,13 +2127,12 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
         }
         StyleValueData::ColorMix {
             color_interpolation_method,
-            first_color,
-            first_percentage,
-            second_color,
-            second_percentage,
+            colors,
+            percentages,
             ..
         } => {
             use crate::css::css_enums::rectangular_color_space;
+            // https://drafts.csswg.org/css-color-5/#serial-color-mix
             sink.push_ascii("color-mix(");
             if let Some(method) = color_interpolation_method.optional_data() {
                 let is_default_oklab = matches!(
@@ -2125,60 +2145,82 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
                     sink.push_ascii(", ");
                 }
             }
-            let first = first_percentage.optional_data();
-            let second = second_percentage.optional_data();
-            let literal_percentage = |value: Option<&StyleValueData>| match value {
-                Some(StyleValueData::Percentage { value }) => Some(*value),
-                _ => None,
-            };
-            let is_calc = |value: Option<&StyleValueData>| matches!(value, Some(StyleValueData::Calculated { .. }));
 
-            serialize_style_value(sink, first_color.data(), mode);
-            match (first, second) {
-                (Some(first_value), Some(_)) => {
-                    let both_fifty =
-                        literal_percentage(first) == Some(50.0) && literal_percentage(second) == Some(50.0);
-                    if !both_fifty {
-                        sink.push_ascii(" ");
-                        serialize_style_value(sink, first_value, mode);
-                    }
+            let colors = colors.as_slice();
+            let percentages = percentages.as_slice();
+            let item_count = colors.len();
+            let literal_percentage =
+                |value: &crate::css::style_value::RetainedStyleValueData| match value.optional_data() {
+                    Some(StyleValueData::Percentage { value }) => Some(*value),
+                    _ => None,
+                };
+            let any_calc = percentages
+                .iter()
+                .any(|value| matches!(value.optional_data(), Some(StyleValueData::Calculated { .. })));
+            // AD-HOC: The specified sum is clamped to 100%, as when normalizing mix percentages, so that an
+            //         omitted percentage never serializes as a negative value, which would not parse.
+            let specified_sum: f64 = percentages
+                .iter()
+                .filter_map(literal_percentage)
+                .sum::<f64>()
+                .min(100.0);
+            let omitted_count = percentages
+                .iter()
+                .filter(|value| value.optional_data().is_none())
+                .count();
+            // NB: Only used when at least one percentage was omitted.
+            let omitted_percentage = (100.0 - specified_sum) / omitted_count.max(1) as f64;
+
+            // For each argument, let its effective percentage be:
+            // - its specified <percentage>, if one was explicitly provided and is not a calc()
+            //   expression;
+            // - if its <percentage> was omitted, and none of the other specified <percentage>s are
+            //   calc() expressions: (100% − specified sum) / omitted count, where specified sum is
+            //   the sum of the explicitly specified <percentage>s and omitted count is the number
+            //   of arguments with omitted <percentage>s;
+            // - otherwise, unknown.
+            let effective_percentage =
+                |value: &crate::css::style_value::RetainedStyleValueData| match value.optional_data() {
+                    Some(StyleValueData::Percentage { value }) => Some(*value),
+                    None if !any_calc => Some(omitted_percentage),
+                    _ => None,
+                };
+
+            // If all effective percentages are known, equal to each other, and greater than or
+            // equal to 100% / N, no percentages are serialized.
+            // NB: The examples in the spec and WPT keep equal percentages above 100% / N (such as
+            //     "teal 70%, peru 70%"), so they are only omitted when they equal 100% / N.
+            let equal_share = 100.0 / item_count as f64;
+            let omit_percentages = percentages
+                .iter()
+                .all(|value| effective_percentage(value) == Some(equal_share));
+
+            for (index, (color, percentage)) in colors.iter().zip(percentages).enumerate() {
+                if index > 0 {
+                    sink.push_ascii(", ");
                 }
-                (Some(first_value), None) => {
-                    if literal_percentage(first) != Some(50.0) {
-                        sink.push_ascii(" ");
-                        serialize_style_value(sink, first_value, mode);
-                    }
+                serialize_style_value(sink, color.data(), mode);
+                if omit_percentages {
+                    continue;
                 }
-                (None, Some(_)) => {
-                    if literal_percentage(second) != Some(50.0)
-                        && let Some(second_literal) = literal_percentage(second)
-                    {
+                // Otherwise, each argument's percentage is serialized as follows:
+                match percentage.optional_data() {
+                    // If a <percentage> was explicitly specified, it is serialized as-is.
+                    Some(value) => {
                         sink.push_ascii(" ");
-                        serialize_a_number(sink, 100.0 - second_literal, mode);
+                        serialize_style_value(sink, value, mode);
+                    }
+                    // If a <percentage> was omitted and none of the other specified <percentage>s
+                    // are calc() expressions: the value (100% − specified sum) / omitted count is
+                    // serialized.
+                    None if !any_calc => {
+                        sink.push_ascii(" ");
+                        serialize_a_number(sink, omitted_percentage, mode);
                         sink.push_ascii("%");
                     }
-                }
-                (None, None) => {}
-            }
-            sink.push_ascii(", ");
-            serialize_style_value(sink, second_color.data(), mode);
-            match (first, second) {
-                (Some(_), Some(second_value)) => {
-                    let sum_is_hundred = match (literal_percentage(first), literal_percentage(second)) {
-                        (Some(first_literal), Some(second_literal)) => first_literal + second_literal == 100.0,
-                        _ => false,
-                    };
-                    if !sum_is_hundred {
-                        sink.push_ascii(" ");
-                        serialize_style_value(sink, second_value, mode);
-                    }
-                }
-                (Some(_) | None, None) => {}
-                (None, Some(second_value)) => {
-                    if literal_percentage(second) != Some(50.0) && is_calc(second) {
-                        sink.push_ascii(" ");
-                        serialize_style_value(sink, second_value, mode);
-                    }
+                    // Otherwise (a <percentage> was omitted but another argument has a calc()
+                    // <percentage>): nothing is serialized.
+                    None => {}
                 }
             }
             sink.push_ascii(")");
@@ -2504,6 +2546,131 @@ fn alpha_should_be_serialized(alpha: &StyleValueData) -> bool {
         StyleValueData::Percentage { value } => value * 0.01 < 1.0,
         _ => true,
     }
+}
+
+/// Whether a color function has a missing color component, including a missing alpha.
+// https://drafts.csswg.org/css-color-4/#missing
+pub(crate) fn color_function_has_missing_component(value: &StyleValueData) -> bool {
+    use crate::css::style_value::is_none_keyword;
+    let StyleValueData::ColorFunction {
+        channel_0,
+        channel_1,
+        channel_2,
+        alpha,
+        ..
+    } = value
+    else {
+        return false;
+    };
+    [channel_0, channel_1, channel_2, alpha]
+        .iter()
+        .any(|component| component.optional_data().is_some_and(is_none_keyword))
+}
+
+/// Serializes an rgb(), hsl() or hwb() value that has at least one missing color component.
+// https://drafts.csswg.org/css-color-4/#css-serialization-of-srgb
+fn serialize_srgb_value_with_missing_components(
+    sink: &mut TextSink,
+    color_type: u8,
+    channels: &[&crate::css::style_value::RetainedStyleValueData; 3],
+    alpha: &crate::css::style_value::RetainedStyleValueData,
+    mode: SerializationMode,
+) {
+    use crate::css::color_conversion;
+    use crate::css::color_resolution::{EMPTY_INPUT, resolve_with_reference_value};
+    use crate::css::style_value::is_none_keyword;
+
+    // A component that resolves to a number is clamped to `range`, then serialized as that number divided by
+    // `divisor`, followed by `suffix`. A component that does not resolve is divided by `divisor` inside a calc()
+    // instead. Any missing component is serialized as the none keyword.
+    let serialize_component = |sink: &mut TextSink,
+                               value: &StyleValueData,
+                               one_hundred_percent: f64,
+                               range: (f64, f64),
+                               divisor: f64,
+                               suffix: &str| {
+        if is_none_keyword(value) {
+            sink.push_ascii("none");
+            return;
+        }
+        match resolve_with_reference_value(value, one_hundred_percent, &EMPTY_INPUT) {
+            Some(resolved) => {
+                serialize_a_number(sink, resolved.clamp(range.0, range.1) / divisor, mode);
+                sink.push_ascii(suffix);
+            }
+            None if divisor == 1.0 => serialize_style_value(sink, value, mode),
+            None => {
+                sink.push_ascii("calc(");
+                serialize_style_value(sink, value, mode);
+                sink.push_ascii(" / ");
+                serialize_a_number(sink, divisor, mode);
+                sink.push_ascii(")");
+            }
+        }
+    };
+    let serialize_alpha = |sink: &mut TextSink| {
+        // The alpha is included only if non-unity or missing.
+        if let Some(alpha) = alpha.optional_data()
+            && alpha_should_be_serialized(alpha)
+        {
+            sink.push_ascii(" / ");
+            serialize_alpha_component(sink, alpha, mode);
+        }
+    };
+
+    if color_type == color_conversion::RGB {
+        // For rgb() and rgba() values, the value is serialized as a color() function in the srgb color space
+        // rather than as the modern space-separated form of rgb(), even though that form would also accept
+        // none: "color(srgb" followed by a single space, followed by a space-separated list of the three
+        // non-alpha components serialized as <number>s in the [0, 1] reference range (or as none if missing),
+        // followed (only if the alpha is non-unity or missing) by " / " and the alpha component (serialized
+        // per the alpha rules, or as none if missing), followed by ")".
+        sink.push_ascii("color(srgb ");
+        for (index, channel) in channels.iter().enumerate() {
+            if index > 0 {
+                sink.push_ascii(" ");
+            }
+            // https://drafts.csswg.org/css-color-4/#rgb-functions
+            // Values outside these ranges are not invalid, but are clamped to the ranges defined here at
+            // parsed-value time.
+            serialize_component(sink, channel.data(), 255.0, (0.0, 255.0), 255.0, "");
+        }
+        serialize_alpha(sink);
+        sink.push_ascii(")");
+        return;
+    }
+
+    // For hsl() and hsla() values, the value is serialized using the modern (whitespace-separated) hsl()
+    // syntax, with a slash before the alpha component when present. The function name is "hsl" (in ASCII
+    // lowercase) regardless of whether the value was authored using the hsla() alias. The hue is serialized
+    // as a canonicalized <number> in degrees, the saturation and lightness as <percentage>s, and the alpha
+    // (included only if non-unity or missing) per the alpha rules; any missing component is serialized as the
+    // none keyword.
+    // For hwb() values, the value is serialized using the modern (whitespace-separated) hwb() syntax, with a
+    // slash before the alpha component when present. The function name is "hwb" in ASCII lowercase. The hue
+    // is serialized as a canonicalized <number> in degrees, the whiteness and blackness as <percentage>s, and
+    // the alpha (included only if non-unity or missing) per the alpha rules; any missing component is
+    // serialized as the none keyword.
+    sink.push_ascii(if color_type == color_conversion::HSL {
+        "hsl("
+    } else {
+        "hwb("
+    });
+    serialize_hue_component(sink, channels[0].data(), mode);
+    for (index, channel) in channels.iter().enumerate().skip(1) {
+        sink.push_ascii(" ");
+        // https://drafts.csswg.org/css-color-4/#the-hsl-notation
+        // For historical reasons, if the saturation is less than 0% it is clamped to 0% at parsed-value time,
+        // before being converted to an sRGB color.
+        let range = if color_type == color_conversion::HSL && index == 1 {
+            (0.0, f64::INFINITY)
+        } else {
+            (f64::NEG_INFINITY, f64::INFINITY)
+        };
+        serialize_component(sink, channel.data(), 100.0, range, 1.0, "%");
+    }
+    serialize_alpha(sink);
+    sink.push_ascii(")");
 }
 
 /// Port of ColorStyleValue::serialize_color_component.
@@ -3334,12 +3501,8 @@ pub(crate) fn sink_into_raw(sink: TextSink) -> usize {
 }
 
 /// Serializes a style value into native ASCII-or-UTF-16 storage.
-///
-/// # Safety
-/// `value` must point at live style value data.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_serialize(value: *const c_void, mode: u8) -> usize {
-    let value = unsafe { &*value.cast::<StyleValueData>() };
+pub extern "C" fn rust_style_value_serialize(value: &StyleValueData, mode: u8) -> usize {
     let mut sink = TextSink::new();
     serialize_style_value(&mut sink, value, SerializationMode::from_ffi(mode));
     sink_into_raw(sink)

@@ -164,6 +164,7 @@ Error
 ErrorEvent
 EvalError
 Event
+EventCounts
 EventSource
 EventTarget
 External
@@ -272,6 +273,8 @@ HTMLUnknownElement
 HTMLVideoElement
 HashChangeEvent
 Headers
+Highlight
+HighlightRegistry
 History
 IDBCursor
 IDBCursorWithValue
@@ -285,6 +288,7 @@ IDBRecord
 IDBRequest
 IDBTransaction
 IDBVersionChangeEvent
+IIRFilterNode
 IdleDeadline
 Image
 ImageBitmap
@@ -299,6 +303,7 @@ IntersectionObserverEntry
 Iterator
 KeyboardEvent
 KeyframeEffect
+LargestContentfulPaint
 Location
 Lock
 LockManager
@@ -338,6 +343,7 @@ NavigationActivation
 NavigationCurrentEntryChangeEvent
 NavigationDestination
 NavigationHistoryEntry
+NavigationPrecommitController
 NavigationTransition
 Navigator
 Node
@@ -367,6 +373,7 @@ PerformanceNavigation
 PerformanceNavigationTiming
 PerformanceObserver
 PerformanceObserverEntryList
+PerformancePaintTiming
 PerformanceResourceTiming
 PerformanceServerTiming
 PerformanceTiming
@@ -401,13 +408,17 @@ ResizeObserverEntry
 ResizeObserverSize
 Response
 SVGAElement
+SVGAngle
 SVGAnimateMotionElement
+SVGAnimatedAngle
+SVGAnimatedBoolean
 SVGAnimatedEnumeration
 SVGAnimatedInteger
 SVGAnimatedLength
 SVGAnimatedLengthList
 SVGAnimatedNumber
 SVGAnimatedNumberList
+SVGAnimatedPreserveAspectRatio
 SVGAnimatedRect
 SVGAnimatedString
 SVGAnimatedTransformList
@@ -423,7 +434,10 @@ SVGFEBlendElement
 SVGFEColorMatrixElement
 SVGFEComponentTransferElement
 SVGFECompositeElement
+SVGFEConvolveMatrixElement
+SVGFEDiffuseLightingElement
 SVGFEDisplacementMapElement
+SVGFEDistantLightElement
 SVGFEDropShadowElement
 SVGFEFloodElement
 SVGFEFuncAElement
@@ -436,6 +450,9 @@ SVGFEMergeElement
 SVGFEMergeNodeElement
 SVGFEMorphologyElement
 SVGFEOffsetElement
+SVGFEPointLightElement
+SVGFESpecularLightingElement
+SVGFESpotLightElement
 SVGFETurbulenceElement
 SVGFilterElement
 SVGForeignObjectElement
@@ -449,6 +466,7 @@ SVGLengthList
 SVGLineElement
 SVGLinearGradientElement
 SVGMPathElement
+SVGMarkerElement
 SVGMaskElement
 SVGMatrix
 SVGMetadataElement
@@ -457,8 +475,10 @@ SVGNumberList
 SVGPathElement
 SVGPatternElement
 SVGPoint
+SVGPointList
 SVGPolygonElement
 SVGPolylineElement
+SVGPreserveAspectRatio
 SVGRadialGradientElement
 SVGRect
 SVGRectElement
@@ -466,6 +486,7 @@ SVGSVGElement
 SVGScriptElement
 SVGSetElement
 SVGStopElement
+SVGStringList
 SVGStyleElement
 SVGSwitchElement
 SVGSymbolElement
@@ -480,6 +501,7 @@ SVGTransformList
 SVGUnitTypes
 SVGUseElement
 SVGViewElement
+Sanitizer
 Screen
 ScreenOrientation
 ScriptProcessorNode
@@ -493,7 +515,6 @@ ServiceWorkerContainer
 ServiceWorkerRegistration
 Set
 ShadowRoot
-SharedArrayBuffer
 SharedWorker
 SourceBuffer
 SourceBufferList
@@ -542,6 +563,7 @@ TransformStreamDefaultController
 TransitionEvent
 TreeWalker
 TrustedHTML
+TrustedHTMLParserOptions
 TrustedScript
 TrustedScriptURL
 TrustedTypePolicy
@@ -566,6 +588,7 @@ VideoTrackList
 ViewTimeline
 ViewTransition
 VisualViewport
+WaveShaperNode
 WeakMap
 WeakRef
 WeakSet

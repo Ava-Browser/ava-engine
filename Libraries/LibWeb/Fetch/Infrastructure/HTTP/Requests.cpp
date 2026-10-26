@@ -17,6 +17,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 
 namespace Web::Fetch::Infrastructure {
@@ -47,7 +48,6 @@ void Request::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_reserved_client);
     visitor.visit(m_traversable_for_user_prompts);
     visitor.visit(m_pending_responses);
-    visitor.visit(m_policy_container);
 }
 
 // https://fetch.spec.whatwg.org/#concept-request-url
@@ -87,6 +87,16 @@ void Request::set_url(URL::URL url)
     if (!m_url_list.is_empty())
         m_url_list.clear();
     m_url_list.append(move(url));
+}
+
+void Request::set_policy_container(PolicyContainerType policy_container)
+{
+    m_policy_container = move(policy_container);
+}
+
+void Request::set_policy_container(NonnullRefPtr<HTML::PolicyContainer const> policy_container)
+{
+    m_policy_container = move(policy_container);
 }
 
 // https://fetch.spec.whatwg.org/#request-destination-script-like
@@ -212,7 +222,7 @@ ByteString Request::byte_serialize_origin() const
 }
 
 // https://fetch.spec.whatwg.org/#concept-request-clone
-GC::Ref<Request> Request::clone(JS::Realm& realm) const
+GC::Ref<Request> Request::clone(JS::Realm& realm, BodyCloning body_cloning) const
 {
     // To clone a request request, run these steps:
     // 1. Let newRequest be a copy of request, except for its body.
@@ -251,6 +261,7 @@ GC::Ref<Request> Request::clone(JS::Realm& realm) const
     new_request->set_text_directive_user_activation(m_text_directive_user_activation);
     new_request->set_browsing_context_group_has_multiple_contexts(m_browsing_context_group_has_multiple_contexts);
     new_request->set_user_agent_initiated(m_user_agent_initiated);
+    new_request->set_form_submission(m_form_submission);
     new_request->set_render_blocking(m_render_blocking);
     new_request->set_url_list(m_url_list);
     new_request->set_redirect_count(m_redirect_count);
@@ -261,8 +272,18 @@ GC::Ref<Request> Request::clone(JS::Realm& realm) const
     new_request->m_navigation_timing_allow_values_list = m_navigation_timing_allow_values_list;
 
     // 2. If request’s body is non-null, set newRequest’s body to the result of cloning request’s body.
-    if (auto const* body = m_body.get_pointer<GC::Ref<Body>>())
-        new_request->set_body((*body)->clone(realm));
+    if (auto const* body = m_body.get_pointer<GC::Ref<Body>>()) {
+        switch (body_cloning) {
+        case BodyCloning::Tee:
+            new_request->set_body((*body)->clone(realm));
+            break;
+        case BodyCloning::FromSource:
+            // AD-HOC: The fetch algorithms never read both this clone's body and the request's (see the note on cloning
+            //         in HTTP-network-or-cache fetch), so the clone reads the source, and a body without one is shared.
+            new_request->set_body((*body)->source().has_value() ? Body::create_from_source(realm, (*body)->fetch_body()) : *body);
+            break;
+        }
+    }
 
     // 3. Return newRequest.
     return new_request;
@@ -371,7 +392,7 @@ bool Request::cross_origin_embedder_policy_allows_credentials() const
         return true;
 
     // 4. If request’s client’s policy container’s embedder policy’s value is not "credentialless", then return true.
-    if (m_policy_container.has<GC::Ref<HTML::PolicyContainer>>() && m_policy_container.get<GC::Ref<HTML::PolicyContainer>>()->embedder_policy.value != HTML::EmbedderPolicyValue::Credentialless)
+    if (m_policy_container.has<NonnullRefPtr<HTML::PolicyContainer const>>() && m_policy_container.get<NonnullRefPtr<HTML::PolicyContainer const>>()->embedder_policy.value != HTML::EmbedderPolicyValue::Credentialless)
         return true;
 
     // 5. If request’s origin is same origin with request’s current URL’s origin and request’s redirect-taint is not

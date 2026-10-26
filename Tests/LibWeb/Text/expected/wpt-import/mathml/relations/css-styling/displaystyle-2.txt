@@ -1,0 +1,32 @@
+Harness status: OK
+
+Found 27 tests
+
+27 Pass
+Pass	mtable element (lowercase)
+Pass	mfrac element (lowercase)
+Pass	mroot element (lowercase)
+Pass	msub element (lowercase)
+Pass	msup element (lowercase)
+Pass	msubsup element (lowercase)
+Pass	munder element (lowercase)
+Pass	mover element (lowercase)
+Pass	munderover element (lowercase)
+Pass	mtable element (uppercase)
+Pass	mfrac element (uppercase)
+Pass	mroot element (uppercase)
+Pass	msub element (uppercase)
+Pass	msup element (uppercase)
+Pass	msubsup element (uppercase)
+Pass	munder element (uppercase)
+Pass	mover element (uppercase)
+Pass	munderover element (uppercase)
+Pass	mtable element (alternate_case)
+Pass	mfrac element (alternate_case)
+Pass	mroot element (alternate_case)
+Pass	msub element (alternate_case)
+Pass	msup element (alternate_case)
+Pass	msubsup element (alternate_case)
+Pass	munder element (alternate_case)
+Pass	mover element (alternate_case)
+Pass	munderover element (alternate_case)

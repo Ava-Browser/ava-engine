@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 pub use crate::css::ffi_support::FfiStringView;
-use crate::css::ffi_support::ascii_lowercase;
+use crate::css::ffi_support::{OwnedBox, ascii_lowercase};
 use crate::css::retained_fly_string::RetainedUtf16FlyString;
 
 pub type SelectorString = crate::css::css_string::CssString;
@@ -147,8 +147,9 @@ pub(crate) struct PseudoClassMetadata {
 pub(crate) enum PseudoElementParameterType {
     None,
     CompoundSelector,
+    HighlightNameSelector,
     IdentList,
-    PTNameSelector,
+    PTNameAndClassSelector,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,7 +194,21 @@ pub enum PseudoElementValue {
     None,
     CompoundSelector(Arc<CompiledSelector>),
     Identifiers(Box<[SelectorString]>),
-    TransitionName { is_universal: bool, value: SelectorString },
+    TransitionName(Box<TransitionNameAndClassSelector>),
+}
+
+// https://drafts.csswg.org/css-view-transitions-1/#typedef-pt-name-selector
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransitionNameSelector {
+    Universal,
+    Name(SelectorString),
+}
+
+// https://drafts.csswg.org/css-view-transitions-2/#typedef-pt-name-and-class-selector
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionNameAndClassSelector {
+    pub name: Option<TransitionNameSelector>,
+    pub classes: Box<[SelectorString]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -398,16 +413,13 @@ impl CompiledSelector {
                         },
                     },
                     SimpleSelector::PseudoElement(pseudo_element) => {
-                        if matches!(
-                            pseudo_element.pseudo_element,
-                            PseudoElementType::ViewTransitionGroup
-                                | PseudoElementType::ViewTransitionImagePair
-                                | PseudoElementType::ViewTransitionNew
-                                | PseudoElementType::ViewTransitionOld
-                        ) && matches!(
-                            pseudo_element.value,
-                            PseudoElementValue::TransitionName { is_universal: true, .. }
-                        ) {
+                        // https://drafts.csswg.org/css-view-transitions-2/#pseudo-element-class-additions
+                        // The specificity of a named view transition pseudo-element selector with a * argument and with
+                        // an empty <pt-class-selector> is zero.
+                        if let PseudoElementValue::TransitionName(argument) = &pseudo_element.value
+                            && argument.name == Some(TransitionNameSelector::Universal)
+                            && argument.classes.is_empty()
+                        {
                             Specificity::default()
                         } else {
                             let pseudo_specificity = Specificity {
@@ -632,15 +644,9 @@ pub fn is_ascii_case_insensitive_html_attribute(name: &RetainedUtf16FlyString) -
     })
 }
 
-/// # Safety
-/// `selector` must be an owned selector handle that has not already been destroyed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_selector_destroy(selector: *mut RustSelector) {
-    if !selector.is_null() {
-        // SAFETY: The caller guarantees that this is an owned handle returned by
-        // a selector-producing FFI function and that it has not already been destroyed.
-        drop(unsafe { Box::from_raw(selector) });
-    }
+pub extern "C" fn rust_selector_destroy(selector: OwnedBox<RustSelector>) {
+    drop(selector);
 }
 
 /// Returns the selector's specificity in the packed representation used by the DevTools protocol.

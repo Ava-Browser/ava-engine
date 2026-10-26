@@ -284,6 +284,7 @@ fn formatting_context_name(formatting_context_type: FormattingContextType) -> Op
         FormattingContextType::Grid => Some("GFC"),
         FormattingContextType::Table => Some("TFC"),
         FormattingContextType::Svg => Some("SVG"),
+        FormattingContextType::Math => Some("MathFC"),
         _ => None,
     }
 }
@@ -457,6 +458,7 @@ fn push_box_suffix(
         data,
         arena.node_style_if_live(slot),
         crate::layout::node_facts::node_is_flex_or_grid_container(parent_style),
+        || parent_style.map(|style| style.writing_mode()),
     )
     .and_then(formatting_context_name)
     {

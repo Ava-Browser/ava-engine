@@ -2,25 +2,25 @@ Harness status: OK
 
 Found 39 tests
 
-25 Pass
-14 Fail
-Fail	Element can be anchor positioned
-Fail	Element can use <length> fallback if present
-Fail	Element can use <length> fallback with percentage
-Fail	Element can use <length> fallback for max size with percentage
-Fail	Element can use <length> fallback for margin with percentage
+38 Pass
+1 Fail
+Pass	Element can be anchor positioned
+Pass	Element can use <length> fallback if present
+Pass	Element can use <length> fallback with percentage
+Pass	Element can use <length> fallback for max size with percentage
+Pass	Element can use <length> fallback for margin with percentage
 Pass	Invalid anchor function, left
 Pass	Invalid anchor function, right
 Pass	Invalid anchor function, bottom
 Pass	Invalid anchor function, top
-Fail	Invalid anchor function, width
-Fail	Invalid anchor function, height
-Fail	Invalid anchor function, min-width
-Fail	Invalid anchor function, min-height
-Fail	Invalid anchor function, max-width
-Fail	Invalid anchor function, max-height
+Pass	Invalid anchor function, width
+Pass	Invalid anchor function, height
+Pass	Invalid anchor function, min-width
+Pass	Invalid anchor function, min-height
+Pass	Invalid anchor function, max-width
+Pass	Invalid anchor function, max-height
 Pass	Invalid anchor function, --unknown left
-Fail	Invalid anchor function, --unknown width
+Pass	Invalid anchor function, --unknown width
 Pass	Invalid anchor function, cross-axis query (vertical)
 Pass	Invalid anchor function,  cross-axis query (horizontal)
 Pass	Invalid anchor function, anchor() in sizing property
@@ -33,7 +33,7 @@ Pass	Invalid anchor function, nested min-height
 Pass	Invalid anchor function, nested max-width
 Pass	Invalid anchor function, nested max-height
 Pass	Invalid anchor function, invalid anchor() in fallback
-Fail	Invalid anchor function, invalid anchor-size() in fallback
+Pass	Invalid anchor function, invalid anchor-size() in fallback
 Pass	Invalid anchor function, min()
 Pass	Invalid anchor function, max()
 Pass	Invalid anchor function, abs()

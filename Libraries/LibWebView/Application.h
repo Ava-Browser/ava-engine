@@ -127,6 +127,11 @@ public:
     virtual bool supports_private_browsing_windows() const { return false; }
     virtual bool supports_client_side_window_decorations() const { return false; }
     virtual bool supports_picture_in_picture() const;
+
+    // What startup recovery does with the windows the last run left open. Only a frontend that shows the launch plan
+    // asks for more than None.
+    virtual SessionLaunchPolicy launch_restore_policy() const;
+
     // Returns true if the platform sends momentum scroll events after a touchpad flick.
     // If it does not, the compositor makes the fling.
     virtual bool platform_reports_scroll_momentum() const { return true; }
@@ -344,6 +349,7 @@ public:
     NonnullRefPtr<Core::Promise<Empty>> clear_browsing_data(ClearBrowsingDataOptions const&);
 
     Action& reload_action() { return *m_reload_action; }
+    Action& reload_bypassing_cache_action() { return *m_reload_bypassing_cache_action; }
     Action& copy_selection_action() { return *m_copy_selection_action; }
     Action& undo_action() { return *m_undo_action; }
     Action& redo_action() { return *m_redo_action; }
@@ -481,7 +487,7 @@ private:
     };
     void create_bookmark_menu_items(Optional<MenuData> = {});
 
-    Vector<BookmarkItem::Bookmark> bookmarks_for_all_tabs_in_current_window() const;
+    virtual Vector<BookmarkItem::Bookmark> bookmarks_for_all_tabs_in_current_window() const;
 
     virtual Vector<DevTools::TabDescription> tab_list() const override;
     virtual Vector<DevTools::CSSProperty> css_property_list() const override;
@@ -589,6 +595,7 @@ private:
     OwnPtr<Core::File> m_cpu_profiler_control_socket;
     bool m_cpu_profiler_claimed { false };
     Vector<int> m_cpu_profiler_signal_handlers;
+    Vector<int> m_session_signal_handlers;
     RequestServerOptions m_request_server_options;
     WebContentOptions m_web_content_options;
     RefPtr<FontService> m_font_service;
@@ -666,6 +673,7 @@ private:
     OwnPtr<ProcessManager> m_process_manager;
 
     RefPtr<Action> m_reload_action;
+    RefPtr<Action> m_reload_bypassing_cache_action;
     RefPtr<Action> m_copy_selection_action;
     RefPtr<Action> m_undo_action;
     RefPtr<Action> m_redo_action;

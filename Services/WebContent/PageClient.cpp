@@ -34,6 +34,7 @@
 #include <LibWeb/DOM/MutationType.h>
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/DOM/NodeList.h>
+#include <LibWeb/Editing/WritingSuggestionController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Geolocation/GeolocationCoordinates.h>
@@ -57,9 +58,12 @@
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Streams/ReadableStreamDefaultReader.h>
+#include <LibWeb/WebDriver/BiDi/BiDi.h>
+#include <LibWeb/WebDriver/InputState.h>
 #include <LibWeb/WebDriver/UserPrompt.h>
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
+#include <LibWebCommon/WebDriver/Input.h>
 #include <LibWebCommon/WebView/Debugger.h>
 #include <LibWebCommon/WebView/ZoomLevel.h>
 #include <WebContent/ConnectionFromClient.h>
@@ -163,6 +167,8 @@ void PageClient::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_page);
+    for (auto& command : m_webdriver_input_commands)
+        visitor.visit(command.value);
     visitor.visit(m_top_level_document_console_client);
     for (auto& range : m_pending_text_fragment_generation_ranges)
         visitor.visit(range.value);
@@ -207,6 +213,9 @@ void PageClient::set_has_focus(bool has_focus)
             continue;
         if (has_focus && navigable->is_local_root())
             document->reset_cursor_blink_cycle();
+        // A writing suggestion is for the user typing in the window, so leaving the window drops it.
+        if (auto* controller = document->writing_suggestion_controller_if_exists(); controller && !has_focus)
+            controller->dismiss();
         // Focus changes can arrive while layout is invalidated. We only need to invalidate cached paint
         // on the current paintable tree here, without requiring layout to be up to date first.
         if (document->has_committed_viewport_box())
@@ -216,7 +225,16 @@ void PageClient::set_has_focus(bool has_focus)
 
 void PageClient::set_window_handle(Utf16String window_handle)
 {
-    as<Web::HTML::LocalTraversableNavigable>(*page().top_level_traversable()).set_window_handle(move(window_handle));
+    auto& traversable = as<Web::HTML::LocalTraversableNavigable>(*page().top_level_traversable());
+    auto first_window_handle = traversable.window_handle().is_empty();
+    traversable.set_window_handle(move(window_handle));
+
+    // NB: The initial page gets its window handle after its first document becomes active. The window-open path
+    //     assigns its handle and runs these steps while creating the traversable instead.
+    if (first_window_handle && Web::WebDriver::BiDi::is_active()) {
+        if (auto document = traversable.active_document(); document && document->is_initial_about_blank())
+            Web::WebDriver::BiDi::document_is_ready_for_scripts(*document);
+    }
 }
 
 void PageClient::setup_palette()
@@ -287,7 +305,7 @@ void PageClient::request_set_opener_of_remote_navigable(Web::HTML::RemoteNavigab
     client().async_did_request_set_opener_of_navigable(m_id, navigable.id(), opener.id());
 }
 
-void PageClient::deliver_posted_message(Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor message)
+void PageClient::deliver_posted_message(Web::HTML::CrossProcessId navigable_id, Web::HTML::MessageDescriptor message)
 {
     if (auto* navigable = as_if<Web::HTML::LocalNavigable>(page().navigable_with_id(navigable_id).ptr()))
         navigable->deliver_posted_message_from_another_process(move(message));
@@ -1533,6 +1551,14 @@ void PageClient::page_did_store_hsts_policy_for_testing(String const& domain, HT
         test_connection->did_store_hsts_policy_for_testing(domain, policy);
 }
 
+void PageClient::page_did_request_clear_storage_for_testing(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentSettingsObject const& environment)
+{
+    // Synchronous, so the browser has relayed the change before the page reads again; the mirror applies it once this
+    // task yields, like any other change made elsewhere.
+    if (auto* test_connection = client().test_connection())
+        test_connection->did_request_clear_storage_for_testing(m_id, storage_endpoint, environment.id);
+}
+
 bool PageClient::page_did_is_known_hsts_host(String const& domain)
 {
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidIsKnownHstsHost>(domain);
@@ -1543,45 +1569,6 @@ bool PageClient::page_did_is_known_hsts_host(String const& domain)
     return response->result();
 }
 
-Optional<Utf16String> PageClient::page_did_request_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id, Utf16String const& bottle_key)
-{
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageItem>(m_id, storage_endpoint, environment_id, bottle_key);
-    if (!response) {
-        dbgln("WebContent client disconnected during DidRequestStorageItem. Exiting peacefully.");
-        Core::Process::terminate_immediately(0);
-    }
-    return response->take_value();
-}
-
-WebView::StorageSetResult PageClient::page_did_set_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id, Utf16String const& bottle_key, Utf16String const& value)
-{
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidSetStorageItem>(m_id, storage_endpoint, environment_id, bottle_key, value);
-    if (!response) {
-        dbgln("WebContent client disconnected during DidSetStorageItem. Exiting peacefully.");
-        Core::Process::terminate_immediately(0);
-    }
-    return response->result();
-}
-
-void PageClient::page_did_remove_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id, Utf16String const& bottle_key)
-{
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRemoveStorageItem>(m_id, storage_endpoint, environment_id, bottle_key);
-    if (!response) {
-        dbgln("WebContent client disconnected during DidRemoveStorageItem. Exiting peacefully.");
-        Core::Process::terminate_immediately(0);
-    }
-}
-
-Vector<Utf16String> PageClient::page_did_request_storage_keys(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id)
-{
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageKeys>(m_id, storage_endpoint, environment_id);
-    if (!response) {
-        dbgln("WebContent client disconnected during DidRequestStorageKeys. Exiting peacefully.");
-        Core::Process::terminate_immediately(0);
-    }
-    return response->take_keys();
-}
-
 u64 PageClient::page_did_request_storage_usage(Web::HTML::EnvironmentId const& environment_id)
 {
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageUsage>(m_id, environment_id);
@@ -1590,20 +1577,6 @@ u64 PageClient::page_did_request_storage_usage(Web::HTML::EnvironmentId const& e
         Core::Process::terminate_immediately(0);
     }
     return response->usage();
-}
-
-void PageClient::page_did_clear_storage(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id)
-{
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidClearStorage>(m_id, storage_endpoint, environment_id);
-    if (!response) {
-        dbgln("WebContent client disconnected during DidClearStorage. Exiting peacefully.");
-        Core::Process::terminate_immediately(0);
-    }
-}
-
-void PageClient::page_did_broadcast_storage_change(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& url, Optional<Utf16String> const& key, Optional<Utf16String> const& old_value, Optional<Utf16String> const& new_value)
-{
-    client().async_did_change_storage_item(m_id, storage_endpoint, url, key, old_value, new_value);
 }
 
 void PageClient::page_did_update_indexed_database(String const& url, Web::IndexedDB::TransactionChanges const& changes)
@@ -1837,10 +1810,10 @@ void PageClient::stop_loading_through_ui_process_for_testing()
         test_connection->async_did_request_stop_loading_for_testing(m_id);
 }
 
-void PageClient::reload_through_ui_process_for_testing()
+void PageClient::reload_through_ui_process_for_testing(bool bypass_cache)
 {
     if (auto* test_connection = client().test_connection())
-        test_connection->async_did_request_reload_for_testing(m_id);
+        test_connection->async_did_request_reload_for_testing(m_id, bypass_cache);
 }
 
 void PageClient::traverse_history_by_delta_through_ui_process_for_testing(i32 delta)
@@ -1968,6 +1941,11 @@ void PageClient::page_did_request_clipboard_entries(u64 request_id)
 void PageClient::page_did_request_spell_check(u64 request_id, Utf16String const& text)
 {
     client().async_did_request_spell_check(m_id, request_id, text);
+}
+
+void PageClient::page_did_request_writing_suggestion(u64 request_id, Utf16String const& text, u32 caret_offset)
+{
+    client().async_did_request_writing_suggestion(m_id, request_id, text, caret_offset);
 }
 
 void PageClient::page_did_request_primary_paste()
@@ -2159,6 +2137,8 @@ WebDriverConnection& PageClient::ensure_webdriver_session()
 
 void PageClient::run_webdriver_command(u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String const& name, JsonValue payload, Vector<String> arguments)
 {
+    if (Web::WebDriver::is_input_state_command(name) && !prepare_webdriver_input_command(command_id, navigable_id, payload))
+        return;
     ensure_webdriver_session().run_command(command_id, navigable_id, name, move(payload), move(arguments));
 }
 
@@ -2167,9 +2147,55 @@ void PageClient::webdriver_did_set_current_browsing_context(u64 command_id, Web:
     client().async_webdriver_did_set_current_browsing_context(m_id, command_id, navigable_id);
 }
 
+bool PageClient::prepare_webdriver_input_command(u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, JsonValue& payload)
+{
+    auto navigable = navigable_id.has_value() ? page().navigable_with_id(*navigable_id) : GC::Ptr { page().top_level_traversable() };
+    if (!navigable) {
+        webdriver_command_complete(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchFrame, "Browsing context not found"sv));
+        return false;
+    }
+    auto envelope = move(payload).as_object();
+    auto top = navigable->top_level_traversable();
+    auto result = Web::WebDriver::restore_input_state(*top, *envelope.get("__webdriver_input_state"sv));
+    if (result.is_error()) {
+        webdriver_command_complete(command_id, result.release_error());
+        return false;
+    }
+    m_webdriver_input_commands.set(command_id, *top);
+    payload = *envelope.get("__webdriver_input_payload"sv);
+    return true;
+}
+
 void PageClient::webdriver_command_complete(u64 command_id, Web::WebDriver::Response response)
 {
+    if (auto top = m_webdriver_input_commands.take(command_id); top.has_value()) {
+        JsonObject envelope;
+        envelope.set("__webdriver_input_state"sv, Web::WebDriver::serialize_input_state(Web::WebDriver::get_input_state(**top)));
+        if (response.is_error()) {
+            auto error = response.release_error();
+            JsonObject serialized_error;
+            serialized_error.set("httpStatus"sv, error.http_status);
+            serialized_error.set("error"sv, error.error);
+            serialized_error.set("message"sv, error.message);
+            if (error.data.has_value())
+                serialized_error.set("data"sv, error.data.release_value());
+            envelope.set("error"sv, move(serialized_error));
+        } else {
+            envelope.set("value"sv, response.release_value());
+        }
+        response = JsonValue { move(envelope) };
+    }
     client().async_webdriver_command_complete(m_id, command_id, move(response));
+}
+
+void PageClient::webdriver_bidi_event(Web::HTML::CrossProcessId navigable_id, String const& name, JsonValue params)
+{
+    client().async_webdriver_bidi_event(m_id, navigable_id, name, move(params));
+}
+
+void PageClient::webdriver_bidi_navigation_event(Web::HTML::CrossProcessId navigable_id, StringView name, Optional<Utf16String> const& navigation_id, URL::URL const& url)
+{
+    client().async_webdriver_bidi_navigation_event(m_id, navigable_id, MUST(String::from_utf8(name)), navigation_id, url);
 }
 
 void PageClient::set_webdriver_session_config(Web::WebDriver::UserPromptHandler user_prompt_handler, Web::WebDriver::PageLoadStrategy page_load_strategy, bool strict_file_interactability, JsonValue const& timeouts)

@@ -5,7 +5,7 @@
  */
 
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
-use crate::css::ffi_support::FfiUtf16View;
+use crate::css::ffi_support::{FfiUtf16View, OwnedBox};
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::svg_formatting_context;
@@ -352,16 +352,12 @@ pub extern "C" fn render_state_paintable_visual_context_node_count(
     })
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread; `out` must have room for `capacity` indices.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_paintable_visual_context_copy_node_indices(
+pub extern "C" fn render_state_paintable_visual_context_copy_node_indices(
     host: &DocumentHost,
     slot: NodeSlotId,
     list: crate::painting::host::FfiVisualContextBoxNodeList,
-    out: *mut u32,
-    capacity: usize,
+    out: ak::SpanMut<'_, u32>,
 ) {
     let indices = {
         read_arena(host, node_read(), (slot, list), |arena, (slot, list)| {
@@ -375,9 +371,7 @@ pub unsafe extern "C" fn render_state_paintable_visual_context_copy_node_indices
             })
         })
     };
-    assert!(indices.len() <= capacity);
-    // SAFETY: the caller warrants `capacity` writable indices behind `out`.
-    unsafe { std::ptr::copy_nonoverlapping(indices.as_ptr(), out, indices.len()) };
+    out.into_slice()[..indices.len()].copy_from_slice(&indices);
 }
 
 pub(super) fn apply_walk_assignments(
@@ -695,19 +689,26 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
     }
 }
 
+/// The bounds of the geometry that a path-like SVG element's box committed. Returns false for any other box.
 #[unsafe(no_mangle)]
-pub extern "C" fn render_state_paintable_computed_svg_path(
+pub extern "C" fn render_state_paintable_computed_svg_path_bounding_box(
     host: &DocumentHost,
     paintable: NodeSlotId,
-) -> *const c_void {
-    read_arena(host, node_read(), paintable, |arena, paintable| {
+    out: &mut libgfx_rust::FloatRect,
+) -> bool {
+    let bounding_box = read_arena(host, node_read(), paintable, |arena, paintable| {
         let paintable_rows = arena.paintable_rows();
         if !paintable_rows.paintable_row_is_populated(paintable) {
-            return std::ptr::null();
+            return None;
         }
         crate::painting::paintable_geometry::committed_svg_path(&paintable_rows, paintable)
-            .map_or(std::ptr::null(), |path| path.as_raw())
-    })
+            .map(|path| path.bounding_box())
+    });
+    let Some(bounding_box) = bounding_box else {
+        return false;
+    };
+    *out = libgfx_rust::FloatRect::from_array(bounding_box);
+    true
 }
 
 /// The glyph cells a text content element's box committed for its own characters, one per code
@@ -1249,16 +1250,9 @@ pub extern "C" fn compositor_animation_effect_state_create() -> *mut CompositorA
     Box::into_raw(Box::new(CompositorAnimationEffectState::default()))
 }
 
-/// # Safety
-///
-/// `state` must be a handle from `compositor_animation_effect_state_create` that is given up here.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_state_destroy(state: *mut CompositorAnimationEffectState) {
-    if state.is_null() {
-        return;
-    }
-    // SAFETY: The caller gives up the handle it created.
-    drop(unsafe { Box::from_raw(state) });
+pub extern "C" fn compositor_animation_effect_state_destroy(state: OwnedBox<CompositorAnimationEffectState>) {
+    drop(state);
 }
 
 /// Builds the animation of the request's target kind for the effect and keeps it pending with the

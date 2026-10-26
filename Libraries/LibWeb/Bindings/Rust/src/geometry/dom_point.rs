@@ -44,7 +44,7 @@ impl DOMPoint {
     /// https://drafts.fxtf.org/geometry/#dom-dompoint-frompoint
     pub(crate) fn from_point(cx: &mut CallContext, other: DOMPointInit) -> WebIdlResult<Ref<Self>> {
         // The fromPoint(other) static method on DOMPoint must create a DOMPoint from the dictionary other.
-        Ok(allocate(cx.vm(), Self::from_dictionary(&other)))
+        Ok(allocate(cx.vm(), |_| Self::from_dictionary(&other)))
     }
 
     /// https://drafts.fxtf.org/geometry/#create-a-dompoint-from-the-dictionary
@@ -52,6 +52,12 @@ impl DOMPoint {
         Self {
             point: DOMPointReadOnly::from_dictionary(other),
         }
+    }
+
+    /// Sets the x and y coordinates, for an SVGPointList that synchronizes its points with a reflected attribute.
+    pub(crate) fn set_x_and_y(&self, x: f64, y: f64) {
+        self.point.set_x_coordinate(x);
+        self.point.set_y_coordinate(y);
     }
 
     /// https://drafts.fxtf.org/geometry/#dom-dompointreadonly-x

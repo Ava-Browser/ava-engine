@@ -1,0 +1,18 @@
+Harness status: OK
+
+Found 13 tests
+
+13 Pass
+Pass	BottomDisplayStyleShiftDown
+Pass	BottomDisplayStyleShiftDown Displaystyle
+Pass	BottomDisplayStyleShiftDown Displaystyle om fraction
+Pass	BottomShiftDown
+Pass	DisplayStyleGapMin
+Pass	DisplayStyleGapMin Dsiplaystyle
+Pass	DisplayStyleGapMin Dsiplaystyle on fraction
+Pass	GapMin
+Pass	TopDisplayStyleShiftUp
+Pass	TopDisplayStyleShiftUp Displaystyle
+Pass	TopDisplayStyleShiftUp Displaystyle on fraction
+Pass	ToShiftUp
+Pass	ToShiftUp with Displaystyle on fraction

@@ -3140,7 +3140,7 @@ handler GetById(
         guard flags has OBJECT_FLAG_IS_RAW_NATIVE_FUNCTION else invoke_accessor_slow;
 
         if flags has OBJECT_FLAG_IS_DIRECT_GETTER_FUNCTION {
-            if property_cache.direct_getter_validated != 0 {
+            if property_cache.getter == getter {
                 guard let result = load_direct_getter_value(function, receiver_object) else invoke_accessor_slow;
                 record_value_feedback(value_feedback, result);
                 store(dst, result);
@@ -4447,6 +4447,32 @@ handler DeleteVariable(
     dst: out Operand,
     identifier: IdentifierTableIndex
 ) @cold = call_slow_path(delete_variable);
+
+handler NewDisposableResourceStack(
+    dst: out Operand
+) @cold = call_slow_path(new_disposable_resource_stack);
+
+handler AddDisposableResource(
+    stack: Operand,
+    value: Operand,
+    hint: u32
+) @cold = call_slow_path(add_disposable_resource);
+
+handler DisposeResources(
+    stack: Operand,
+    completion_type: Operand,
+    completion_value: Operand
+) @cold = call_slow_path(dispose_resources);
+
+handler AsyncDisposeResourcesStep(
+    done: out Operand,
+    awaited_value: out Operand,
+    stack: Operand,
+    completion_type: Operand,
+    completion_value: Operand,
+    await_completion_type: Operand,
+    await_completion_value: Operand
+) @cold = call_slow_path(async_dispose_resources_step);
 
 handler GetCompletionFields(
     type_dst: out Operand,

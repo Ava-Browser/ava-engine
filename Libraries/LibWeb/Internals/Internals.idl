@@ -50,6 +50,12 @@ interface Internals {
     DOMString spellingErrorRanges(Node node);
     Promise<DOMString> checkSpellingForTesting(DOMString text);
     Promise<undefined> spellCheckSettled();
+
+    // Writing suggestions
+    Promise<DOMString> requestWritingSuggestionForTesting(DOMString text, unsigned long caretOffset);
+    DOMString writingSuggestion();
+    Promise<undefined> writingSuggestionSettled();
+    Promise<undefined> writingSuggestionRequestSent();
     Promise<DOMString> activateSpellingMenuItem(SpellingMenuItem item, optional unsigned long guessIndex = 0);
 
     const unsigned short MOD_NONE = 0;
@@ -129,6 +135,8 @@ interface Internals {
 
     boolean dispatchUserActivatedEvent(EventTarget target, Event event);
     undefined spoofCurrentURL(USVString url);
+    // Gives the document the URL's origin in this process only, as a compromised process would claim it.
+    undefined spoofCurrentOriginInThisProcess(USVString url);
     // Sets the navigator compatibility mode of this process; the realms created afterwards expose what that mode has.
     undefined setNavigatorCompatibilityMode(InternalsNavigatorCompatibilityMode mode);
 
@@ -143,6 +151,8 @@ interface Internals {
     undefined simulateDrop(double x, double y);
 
     undefined expireCookiesWithTimeOffset(long long seconds);
+    // Clears this document's local ("local") or session ("session") storage the way the browser does, through its jar.
+    undefined clearStorageForTesting(DOMString type);
     Promise<undefined> deleteAllCookies();
     boolean hasCookieForURL(DOMString url, ByteString name, ByteString value);
 
@@ -182,6 +192,7 @@ interface Internals {
     DOMString getComputedAriaLevel(Element element);
     undefined setAccessibilityFocusTarget(Element element);
     unsigned short getEchoServerPort();
+    unsigned short getHttpsEchoServerPort();
 
     undefined setHSTSPolicy(DOMString domain, unsigned long long maxAge, boolean includeSubDomains);
     undefined ingestHSTSHeader(USVString url, DOMString headerValue);
@@ -215,10 +226,14 @@ interface Internals {
     DOMString dumpSiteIsolationProcessTree();
     // Reports if the browser process has created a document for the iframe that it hasn't made active yet.
     boolean hasPopulatedDocument(HTMLIFrameElement iframe);
+    // Whether the canvas drew content that it has not presented to the compositor yet.
+    boolean canvasHasUnpresentedContent(HTMLCanvasElement canvas);
     undefined crashRemoteFrameProcesses();
     // Stops loading and reloads as the browser's Stop and Reload buttons do.
     undefined stopLoadingThroughUIProcess();
     undefined reloadThroughUIProcess();
+    // Reloads bypassing the HTTP cache, as the browser's Reload Without Cache action does.
+    undefined reloadBypassingCacheThroughUIProcess();
     // Traverses the history by a delta as the browser's Back and Forward buttons do, with no source document.
     undefined traverseHistoryThroughUIProcess(long delta);
     Promise<undefined> flushSessionHistoryTraversalQueue();
@@ -379,6 +394,10 @@ interface Internals {
     undefined setPageMuted(boolean muted);
 
     DOMString viewportOverflowX();
+
+    // A byte stream that pulls at most pullSize of the bytes at a time through
+    // https://streams.spec.whatwg.org/#readablestream-pull-from-bytes, and closes once it has pulled them all.
+    ReadableStream createStreamPullingFromBytes(ByteString bytes, unsigned long pullSize);
 
 };
 

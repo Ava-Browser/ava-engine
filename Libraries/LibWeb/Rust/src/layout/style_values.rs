@@ -15,6 +15,26 @@ pub(crate) enum InsetField {
     Left,
 }
 
+impl InsetField {
+    pub(crate) fn side(self) -> geometry::Side {
+        match self {
+            Self::Top => geometry::Side::Top,
+            Self::Right => geometry::Side::Right,
+            Self::Bottom => geometry::Side::Bottom,
+            Self::Left => geometry::Side::Left,
+        }
+    }
+
+    pub(crate) fn from_side(side: geometry::Side) -> Self {
+        match side {
+            geometry::Side::Top => Self::Top,
+            geometry::Side::Right => Self::Right,
+            geometry::Side::Bottom => Self::Bottom,
+            geometry::Side::Left => Self::Left,
+        }
+    }
+}
+
 /// A resolved px-or-auto inset produced by anchor resolution. It takes
 /// precedence over every style read and reports
 /// contains_anchor_function() == false.
@@ -84,6 +104,95 @@ impl InsetValue<'_> {
     }
 }
 
+/// A sizing property whose computed value holds anchor-size() functions, as the abspos engine resolved it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedSizeOverride {
+    Length(CssPixels),
+    Keyword(ComputedSizeKind),
+}
+
+/// The sizing and margin properties of one positioned box whose computed values hold anchor-size() functions, with
+/// those functions resolved by the abspos engine. A property without one stays None and reads from style, as does a
+/// sizing property whose anchor-size() functions all resolve to their fallback values. Margins also carry the zero that
+/// auto resolves to in the axes a position area or anchor-center aligns the box in.
+/// NB: The properties are those of the frame the box is laid out in, as style reads see them there.
+/// https://drafts.csswg.org/css-anchor-position-1/#anchor-size-fn
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResolvedAnchorSizes {
+    pub(crate) width: Option<ResolvedSizeOverride>,
+    pub(crate) min_width: Option<ResolvedSizeOverride>,
+    pub(crate) max_width: Option<ResolvedSizeOverride>,
+    pub(crate) height: Option<ResolvedSizeOverride>,
+    pub(crate) min_height: Option<ResolvedSizeOverride>,
+    pub(crate) max_height: Option<ResolvedSizeOverride>,
+    pub(crate) margin_top: Option<CssPixels>,
+    pub(crate) margin_right: Option<CssPixels>,
+    pub(crate) margin_bottom: Option<CssPixels>,
+    pub(crate) margin_left: Option<CssPixels>,
+}
+
+impl ResolvedAnchorSizes {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The computed values `ResolvedAnchorSizes` stands for, which style reads borrow.
+#[derive(Default)]
+pub(crate) struct AnchorResolvedValues {
+    width: Option<ComputedSize>,
+    min_width: Option<ComputedSize>,
+    max_width: Option<ComputedSize>,
+    height: Option<ComputedSize>,
+    min_height: Option<ComputedSize>,
+    max_height: Option<ComputedSize>,
+    margin_top: Option<ComputedLengthPercentageOrAuto>,
+    margin_right: Option<ComputedLengthPercentageOrAuto>,
+    margin_bottom: Option<ComputedLengthPercentageOrAuto>,
+    margin_left: Option<ComputedLengthPercentageOrAuto>,
+    /// The frame the box is laid out in, whose sides and axes the values are those of.
+    frame: geometry::Frame,
+}
+
+impl std::fmt::Debug for AnchorResolvedValues {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("AnchorResolvedValues").finish_non_exhaustive()
+    }
+}
+
+impl AnchorResolvedValues {
+    pub(crate) fn new(resolved: &ResolvedAnchorSizes, frame: geometry::Frame) -> Self {
+        let size = |value: Option<ResolvedSizeOverride>| {
+            value.map(|value| match value {
+                ResolvedSizeOverride::Length(px) => ComputedSize {
+                    kind: ComputedSizeKind::Length,
+                    value: ComputedStyleValueHandle::length(px.to_double()),
+                },
+                ResolvedSizeOverride::Keyword(kind) => ComputedSize::keyword(kind),
+            })
+        };
+        let margin = |value: Option<CssPixels>| {
+            value.map(|px| ComputedLengthPercentageOrAuto {
+                is_auto: false,
+                value: ComputedStyleValueHandle::length(px.to_double()),
+            })
+        };
+        Self {
+            width: size(resolved.width),
+            min_width: size(resolved.min_width),
+            max_width: size(resolved.max_width),
+            height: size(resolved.height),
+            min_height: size(resolved.min_height),
+            max_height: size(resolved.max_height),
+            margin_top: margin(resolved.margin_top),
+            margin_right: margin(resolved.margin_right),
+            margin_bottom: margin(resolved.margin_bottom),
+            margin_left: margin(resolved.margin_left),
+            frame,
+        }
+    }
+}
+
 /// A padding read: the style's, or zero for a non-devolvable widget.
 #[derive(Clone, Copy)]
 pub(crate) enum PaddingValue<'a> {
@@ -116,8 +225,10 @@ impl PaddingValue<'_> {
 pub(crate) struct StyleValues<'a> {
     style: ComputedValuesView<'a>,
     resolved_anchor_insets: Option<&'a formatting_context::ResolvedAnchorInsets>,
+    anchor_resolved_values: Option<&'a AnchorResolvedValues>,
     vertical_align_override: Option<u8>,
     is_non_devolvable_widget: bool,
+    frame: geometry::Frame,
 }
 
 impl<'a> std::ops::Deref for StyleValues<'a> {
@@ -134,14 +245,298 @@ impl<'a> StyleValues<'a> {
         Self {
             style: ComputedValuesView::new(&payloads.groups),
             resolved_anchor_insets: None,
+            anchor_resolved_values: None,
             vertical_align_override: None,
             is_non_devolvable_widget: false,
+            frame: geometry::Frame::PHYSICAL,
         }
     }
 
     #[inline]
     pub(crate) fn for_node(callbacks: &LayoutPass<'a>, node: Node) -> Self {
-        StyleValues::new(callbacks.style_payloads(node)).for_kind(callbacks.node_data(node).kind.get())
+        StyleValues::new(callbacks.style_payloads(node))
+            .for_kind(callbacks.node_data(node).kind.get())
+            .in_frame(callbacks.frame)
+    }
+
+    /// The view as seen from `frame`, whose sides and axes the box's sizes and box model properties are read in.
+    #[inline]
+    pub(crate) fn in_frame(mut self, frame: geometry::Frame) -> Self {
+        self.frame = frame;
+        self
+    }
+
+    #[inline]
+    fn physical(self, side: geometry::Side) -> geometry::Side {
+        self.frame.physical_side(side)
+    }
+
+    /// Whether the inline-start side is the frame's right side rather than its left side.
+    #[inline]
+    pub(crate) fn inline_axis_is_reverse(self) -> bool {
+        if self.frame.is_physical() {
+            return self.style.inline_axis_is_reverse();
+        }
+        // NB: The left side of a frame is the line-left side, which is inline-start in ltr text.
+        self.style.direction() == direction::RTL
+    }
+
+    /// Whether the block-start side is the frame's bottom side rather than its top side.
+    #[inline]
+    pub(crate) fn block_axis_is_reverse(self) -> bool {
+        if self.frame.is_physical() {
+            return self.style.block_axis_is_reverse();
+        }
+        false
+    }
+
+    #[inline]
+    pub(crate) fn unresolved_width(self) -> &'a ComputedSize {
+        if self.frame.is_transposed() {
+            self.style.height()
+        } else {
+            self.style.width()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn unresolved_height(self) -> &'a ComputedSize {
+        if self.frame.is_transposed() {
+            self.style.width()
+        } else {
+            self.style.height()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn unresolved_min_width(self) -> &'a ComputedSize {
+        if self.frame.is_transposed() {
+            self.style.min_height()
+        } else {
+            self.style.min_width()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn unresolved_min_height(self) -> &'a ComputedSize {
+        if self.frame.is_transposed() {
+            self.style.min_width()
+        } else {
+            self.style.min_height()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn unresolved_max_width(self) -> &'a ComputedSize {
+        if self.frame.is_transposed() {
+            self.style.max_height()
+        } else {
+            self.style.max_width()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn unresolved_max_height(self) -> &'a ComputedSize {
+        if self.frame.is_transposed() {
+            self.style.max_width()
+        } else {
+            self.style.max_height()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn contain_intrinsic_width_has_length(self) -> bool {
+        if self.frame.is_transposed() {
+            self.style.contain_intrinsic_height_has_length()
+        } else {
+            self.style.contain_intrinsic_width_has_length()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn contain_intrinsic_width_px(self) -> f64 {
+        if self.frame.is_transposed() {
+            self.style.contain_intrinsic_height_px()
+        } else {
+            self.style.contain_intrinsic_width_px()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn contain_intrinsic_height_has_length(self) -> bool {
+        if self.frame.is_transposed() {
+            self.style.contain_intrinsic_width_has_length()
+        } else {
+            self.style.contain_intrinsic_height_has_length()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn contain_intrinsic_height_px(self) -> f64 {
+        if self.frame.is_transposed() {
+            self.style.contain_intrinsic_width_px()
+        } else {
+            self.style.contain_intrinsic_height_px()
+        }
+    }
+
+    /// The preferred aspect ratio as a width to height fraction in the frame.
+    #[inline]
+    pub(crate) fn css_preferred_aspect_ratio(self) -> (CssPixels, CssPixels) {
+        let (numerator, denominator) = self.style.css_preferred_aspect_ratio();
+        if self.frame.is_transposed() {
+            (denominator, numerator)
+        } else {
+            (numerator, denominator)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn border_spacing_horizontal(self) -> CssPixels {
+        if self.frame.is_transposed() {
+            self.style.border_spacing_vertical()
+        } else {
+            self.style.border_spacing_horizontal()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn border_spacing_vertical(self) -> CssPixels {
+        if self.frame.is_transposed() {
+            self.style.border_spacing_horizontal()
+        } else {
+            self.style.border_spacing_vertical()
+        }
+    }
+
+    fn physical_margin(self, side: geometry::Side) -> &'a ComputedLengthPercentageOrAuto {
+        match side {
+            geometry::Side::Top => self.style.margin_top(),
+            geometry::Side::Right => self.style.margin_right(),
+            geometry::Side::Bottom => self.style.margin_bottom(),
+            geometry::Side::Left => self.style.margin_left(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn unresolved_margin_top(self) -> &'a ComputedLengthPercentageOrAuto {
+        if self.frame.is_physical() {
+            return self.style.margin_top();
+        }
+        self.physical_margin(self.physical(geometry::Side::Top))
+    }
+
+    #[inline]
+    pub(crate) fn unresolved_margin_right(self) -> &'a ComputedLengthPercentageOrAuto {
+        if self.frame.is_physical() {
+            return self.style.margin_right();
+        }
+        self.physical_margin(self.physical(geometry::Side::Right))
+    }
+
+    #[inline]
+    pub(crate) fn unresolved_margin_bottom(self) -> &'a ComputedLengthPercentageOrAuto {
+        if self.frame.is_physical() {
+            return self.style.margin_bottom();
+        }
+        self.physical_margin(self.physical(geometry::Side::Bottom))
+    }
+
+    #[inline]
+    pub(crate) fn unresolved_margin_left(self) -> &'a ComputedLengthPercentageOrAuto {
+        if self.frame.is_physical() {
+            return self.style.margin_left();
+        }
+        self.physical_margin(self.physical(geometry::Side::Left))
+    }
+
+    fn physical_border(self, side: geometry::Side) -> (CssPixels, u8, u32) {
+        match side {
+            geometry::Side::Top => (
+                self.style.border_top_width(),
+                self.style.border_top_style(),
+                self.style.border_top_color(),
+            ),
+            geometry::Side::Right => (
+                self.style.border_right_width(),
+                self.style.border_right_style(),
+                self.style.border_right_color(),
+            ),
+            geometry::Side::Bottom => (
+                self.style.border_bottom_width(),
+                self.style.border_bottom_style(),
+                self.style.border_bottom_color(),
+            ),
+            geometry::Side::Left => (
+                self.style.border_left_width(),
+                self.style.border_left_style(),
+                self.style.border_left_color(),
+            ),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn border_top_style(self) -> u8 {
+        if self.frame.is_physical() {
+            return self.style.border_top_style();
+        }
+        self.physical_border(self.physical(geometry::Side::Top)).1
+    }
+
+    #[inline]
+    pub(crate) fn border_right_style(self) -> u8 {
+        if self.frame.is_physical() {
+            return self.style.border_right_style();
+        }
+        self.physical_border(self.physical(geometry::Side::Right)).1
+    }
+
+    #[inline]
+    pub(crate) fn border_bottom_style(self) -> u8 {
+        if self.frame.is_physical() {
+            return self.style.border_bottom_style();
+        }
+        self.physical_border(self.physical(geometry::Side::Bottom)).1
+    }
+
+    #[inline]
+    pub(crate) fn border_left_style(self) -> u8 {
+        if self.frame.is_physical() {
+            return self.style.border_left_style();
+        }
+        self.physical_border(self.physical(geometry::Side::Left)).1
+    }
+
+    #[inline]
+    pub(crate) fn border_top_color(self) -> u32 {
+        if self.frame.is_physical() {
+            return self.style.border_top_color();
+        }
+        self.physical_border(self.physical(geometry::Side::Top)).2
+    }
+
+    #[inline]
+    pub(crate) fn border_right_color(self) -> u32 {
+        if self.frame.is_physical() {
+            return self.style.border_right_color();
+        }
+        self.physical_border(self.physical(geometry::Side::Right)).2
+    }
+
+    #[inline]
+    pub(crate) fn border_bottom_color(self) -> u32 {
+        if self.frame.is_physical() {
+            return self.style.border_bottom_color();
+        }
+        self.physical_border(self.physical(geometry::Side::Bottom)).2
+    }
+
+    #[inline]
+    pub(crate) fn border_left_color(self) -> u32 {
+        if self.frame.is_physical() {
+            return self.style.border_left_color();
+        }
+        self.physical_border(self.physical(geometry::Side::Left)).2
     }
 
     /// The view for a box of `kind`. A non-devolvable widget is drawn natively to fill its box, so author padding and
@@ -158,6 +553,73 @@ impl<'a> StyleValues<'a> {
     ) -> Self {
         self.resolved_anchor_insets = resolved;
         self
+    }
+
+    pub(crate) fn with_anchor_resolved_values(mut self, resolved: Option<&'a AnchorResolvedValues>) -> Self {
+        // FIXME: Map the resolved values into the frame of a box that lays out its contents in another writing mode
+        //        than its containing block, rather than reading its computed values there.
+        self.anchor_resolved_values = resolved.filter(|resolved| resolved.frame == self.frame);
+        self
+    }
+
+    pub(crate) fn width(self) -> &'a ComputedSize {
+        self.anchor_resolved_values
+            .and_then(|resolved| resolved.width.as_ref())
+            .unwrap_or_else(|| unresolvable_anchor_size_or(self.unresolved_width(), auto_computed_size()))
+    }
+
+    pub(crate) fn min_width(self) -> &'a ComputedSize {
+        self.anchor_resolved_values
+            .and_then(|resolved| resolved.min_width.as_ref())
+            .unwrap_or_else(|| unresolvable_anchor_size_or(self.unresolved_min_width(), auto_computed_size()))
+    }
+
+    pub(crate) fn max_width(self) -> &'a ComputedSize {
+        self.anchor_resolved_values
+            .and_then(|resolved| resolved.max_width.as_ref())
+            .unwrap_or_else(|| unresolvable_anchor_size_or(self.unresolved_max_width(), none_computed_size()))
+    }
+
+    pub(crate) fn height(self) -> &'a ComputedSize {
+        self.anchor_resolved_values
+            .and_then(|resolved| resolved.height.as_ref())
+            .unwrap_or_else(|| unresolvable_anchor_size_or(self.unresolved_height(), auto_computed_size()))
+    }
+
+    pub(crate) fn min_height(self) -> &'a ComputedSize {
+        self.anchor_resolved_values
+            .and_then(|resolved| resolved.min_height.as_ref())
+            .unwrap_or_else(|| unresolvable_anchor_size_or(self.unresolved_min_height(), auto_computed_size()))
+    }
+
+    pub(crate) fn max_height(self) -> &'a ComputedSize {
+        self.anchor_resolved_values
+            .and_then(|resolved| resolved.max_height.as_ref())
+            .unwrap_or_else(|| unresolvable_anchor_size_or(self.unresolved_max_height(), none_computed_size()))
+    }
+
+    pub(crate) fn margin_top(self) -> &'a ComputedLengthPercentageOrAuto {
+        self.anchor_resolved_values
+            .and_then(|resolved| resolved.margin_top.as_ref())
+            .unwrap_or_else(|| self.unresolved_margin_top())
+    }
+
+    pub(crate) fn margin_right(self) -> &'a ComputedLengthPercentageOrAuto {
+        self.anchor_resolved_values
+            .and_then(|resolved| resolved.margin_right.as_ref())
+            .unwrap_or_else(|| self.unresolved_margin_right())
+    }
+
+    pub(crate) fn margin_bottom(self) -> &'a ComputedLengthPercentageOrAuto {
+        self.anchor_resolved_values
+            .and_then(|resolved| resolved.margin_bottom.as_ref())
+            .unwrap_or_else(|| self.unresolved_margin_bottom())
+    }
+
+    pub(crate) fn margin_left(self) -> &'a ComputedLengthPercentageOrAuto {
+        self.anchor_resolved_values
+            .and_then(|resolved| resolved.margin_left.as_ref())
+            .unwrap_or_else(|| self.unresolved_margin_left())
     }
 
     fn bare_anchor_wrapper(self, field: InsetField) -> Option<&'a crate::css::style_value::StyleValueData> {
@@ -179,12 +641,18 @@ impl<'a> StyleValues<'a> {
     }
 
     fn inset_value(self, field: InsetField) -> InsetValue<'a> {
+        // NB: The abspos engine resolves anchor functions per side of the frame it lays the box out in.
         if let Some(resolved) = self
             .resolved_anchor_insets
             .and_then(|insets| insets.override_for(field))
         {
             return InsetValue::Resolved(resolved);
         }
+        let field = if self.frame.is_physical() {
+            field
+        } else {
+            InsetField::from_side(self.physical(field.side()))
+        };
         if let Some(wrapper) = self.bare_anchor_wrapper(field) {
             return InsetValue::BareAnchor(wrapper);
         }
@@ -232,36 +700,77 @@ impl<'a> StyleValues<'a> {
         }
     }
 
+    fn physical_padding(self, side: geometry::Side) -> PaddingValue<'a> {
+        self.padding_unless_non_devolvable(match side {
+            geometry::Side::Top => self.style.padding_top(),
+            geometry::Side::Right => self.style.padding_right(),
+            geometry::Side::Bottom => self.style.padding_bottom(),
+            geometry::Side::Left => self.style.padding_left(),
+        })
+    }
+
     pub(crate) fn padding_top(self) -> PaddingValue<'a> {
-        self.padding_unless_non_devolvable(self.style.padding_top())
+        if self.frame.is_physical() {
+            return self.padding_unless_non_devolvable(self.style.padding_top());
+        }
+        self.physical_padding(self.physical(geometry::Side::Top))
     }
 
     pub(crate) fn padding_right(self) -> PaddingValue<'a> {
-        self.padding_unless_non_devolvable(self.style.padding_right())
+        if self.frame.is_physical() {
+            return self.padding_unless_non_devolvable(self.style.padding_right());
+        }
+        self.physical_padding(self.physical(geometry::Side::Right))
     }
 
     pub(crate) fn padding_bottom(self) -> PaddingValue<'a> {
-        self.padding_unless_non_devolvable(self.style.padding_bottom())
+        if self.frame.is_physical() {
+            return self.padding_unless_non_devolvable(self.style.padding_bottom());
+        }
+        self.physical_padding(self.physical(geometry::Side::Bottom))
     }
 
     pub(crate) fn padding_left(self) -> PaddingValue<'a> {
-        self.padding_unless_non_devolvable(self.style.padding_left())
+        if self.frame.is_physical() {
+            return self.padding_unless_non_devolvable(self.style.padding_left());
+        }
+        self.physical_padding(self.physical(geometry::Side::Left))
     }
 
     pub(crate) fn border_top_width(self) -> CssPixels {
-        self.border_width_unless_non_devolvable(self.style.border_top_width())
+        let width = if self.frame.is_physical() {
+            self.style.border_top_width()
+        } else {
+            self.physical_border(self.physical(geometry::Side::Top)).0
+        };
+        self.border_width_unless_non_devolvable(width)
     }
 
     pub(crate) fn border_right_width(self) -> CssPixels {
-        self.border_width_unless_non_devolvable(self.style.border_right_width())
+        let width = if self.frame.is_physical() {
+            self.style.border_right_width()
+        } else {
+            self.physical_border(self.physical(geometry::Side::Right)).0
+        };
+        self.border_width_unless_non_devolvable(width)
     }
 
     pub(crate) fn border_bottom_width(self) -> CssPixels {
-        self.border_width_unless_non_devolvable(self.style.border_bottom_width())
+        let width = if self.frame.is_physical() {
+            self.style.border_bottom_width()
+        } else {
+            self.physical_border(self.physical(geometry::Side::Bottom)).0
+        };
+        self.border_width_unless_non_devolvable(width)
     }
 
     pub(crate) fn border_left_width(self) -> CssPixels {
-        self.border_width_unless_non_devolvable(self.style.border_left_width())
+        let width = if self.frame.is_physical() {
+            self.style.border_left_width()
+        } else {
+            self.physical_border(self.physical(geometry::Side::Left)).0
+        };
+        self.border_width_unless_non_devolvable(width)
     }
 
     pub(crate) fn with_vertical_align_keyword(mut self, keyword: u8) -> Self {
@@ -277,6 +786,126 @@ impl<'a> StyleValues<'a> {
         self.vertical_align_override
             .unwrap_or_else(|| self.style.box_values().vertical_align.keyword)
     }
+}
+
+/// `size`, or `initial` when `size` holds an anchor function that is unresolvable and has no fallback value.
+/// https://drafts.csswg.org/css-anchor-position-1/#anchor-size-resolution
+/// If no fallback value is specified, it makes the declaration referencing it invalid at computed-value time.
+/// NB: Outside of the resolutions the abspos engine installs, an anchor function is unresolvable.
+fn unresolvable_anchor_size_or<'a>(size: &'a ComputedSize, initial: &'static ComputedSize) -> &'a ComputedSize {
+    if !size.is_length_percentage() || !size.length_percentage().contains_anchor_function() {
+        return size;
+    }
+    let mut percentage_basis = CssPixels::default();
+    // SAFETY: The callback context is the percentage basis, live for this synchronous resolution.
+    let resolved = unsafe {
+        resolve_calc_with_external_resolutions(
+            size.length_percentage().calculated_pointer(),
+            percentage_basis,
+            (&raw mut percentage_basis).cast(),
+            Some(resolve_unresolvable_anchor_function),
+        )
+    };
+    if resolved.resolved { size } else { initial }
+}
+
+/// A px calc node, holding one reference for the external-resolution snapshot that releases it.
+pub(crate) fn calc_node_create_px_dimension(value: f64) -> *const c_void {
+    crate::css::calc::rust_calc_node_create_numeric_dimension(
+        formatting_context::CALC_NUMERIC_KIND_LENGTH,
+        value,
+        crate::css::style_compute::px_length_unit(),
+    )
+    .cast()
+}
+
+/// The calc node the fallback value of an unresolvable anchor() or anchor-size() function resolves to, or null when
+/// it has none. Nested anchor functions resolve through `resolve_non_math_function`.
+/// https://drafts.csswg.org/css-anchor-position-1/#anchor-resolution
+///
+/// # Safety
+/// `callback_context` must be what `resolve_non_math_function` expects, and stay live for the resolution.
+pub(crate) unsafe fn anchor_function_fallback_node(
+    fallback_value: &crate::css::style_value::RetainedStyleValueData,
+    percentage_basis: CssPixels,
+    callback_context: *mut c_void,
+    resolve_non_math_function: unsafe extern "C" fn(*mut c_void, *const c_void) -> *const c_void,
+) -> *const c_void {
+    use crate::css::style_value::StyleValueData;
+    match fallback_value.optional_data() {
+        None => std::ptr::null(),
+        Some(StyleValueData::Length { value, unit }) => {
+            // Computed anchor() fallbacks hold absolute lengths only; relative
+            // units carry NaN canonical ratios.
+            let ratio = crate::css::style_compute::LENGTH_UNIT_CANONICAL_PX_RATIOS[*unit as usize];
+            assert!(ratio.is_finite());
+            calc_node_create_px_dimension(CssPixels::nearest_value_for(*value * ratio).to_double())
+        }
+        Some(StyleValueData::Percentage { value }) => {
+            calc_node_create_px_dimension(percentage_basis.to_double() * (value / 100.0))
+        }
+        Some(StyleValueData::Calculated { .. }) => {
+            // SAFETY: The anchor function shell retains the fallback calculation for
+            // this synchronous resolution.
+            let resolved = unsafe {
+                resolve_calc_with_external_resolutions(
+                    fallback_value.pointer().cast(),
+                    percentage_basis,
+                    callback_context,
+                    Some(resolve_non_math_function),
+                )
+            };
+            if !resolved.resolved {
+                return std::ptr::null();
+            }
+            calc_node_create_px_dimension(resolved.value)
+        }
+        // SAFETY: The outer anchor function shell retains the nested one for this synchronous resolution.
+        Some(StyleValueData::Anchor { .. } | StyleValueData::AnchorSize { .. }) => unsafe {
+            resolve_non_math_function(callback_context, fallback_value.pointer().cast())
+        },
+        Some(_) => {
+            unreachable!("anchor function fallback must be a length, percentage, calculation or anchor function")
+        }
+    }
+}
+
+/// Resolves an anchor() or anchor-size() function outside the abspos engine, where it is unresolvable and resolves
+/// to its fallback value. The callback context is the percentage basis.
+unsafe extern "C" fn resolve_unresolvable_anchor_function(context: *mut c_void, shell: *const c_void) -> *const c_void {
+    use crate::css::style_value::StyleValueData;
+    // SAFETY: The context is the percentage basis resolve_calc_with_unresolvable_anchor_functions passes.
+    let percentage_basis = unsafe { *context.cast::<CssPixels>() };
+    // SAFETY: `shell` is the live style value the calc core's non-math-function node retains.
+    match unsafe { &*shell.cast::<StyleValueData>() } {
+        StyleValueData::Anchor { fallback_value, .. } | StyleValueData::AnchorSize { fallback_value, .. } => unsafe {
+            anchor_function_fallback_node(
+                fallback_value,
+                percentage_basis,
+                context,
+                resolve_unresolvable_anchor_function,
+            )
+        },
+        _ => std::ptr::null(),
+    }
+}
+
+/// Resolves `calculated`, whose anchor functions are unresolvable, to px. A function without a fallback value makes
+/// the declaration invalid at computed-value time, which this approximates as zero.
+pub(crate) fn resolve_calc_with_unresolvable_anchor_functions(
+    calculated: *const c_void,
+    mut percentage_basis: CssPixels,
+) -> f64 {
+    // SAFETY: The callback context is the percentage basis, live for this synchronous resolution.
+    let resolved = unsafe {
+        resolve_calc_with_external_resolutions(
+            calculated,
+            percentage_basis,
+            (&raw mut percentage_basis).cast(),
+            Some(resolve_unresolvable_anchor_function),
+        )
+    };
+    if resolved.resolved { resolved.value } else { 0.0 }
 }
 
 pub(crate) unsafe fn resolve_calc_with_external_resolutions(

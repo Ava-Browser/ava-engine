@@ -44,6 +44,7 @@ WEB_API CSSPixels content_height(Layout::Node const&);
 WEB_API CSSPixels border_box_width(Layout::Node const&);
 WEB_API CSSPixels border_box_height(Layout::Node const&);
 WEB_API BoxModelMetrics box_model(Layout::Node const&);
+WEB_API Optional<CSSPixels> anchor_resolved_size(Layout::Node const&, CSS::PropertyID);
 WEB_API CSSPixelRect transform_reference_box(Layout::Node const&);
 WEB_API Optional<CSSPixelRect> scrollable_overflow_rect(Layout::Node const&);
 WEB_API bool has_scrollable_overflow(Layout::Node const&);
@@ -68,7 +69,7 @@ WEB_API Compositing::ContextRef accumulated_visual_context(Layout::Node const&);
 WEB_API Compositing::ContextRef accumulated_visual_context_for_descendants(Layout::Node const&);
 WEB_API Compositing::SpatialNodeIndex own_scroll_node_index(Layout::Node const&);
 
-WEB_API Gfx::Path const* committed_svg_path(Layout::Node const&);
+WEB_API Optional<Gfx::FloatRect> committed_svg_path_bounding_box(Layout::Node const&);
 WEB_API Vector<Layout::RustFFI::FfiSvgTextCharacterCell> svg_text_character_cells(Layout::Node const&);
 WEB_API CSSPixelSize svg_viewport_size(Layout::Node const&);
 WEB_API Optional<Gfx::AffineTransform> svg_viewport_transform(Layout::Node const&);
@@ -83,7 +84,7 @@ WEB_API CSSPixelRect caret_rect_for_child_offset(Layout::BegunRead const&, Layou
 // Per-document paint facts the recording inputs carry, resolved once per recording.
 WEB_API Layout::RustFFI::FfiCaretPaint resolve_document_caret_paint(Layout::BegunRead const&, DOM::Document&);
 WEB_API Layout::RustFFI::FfiFocusedTextControlSelection resolve_focused_text_control_selection(Layout::BegunRead const&, DOM::Document const&);
-WEB_API Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(Layout::BegunRead const&, DOM::Document const&, Vector<u8>& path_bytes);
+WEB_API Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(Layout::BegunRead const&, DOM::Document const&);
 WEB_API void push_highlight_pseudo_styles(DOM::Element const&);
 
 // The node a layout row stands for, as the arena names it.
@@ -108,6 +109,8 @@ WEB_API Layout::RustFFI::FfiRectToViewportTransform identity_rect_to_viewport_tr
 WEB_API Layout::RustFFI::FfiRectToViewportTransform rect_to_viewport_transform(DOM::Document const&, Compositing::AccumulatedVisualContextTree const&);
 WEB_API Vector<CSSPixelRect> client_rects(Layout::Node const&, Layout::RustFFI::FfiRectToViewportTransform const&);
 WEB_API CSSPixelRect bounding_client_rect(Layout::Node const&, Layout::RustFFI::FfiRectToViewportTransform const&);
+WEB_API bool has_sticky_positioned_inclusive_ancestor(Layout::Node const&);
+WEB_API CSSPixelPoint accumulated_sticky_offset(Layout::Node const&, Layout::RustFFI::FfiRectToViewportTransform const&);
 
 WEB_API CSSPixelPoint cumulative_scroll_compensation(Layout::Node const&);
 

@@ -1,0 +1,12 @@
+Harness status: OK
+
+Found 7 tests
+
+7 Pass
+Pass	RadicalDegreeBottomRaisePercent
+Pass	RadicalDisplayStyleVerticalGap
+Pass	RadicalExtraAscender
+Pass	RadicalKernAfterDegree
+Pass	RadicalKernBeforeDegree
+Pass	RadicalRuleThickness
+Pass	RadicalVerticalGap

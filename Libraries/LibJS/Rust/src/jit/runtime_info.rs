@@ -28,6 +28,7 @@ use crate::bytecode::executable::{
     MEGAMORPHIC_PRIMARY_ENTRIES_OFFSET, MEGAMORPHIC_SECONDARY_ENTRIES_OFFSET,
 };
 use crate::gc::class::{Class, GcCell};
+use crate::gc::defer_gc::DeferGc;
 use crate::interpreter::runtime_functions::runtime_function_addresses;
 use crate::interpreter::vm::{
     FLY_STRING_CACHE_SIZE, LARGE_NUMERIC_STRING_CACHE_SIZE, NUMERIC_STRING_CACHE_SIZE, NumericStringCacheEntry, Vm,
@@ -445,7 +446,12 @@ const _: () = assert!(size_of::<core::cell::Cell<Option<Gc<PrimitiveString>>>>()
 
 /// The runtime info of a compile job for code of `realm`, with what JIT code needs to allocate cells itself (which
 /// refers to the cells in `allocation.cells`).
-pub fn runtime_info(vm: &Vm, realm: Gc<Realm>, allocation: AllocationInfos) -> RuntimeInfo {
+pub fn runtime_info(
+    vm: &Vm,
+    realm: Gc<Realm>,
+    allocation: AllocationInfos<'_>,
+    _defer_gc: &DeferGc<'_>,
+) -> RuntimeInfo {
     let addresses = vm.jit.runtime_function_addresses();
     let mut layout = runtime_layout();
     layout.try_get_by_id_cache = addresses.try_get_by_id_cache;
@@ -493,6 +499,7 @@ pub fn runtime_info(vm: &Vm, realm: Gc<Realm>, allocation: AllocationInfos) -> R
             0
         },
         array_push: super::calls::libjs_jit_array_push as *const () as u64,
+        array_splice: super::intrinsics::libjs_jit_array_splice as *const () as u64,
         store_holey_element: super::calls::libjs_jit_store_holey_element as *const () as u64,
         slice_arguments: super::calls::libjs_jit_slice_arguments as *const () as u64,
         open_array_iteration: super::intrinsics::libjs_jit_open_array_iteration as *const () as u64,
@@ -521,6 +528,7 @@ pub fn runtime_info(vm: &Vm, realm: Gc<Realm>, allocation: AllocationInfos) -> R
         realm: CellId(realm.as_ptr() as u64),
         array_prototype: CellId(realm.array_prototype().as_ptr() as u64),
         object_prototype: CellId(realm.object_prototype().as_ptr() as u64),
+        array_constructor: CellId(realm.intrinsics().array_constructor(vm).as_ptr() as u64),
         no_yield_continuation: ExecutionContext::NO_YIELD_CONTINUATION,
         heap_region_base: vm.head.heap_region_base.get() as u64,
         heap_region_offset_mask: HEAP_REGION_OFFSET_MASK,

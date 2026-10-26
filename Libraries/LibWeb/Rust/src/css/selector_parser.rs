@@ -6,6 +6,7 @@
 
 //! CSS selector parsing.
 
+use crate::css::ffi_support::OwnedBox;
 use std::sync::Arc;
 
 use super::css_tokenizer::{CssNumberType, ParserTokenKind, TokenizerInput, tokenize_for_parser};
@@ -22,7 +23,8 @@ use super::selector::{
 };
 use super::selector::{
     AttributeSelector, CompiledSelector, CompoundSelector, NameSelector, PseudoClassSelector, PseudoElementSelector,
-    PseudoElementValue, QualifiedName, SelectorList, SimpleSelector,
+    PseudoElementValue, QualifiedName, SelectorList, SimpleSelector, TransitionNameAndClassSelector,
+    TransitionNameSelector,
 };
 use super::selector::{RustSelector, search_text_match_filter};
 
@@ -464,6 +466,46 @@ impl<'a> SelectorParser<'a> {
                 [] => {}
                 [filter] if search_text_match_filter(filter).is_some() => {}
                 _ => return Err(()),
+            }
+        }
+        for compound in &compounds {
+            let Some(SimpleSelector::PseudoElement(pseudo_element)) = compound.simple_selectors.first() else {
+                continue;
+            };
+            // https://drafts.csswg.org/css-pseudo-4/#highlight-selectors
+            // INTEROP: Selectors 4 allows logical combination and user action pseudo-classes after any
+            //          pseudo-element, but browsers reject every simple selector after a highlight pseudo-element.
+            //          ::search-text is checked above, as it allows :current.
+            if matches!(
+                pseudo_element.pseudo_element,
+                PseudoElementType::Highlight | PseudoElementType::Selection | PseudoElementType::SpellingError
+            ) && compound.simple_selectors.len() > 1
+            {
+                return Err(());
+            }
+            // https://drafts.csswg.org/css-view-transitions-1/#pseudo-root
+            // If a descendant pseudo of a pseudo-element root has no other siblings, then :only-child matches that
+            // pseudo.
+            // INTEROP: Selectors 4 allows logical combination and user action pseudo-classes after any
+            //          pseudo-element, but browsers reject every pseudo-class other than :only-child after a view
+            //          transition pseudo-element, and none at all after ::view-transition.
+            let allows_only_child = match pseudo_element.pseudo_element {
+                PseudoElementType::ViewTransition => false,
+                PseudoElementType::ViewTransitionGroup
+                | PseudoElementType::ViewTransitionImagePair
+                | PseudoElementType::ViewTransitionNew
+                | PseudoElementType::ViewTransitionOld => true,
+                _ => continue,
+            };
+            let is_only_child = |simple_selector: &SimpleSelector| {
+                matches!(simple_selector, SimpleSelector::PseudoClass(pseudo_class)
+                    if pseudo_class.pseudo_class == PseudoClassType::OnlyChild)
+            };
+            if !compound.simple_selectors[1..]
+                .iter()
+                .all(|simple_selector| allows_only_child && is_only_child(simple_selector))
+            {
+                return Err(());
             }
         }
         Ok(CompiledSelector::new(compounds.into_boxed_slice()))
@@ -971,6 +1013,20 @@ impl<'a> SelectorParser<'a> {
                     compound,
                 ]))))
             }
+            // https://drafts.csswg.org/css-pseudo-4/#typedef-highlight-name-selector
+            // <highlight-name-selector> = '*' | <custom-ident>
+            // FIXME: Support the '*' argument, which selects every custom highlight.
+            PseudoElementParameterType::HighlightNameSelector => {
+                let name = stream.next().and_then(ComponentValue::ident).ok_or(())?;
+                if is_css_wide_keyword(name) || ascii_eq(name, "default") {
+                    return Err(());
+                }
+                stream.discard_whitespace();
+                if !stream.is_empty() {
+                    return Err(());
+                }
+                Ok(PseudoElementValue::Identifiers(Box::new([name.into()])))
+            }
             PseudoElementParameterType::IdentList => {
                 let mut identifiers = Vec::new();
                 while !stream.is_empty() {
@@ -982,22 +1038,51 @@ impl<'a> SelectorParser<'a> {
                 }
                 Ok(PseudoElementValue::Identifiers(identifiers.into_boxed_slice()))
             }
-            PseudoElementParameterType::PTNameSelector => {
-                let (is_universal, value) = if stream.peek().is_some_and(|value| value.is_delim(b'*')) {
-                    stream.position += 1;
-                    (true, SelectorString::default())
-                } else {
-                    let ident = stream.next().and_then(ComponentValue::ident).ok_or(())?;
+            // https://drafts.csswg.org/css-view-transitions-2/#typedef-pt-name-and-class-selector
+            // <pt-name-and-class-selector> = <pt-name-selector> <pt-class-selector>? | <pt-class-selector>
+            // <pt-class-selector> = ['.' <custom-ident>]+
+            // When interpreting the above grammar, white space is forbidden:
+            // * Between <pt-name-selector> and <pt-class-selector>
+            // * Between any of the components of <pt-class-selector>.
+            PseudoElementParameterType::PTNameAndClassSelector => {
+                fn custom_ident(value: Option<&ComponentValue>) -> Result<SelectorString, ()> {
+                    let ident = value.and_then(ComponentValue::ident).ok_or(())?;
                     if is_css_wide_keyword(ident) || ascii_eq(ident, "default") {
                         return Err(());
                     }
-                    (false, ident.into())
+                    Ok(ident.into())
+                }
+
+                // https://drafts.csswg.org/css-view-transitions-1/#typedef-pt-name-selector
+                // <pt-name-selector> = '*' | <custom-ident>
+                let name = if stream.peek().is_some_and(|value| value.is_delim(b'*')) {
+                    stream.position += 1;
+                    Some(TransitionNameSelector::Universal)
+                } else if stream.peek().is_some_and(|value| value.ident().is_some()) {
+                    Some(TransitionNameSelector::Name(custom_ident(stream.next())?))
+                } else {
+                    None
                 };
+
+                let mut classes = Vec::new();
+                while stream.peek().is_some_and(|value| value.is_delim(b'.')) {
+                    stream.position += 1;
+                    classes.push(custom_ident(stream.next())?);
+                }
+                if name.is_none() && classes.is_empty() {
+                    return Err(());
+                }
+
                 stream.discard_whitespace();
                 if !stream.is_empty() {
                     return Err(());
                 }
-                Ok(PseudoElementValue::TransitionName { is_universal, value })
+                Ok(PseudoElementValue::TransitionName(Box::new(
+                    TransitionNameAndClassSelector {
+                        name,
+                        classes: classes.into_boxed_slice(),
+                    },
+                )))
             }
         }
     }
@@ -1245,19 +1330,16 @@ pub(crate) unsafe fn selector_parse(
     .map_or(std::ptr::null_mut(), |selectors| Box::into_raw(Box::new(selectors)))
 }
 
-/// # Safety
-/// Input and the optional immutable namespace context must be readable for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_selector_parse_with_namespace_context(
+pub extern "C" fn rust_selector_parse_with_namespace_context(
     input: FfiUtf16View,
-    namespaces: *const std::ffi::c_void,
+    namespaces: Option<&crate::css::rule::NativeNamespaceContext>,
     is_relative: bool,
     is_forgiving: bool,
 ) -> *mut RustParsedSelectorList {
     let Some(input) = input.units() else {
         return std::ptr::null_mut();
     };
-    let namespaces = unsafe { namespaces.cast::<crate::css::rule::NativeNamespaceContext>().as_ref() };
     let namespaces: Vec<_> = namespaces
         .into_iter()
         .flat_map(|namespaces| namespaces.prefixes.iter())
@@ -1357,15 +1439,9 @@ pub extern "C" fn rust_selector_parse_pseudo_element(input: FfiUtf16View) -> Ffi
     }
 }
 
-/// # Safety
-/// `list` must be null or an owned selector list that has not been destroyed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parsed_selector_list_destroy(list: *mut RustParsedSelectorList) {
-    unsafe {
-        if !list.is_null() {
-            drop(Box::from_raw(list));
-        }
-    }
+pub extern "C" fn rust_parsed_selector_list_destroy(list: OwnedBox<RustParsedSelectorList>) {
+    drop(list);
 }
 
 #[unsafe(no_mangle)]

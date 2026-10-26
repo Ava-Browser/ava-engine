@@ -99,6 +99,27 @@ const NONNEGATIVE_LENGTH_RANGE: &[NumericRangeOverride] = &[NumericRangeOverride
     max: f32::MAX as f64,
 }];
 
+// https://svgwg.org/svg2-draft/painting.html#StrokeDashing
+// If any value in the list is negative, the <dasharray> value is invalid.
+// NB: So the values that interpolating dash lists produces are clamped to be non-negative.
+const STROKE_DASHARRAY_RANGES: &[NumericRangeOverride] = &[
+    NumericRangeOverride {
+        value_type: VALUE_TYPE_LENGTH,
+        min: 0.0,
+        max: f32::MAX as f64,
+    },
+    NumericRangeOverride {
+        value_type: VALUE_TYPE_PERCENTAGE,
+        min: 0.0,
+        max: f32::MAX as f64,
+    },
+    NumericRangeOverride {
+        value_type: VALUE_TYPE_NUMBER,
+        min: 0.0,
+        max: f32::MAX as f64,
+    },
+];
+
 #[repr(C)]
 pub struct FfiAnimationValueResult {
     pub value: *const StyleValueData,
@@ -347,6 +368,8 @@ pub(crate) struct AnimationPreparationInputs {
 
 pub(crate) struct ComputedAnimationBatch<'a> {
     pub(crate) context: FfiAnimationContext<'a>,
+    /// The device pixel ratio that animated border widths are snapped to.
+    pub(crate) device_pixels_per_css_pixel: f64,
     pub(crate) sampled_effects: &'a [FfiSampledAnimationEffect],
     /// The identities of the custom-property environments of the element and of the one it
     /// inherits from, which a preparation that substituted keyframe values against the element was
@@ -784,7 +807,6 @@ struct AnimationKeyframePlan {
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiCompositeOperation {
     Replace,
     Add,
@@ -1394,18 +1416,37 @@ fn retained_calculation(
 fn retained_length_percentage_calculation(
     calculation: Arc<crate::css::calc::CalcNode>,
     resolved_type: crate::css::calc::FfiNumericType,
+    range_overrides: &[NumericRangeOverride],
 ) -> RetainedStyleValueData {
+    let range = |value_type: u8| {
+        range_overrides
+            .iter()
+            .find(|range| range.value_type == value_type)
+            .map(|range| (range.min, range.max))
+    };
     let value = match &*calculation {
         crate::css::calc::CalcNode::Numeric(crate::css::calc::CalcNumericValue::Length { value, unit }) => {
             StyleValueData::Length {
-                value: *value,
+                value: clamp_to_range(*value, range(VALUE_TYPE_LENGTH)),
                 unit: *unit,
             }
         }
         crate::css::calc::CalcNode::Numeric(crate::css::calc::CalcNumericValue::Percentage(value)) => {
-            StyleValueData::Percentage { value: *value }
+            StyleValueData::Percentage {
+                value: clamp_to_range(*value, range(VALUE_TYPE_PERCENTAGE)),
+            }
         }
-        _ => crate::css::calc::length_percentage_calculated_style_value(calculation, resolved_type),
+        _ => {
+            let mut value = crate::css::calc::length_percentage_calculated_style_value(calculation, resolved_type);
+            if let StyleValueData::Calculated { accepted_ranges, .. } = &mut value {
+                *accepted_ranges = crate::css::style_value::RetainedNumericRangeList::from_numeric_ranges(
+                    [VALUE_TYPE_LENGTH, VALUE_TYPE_PERCENTAGE]
+                        .into_iter()
+                        .filter_map(|value_type| range(value_type).map(|(min, max)| (value_type, min, max))),
+                );
+            }
+            value
+        }
     };
     RetainedStyleValueData::from_arc(Arc::new(value))
 }
@@ -1444,7 +1485,7 @@ fn interpolate_translate_component(
     let from = length_percentage_calculation_node(from)?;
     let to = length_percentage_calculation_node(to)?;
     let (calculation, resolved_type) = crate::css::calc::interpolate_length_percentage_calculations(from, to, delta)?;
-    Some(retained_length_percentage_calculation(calculation, resolved_type))
+    Some(retained_length_percentage_calculation(calculation, resolved_type, &[]))
 }
 
 fn decode_translate_components(value: &StyleValueData) -> Option<Vec<RetainedStyleValueData>> {
@@ -1888,7 +1929,7 @@ fn composite_grid_component(
     {
         // https://drafts.csswg.org/css-values-4/#combine-mixed
         // Addition of <percentage> is defined the same as interpolation except by adding each component rather than interpolating it.
-        return retained_length_percentage_calculation(calculation, resolved_type);
+        return retained_length_percentage_calculation(calculation, resolved_type, &[]);
     }
 
     animated.clone_retained()
@@ -3508,7 +3549,7 @@ fn composite_scalar_value(
     {
         // https://drafts.csswg.org/css-values-4/#combine-mixed
         // Addition of <percentage> is defined the same as interpolation except by adding each component rather than interpolating it.
-        return handled_retained_value(retained_length_percentage_calculation(calculation, resolved_type));
+        return handled_retained_value(retained_length_percentage_calculation(calculation, resolved_type, &[]));
     }
 
     match (underlying, animated) {
@@ -4177,7 +4218,11 @@ fn interpolate_scalar_value(
         && let Some((calculation, resolved_type)) =
             crate::css::calc::interpolate_length_percentage_calculations(from, to, delta)
     {
-        return handled_retained_value(retained_length_percentage_calculation(calculation, resolved_type));
+        return handled_retained_value(retained_length_percentage_calculation(
+            calculation,
+            resolved_type,
+            range_overrides,
+        ));
     }
 
     match (from, to) {
@@ -6588,7 +6633,11 @@ fn interpolate_shadow(
     else {
         return None;
     };
-    if from_shadow_type != to_shadow_type {
+    // https://drafts.csswg.org/web-animations-1/#animating-shadow-lists
+    // However, if both input shadows are inset or both input shadows are not inset, then the interpolated shadow must
+    // match the input shadows in that regard. If any pair of input shadows has one inset and the other not inset, the
+    // entire shadow-list uses discrete animation.
+    if from_shadow_type != to_shadow_type || from_placement != to_placement {
         return None;
     }
 
@@ -6651,7 +6700,175 @@ fn interpolate_shadow(
         offset_y,
         blur_radius,
         spread_distance,
-        placement: if delta >= 0.5 { *to_placement } else { *from_placement },
+        placement: *from_placement,
+    })
+}
+
+fn shadow_list_entries(value: &StyleValueData) -> Option<(Vec<RetainedStyleValueData>, u8, bool)> {
+    // https://drafts.csswg.org/web-animations-1/#animating-shadow-lists
+    // Each shadow in the list (treating none as a 0-length list) is interpolated component-wise as with by computed
+    // value behavior.
+    match value {
+        StyleValueData::Keyword { keyword } if *keyword == crate::css::style_compute::none_keyword() => {
+            Some((Vec::new(), 0, false))
+        }
+        StyleValueData::ValueList {
+            values,
+            separator,
+            collapsible,
+        } => Some((
+            values
+                .as_slice()
+                .iter()
+                .map(RetainedStyleValueData::clone_retained)
+                .collect(),
+            *separator,
+            *collapsible,
+        )),
+        _ => None,
+    }
+}
+
+fn pad_shadow_lists(first: &mut Vec<RetainedStyleValueData>, second: &mut Vec<RetainedStyleValueData>) -> bool {
+    // https://drafts.csswg.org/web-animations-1/#animating-shadow-lists
+    // If the lists of shadows have different lengths, then the shorter list is padded at the end with shadows whose
+    // color is transparent, whose lengths are all 0, and whose inset (or not) matches the longer list.
+    while first.len() < second.len() {
+        let Some(shadow) = blank_shadow(second[first.len()].data()) else {
+            return false;
+        };
+        first.push(shadow);
+    }
+    while second.len() < first.len() {
+        let Some(shadow) = blank_shadow(first[second.len()].data()) else {
+            return false;
+        };
+        second.push(shadow);
+    }
+    true
+}
+
+fn accumulate_shadow(
+    context: &FfiAnimationContext,
+    underlying: &StyleValueData,
+    animated: &StyleValueData,
+) -> Option<StyleValueData> {
+    let (
+        StyleValueData::Shadow {
+            shadow_type: underlying_shadow_type,
+            color: underlying_color,
+            offset_x: underlying_offset_x,
+            offset_y: underlying_offset_y,
+            blur_radius: underlying_blur_radius,
+            spread_distance: underlying_spread_distance,
+            placement: underlying_placement,
+        },
+        StyleValueData::Shadow {
+            shadow_type: animated_shadow_type,
+            color: animated_color,
+            offset_x: animated_offset_x,
+            offset_y: animated_offset_y,
+            blur_radius: animated_blur_radius,
+            spread_distance: animated_spread_distance,
+            placement: animated_placement,
+        },
+    ) = (underlying, animated)
+    else {
+        return None;
+    };
+    if underlying_shadow_type != animated_shadow_type || underlying_placement != animated_placement {
+        return None;
+    }
+
+    let resolve_length = |value: &RetainedStyleValueData| match value.optional_data() {
+        Some(value) => resolve_animation_length(Some(context), value),
+        None => Some(0.0),
+    };
+    let add_lengths = |underlying: &RetainedStyleValueData, animated: &RetainedStyleValueData| {
+        Some(retained_length(
+            resolve_length(underlying)? + resolve_length(animated)?,
+            crate::css::style_compute::px_length_unit(),
+        ))
+    };
+    let underlying_color = resolve_animation_color(Some(context), underlying_color)?;
+    let animated_color = resolve_animation_color(Some(context), animated_color)?;
+    let color = composite_scalar_value(
+        underlying_color.data(),
+        animated_color.data(),
+        FfiCompositeOperation::Accumulate,
+    )
+    .into_value()?;
+
+    Some(StyleValueData::Shadow {
+        shadow_type: *underlying_shadow_type,
+        color,
+        offset_x: add_lengths(underlying_offset_x, animated_offset_x)?,
+        offset_y: add_lengths(underlying_offset_y, animated_offset_y)?,
+        blur_radius: add_lengths(underlying_blur_radius, animated_blur_radius)?,
+        spread_distance: if underlying_spread_distance.optional_data().is_some()
+            || animated_spread_distance.optional_data().is_some()
+        {
+            add_lengths(underlying_spread_distance, animated_spread_distance)?
+        } else {
+            empty_retained_style_value()
+        },
+        placement: *underlying_placement,
+    })
+}
+
+fn composite_shadow_list(
+    context: &FfiAnimationContext,
+    underlying: &StyleValueData,
+    animated: &StyleValueData,
+    operation: FfiCompositeOperation,
+) -> AnimationValueResult {
+    let (
+        Some((mut underlying_shadows, underlying_separator, underlying_collapsible)),
+        Some((mut animated_shadows, animated_separator, animated_collapsible)),
+    ) = (shadow_list_entries(underlying), shadow_list_entries(animated))
+    else {
+        return handled_without_value();
+    };
+    let (separator, collapsible) = if underlying_shadows.is_empty() {
+        (animated_separator, animated_collapsible)
+    } else {
+        (underlying_separator, underlying_collapsible)
+    };
+
+    let shadows = match operation {
+        FfiCompositeOperation::Replace => return handled_without_value(),
+        FfiCompositeOperation::Add => {
+            // https://drafts.csswg.org/web-animations-1/#animating-shadow-lists
+            // Addition of two shadow lists Va and Vb is defined as list concatenation such that Vresult is equal to Va
+            // extended with Vb.
+            underlying_shadows.extend(animated_shadows);
+            underlying_shadows
+        }
+        FfiCompositeOperation::Accumulate => {
+            // https://drafts.csswg.org/web-animations-1/#animating-shadow-lists
+            // Accumulation of shadow lists follows the matching rules for interpolation above, performing addition on
+            // each component according to its type, or falling back to discrete animation if the inset values do not
+            // match.
+            if !pad_shadow_lists(&mut underlying_shadows, &mut animated_shadows) {
+                return handled_without_value();
+            }
+            let mut shadows = Vec::with_capacity(underlying_shadows.len());
+            for (underlying_shadow, animated_shadow) in underlying_shadows.iter().zip(&animated_shadows) {
+                let Some(shadow) = accumulate_shadow(context, underlying_shadow.data(), animated_shadow.data()) else {
+                    return handled_without_value();
+                };
+                shadows.push(RetainedStyleValueData::from_arc(Arc::new(shadow)));
+            }
+            shadows
+        }
+    };
+    if shadows.is_empty() {
+        return handled_retained_value(retained_none_keyword());
+    }
+    owned(StyleValueData::ValueList {
+        values: RetainedStyleValueDataList::from_retained_values(shadows),
+        separator,
+        collapsible,
     })
 }
 
@@ -6666,46 +6883,16 @@ fn interpolate_shadow_list(
     // Animation type: by computed value, treating none as a zero-item list and appending blank shadows
     //                 (transparent 0 0 0 0) with a corresponding inset keyword as needed to match the longer list if
     //                 the shorter list is otherwise compatible with the longer one
-    let list = |value: &StyleValueData| -> Option<(Vec<RetainedStyleValueData>, u8, bool)> {
-        match value {
-            StyleValueData::Keyword { keyword } if *keyword == crate::css::style_compute::none_keyword() => {
-                Some((Vec::new(), 0, false))
-            }
-            StyleValueData::ValueList {
-                values,
-                separator,
-                collapsible,
-            } => Some((
-                values
-                    .as_slice()
-                    .iter()
-                    .map(RetainedStyleValueData::clone_retained)
-                    .collect(),
-                *separator,
-                *collapsible,
-            )),
-            _ => None,
-        }
-    };
-    let Some((mut from_shadows, from_separator, from_collapsible)) = list(from) else {
+    let Some((mut from_shadows, from_separator, from_collapsible)) = shadow_list_entries(from) else {
         return not_handled();
     };
-    let Some((mut to_shadows, to_separator, to_collapsible)) = list(to) else {
+    let Some((mut to_shadows, to_separator, to_collapsible)) = shadow_list_entries(to) else {
         return not_handled();
     };
     let from_was_empty = from_shadows.is_empty();
 
-    while from_shadows.len() < to_shadows.len() {
-        let Some(shadow) = blank_shadow(to_shadows[from_shadows.len()].data()) else {
-            return not_handled();
-        };
-        from_shadows.push(shadow);
-    }
-    while to_shadows.len() < from_shadows.len() {
-        let Some(shadow) = blank_shadow(from_shadows[to_shadows.len()].data()) else {
-            return not_handled();
-        };
-        to_shadows.push(shadow);
+    if !pad_shadow_lists(&mut from_shadows, &mut to_shadows) {
+        return not_handled();
     }
 
     let mut shadows = Vec::with_capacity(from_shadows.len());
@@ -7216,6 +7403,124 @@ fn interpolate_filter_list(
     })
 }
 
+fn is_four_sided_property(property_id: u16) -> bool {
+    matches!(
+        property_id,
+        crate::css::property_metadata::property_id::BORDER_IMAGE_OUTSET
+            | crate::css::property_metadata::property_id::BORDER_IMAGE_WIDTH
+    )
+}
+
+/// The top, right, bottom and left components of a value given as one to four sides.
+fn expand_four_sides(value: &StyleValueData) -> Option<[RetainedStyleValueData; 4]> {
+    // https://drafts.csswg.org/css-backgrounds/#border-image-outset
+    // Computed value: four values, each a number or absolute length
+    // https://drafts.csswg.org/css-backgrounds/#border-image-width
+    // Computed value: four values, each either a number, the keyword auto, or a computed <length-percentage> value
+    let sides = match value {
+        StyleValueData::ValueList {
+            values, separator: 0, ..
+        } => values.as_slice(),
+        StyleValueData::ValueList { .. } => return None,
+        _ => {
+            let side = RetainedStyleValueData::from_arc(Arc::new(value.clone()));
+            return Some([side.clone(), side.clone(), side.clone(), side]);
+        }
+    };
+    // https://drafts.csswg.org/css-backgrounds/#border-image-outset
+    // If there is only one component value, it applies to all sides. If there are two values, the top and bottom are
+    // set to the first value and the right and left are set to the second. If there are three values, the top is set
+    // to the first value, the left and right are set to the second, and the bottom is set to the third. If there are
+    // four values they apply to the top, right, bottom, and left, respectively.
+    let (top, right, bottom, left) = match sides {
+        [all] => (all, all, all, all),
+        [vertical, horizontal] => (vertical, horizontal, vertical, horizontal),
+        [top, horizontal, bottom] => (top, horizontal, bottom, horizontal),
+        [top, right, bottom, left] => (top, right, bottom, left),
+        _ => return None,
+    };
+    Some([top.clone(), right.clone(), bottom.clone(), left.clone()])
+}
+
+/// Builds the shortest one to four value list that expands to the given sides.
+fn shortest_four_sides(sides: [RetainedStyleValueData; 4]) -> StyleValueData {
+    let [top, right, bottom, left] = sides;
+    let mut values = vec![top, right, bottom, left];
+    if values[3].data() == values[1].data() {
+        values.pop();
+        if values[2].data() == values[0].data() {
+            values.pop();
+            if values[1].data() == values[0].data() {
+                values.pop();
+            }
+        }
+    }
+    if values.len() == 1 {
+        return values.pop().unwrap().data().clone();
+    }
+    StyleValueData::ValueList {
+        values: RetainedStyleValueDataList::from_retained_values(values),
+        separator: 0,
+        collapsible: true,
+    }
+}
+
+fn combine_four_sides(
+    from: &StyleValueData,
+    to: &StyleValueData,
+    combine: impl Fn(&StyleValueData, &StyleValueData) -> AnimationValueResult,
+) -> Option<AnimationValueResult> {
+    let (Some(from_sides), Some(to_sides)) = (expand_four_sides(from), expand_four_sides(to)) else {
+        return None;
+    };
+    let mut sides = Vec::with_capacity(4);
+    for (from_side, to_side) in from_sides.iter().zip(&to_sides) {
+        let result = combine(from_side.data(), to_side.data());
+        if !result.handled {
+            return None;
+        }
+        let Some(value) = result.value else {
+            return Some(handled_without_value());
+        };
+        sides.push(value);
+    }
+    let sides: [RetainedStyleValueData; 4] = sides.try_into().ok()?;
+    Some(owned(shortest_four_sides(sides)))
+}
+
+fn combine_scrollbar_color(
+    context: Option<&FfiAnimationContext>,
+    from: &StyleValueData,
+    to: &StyleValueData,
+    combine: impl Fn(&StyleValueData, &StyleValueData) -> AnimationValueResult,
+) -> Option<StyleValueData> {
+    // https://drafts.csswg.org/css-scrollbars/#scrollbar-color
+    // Computed value: specified keyword or two computed colors
+    // Animation type: by computed value
+    let (
+        StyleValueData::ScrollbarColor {
+            thumb_color: from_thumb_color,
+            track_color: from_track_color,
+        },
+        StyleValueData::ScrollbarColor {
+            thumb_color: to_thumb_color,
+            track_color: to_track_color,
+        },
+    ) = (from, to)
+    else {
+        return None;
+    };
+    let combine_colors = |from: &RetainedStyleValueData, to: &RetainedStyleValueData| {
+        let from = resolve_animation_color(context, from)?;
+        let to = resolve_animation_color(context, to)?;
+        combine(from.data(), to.data()).into_value()
+    };
+    Some(StyleValueData::ScrollbarColor {
+        thumb_color: combine_colors(from_thumb_color, to_thumb_color)?,
+        track_color: combine_colors(from_track_color, to_track_color)?,
+    })
+}
+
 pub(crate) fn interpolate_value(
     context: Option<&FfiAnimationContext>,
     property_id: u16,
@@ -7353,7 +7658,12 @@ pub(crate) fn interpolate_value(
         for index in 0..list_size {
             let from_value = from_list.map_or(from, |(values, _, _)| values[index % from_length].data());
             let to_value = to_list.map_or(to, |(values, _, _)| values[index % to_length].data());
-            let result = interpolate_scalar_value(property_id, from_value, to_value, delta, &[]);
+            let ranges = if is_stroke_dasharray {
+                STROKE_DASHARRAY_RANGES
+            } else {
+                &[]
+            };
+            let result = interpolate_scalar_value(property_id, from_value, to_value, delta, ranges);
             let Some(result_value) = result.into_value() else {
                 return discrete_value(context, from, to, delta);
             };
@@ -7538,7 +7848,21 @@ pub(crate) fn interpolate_value(
         return discrete_value(context, from, to, delta);
     }
     assert_eq!(animation_type, ANIMATION_TYPE_BY_COMPUTED_VALUE);
-    let result = interpolate_scalar_value(property_id, from, to, delta, &[]);
+    if property_id == crate::css::property_metadata::property_id::SCROLLBAR_COLOR
+        && let Some(value) = combine_scrollbar_color(context, from, to, |from, to| {
+            interpolate_scalar_value(property_id, from, to, delta, &[])
+        })
+    {
+        return owned(value);
+    }
+    let result = if is_four_sided_property(property_id) {
+        combine_four_sides(from, to, |from, to| {
+            interpolate_scalar_value(property_id, from, to, delta, &[])
+        })
+        .unwrap_or_else(not_handled)
+    } else {
+        interpolate_scalar_value(property_id, from, to, delta, &[])
+    };
     // https://drafts.csswg.org/web-animations-1/#by-computed-value
     // If the number of components or the types of corresponding components do not match, or if any component value uses discrete animation and the two corresponding values do not match, then the property values combine as discrete.
     if !result.handled || result.value.is_none() && context.is_some_and(|context| context.allow_discrete) {
@@ -7575,6 +7899,26 @@ fn composite_batch_value<'a>(
     ) {
         composite_filter_list(context, underlying, animated, operation)
     } else if matches!(operation, FfiCompositeOperation::Replace) {
+        handled_without_value()
+    } else if matches!(
+        property_id,
+        crate::css::property_metadata::property_id::BOX_SHADOW
+            | crate::css::property_metadata::property_id::TEXT_SHADOW
+    ) {
+        composite_shadow_list(context, underlying, animated, operation)
+    } else if property_id == crate::css::property_metadata::property_id::SCROLLBAR_COLOR {
+        combine_scrollbar_color(Some(context), underlying, animated, |underlying, animated| {
+            composite_scalar_value(underlying, animated, operation)
+        })
+        .map_or_else(handled_without_value, owned)
+    } else if is_four_sided_property(property_id) {
+        combine_four_sides(underlying, animated, |underlying, animated| {
+            composite_scalar_value(underlying, animated, operation)
+        })
+        .unwrap_or_else(handled_without_value)
+    } else if property_id == crate::css::property_metadata::property_id::STROKE_DASHARRAY {
+        // https://svgwg.org/svg2-draft/painting.html#StrokeDashing
+        // stroke-dasharray values are not additive.
         handled_without_value()
     } else if property_id == crate::css::property_metadata::property_id::OFFSET_PATH {
         composite_offset_path(underlying, animated, operation).map_or_else(handled_without_value, owned)
@@ -8295,6 +8639,41 @@ pub(crate) fn animation_preparation_matches(
         .is_some_and(|preparation| preparation.key.matches(sampled, custom_property_environments))
 }
 
+fn snap_animated_border_width(
+    property_id: u16,
+    value: RetainedStyleValueData,
+    device_pixels_per_css_pixel: f64,
+) -> RetainedStyleValueData {
+    use crate::css::property_metadata::property_id as prop;
+    // https://drafts.csswg.org/css-backgrounds/#border-width
+    // Computed value: absolute length, snapped as a border width
+    // NB: An animated value is a computed value too, so it is snapped like one.
+    if !matches!(
+        property_id,
+        prop::BORDER_BOTTOM_WIDTH
+            | prop::BORDER_LEFT_WIDTH
+            | prop::BORDER_RIGHT_WIDTH
+            | prop::BORDER_TOP_WIDTH
+            | prop::COLUMN_RULE_WIDTH
+            | prop::OUTLINE_WIDTH
+    ) || device_pixels_per_css_pixel <= 0.0
+    {
+        return value;
+    }
+    let Some(StyleValueData::Length { value: length, unit }) = value.optional_data() else {
+        return value;
+    };
+    if *unit != crate::css::style_compute::px_length_unit() || *length < 0.0 {
+        return value;
+    }
+    let snapped = crate::css::style_compute::snap_a_length_as_a_border_width(
+        device_pixels_per_css_pixel,
+        crate::css::css_pixels::CssPixels::nearest_value_for(*length),
+    )
+    .to_double();
+    retained_length(snapped, *unit)
+}
+
 /// Complete the Rust-owned animation plan and compose every interval without
 /// consulting C++ or the DOM. On the first sample this consumes the declarations and keyframe
 /// values the batch carries. Later samples can reuse that preparation from the animated overlay.
@@ -8304,6 +8683,7 @@ pub(crate) fn evaluate_animations(batch: ComputedAnimationBatch<'_>) -> Vec<(u32
     crate::css::ffi_stats::note_animation_evaluation();
     let ComputedAnimationBatch {
         context: sample_context,
+        device_pixels_per_css_pixel,
         sampled_effects: sampled,
         custom_property_environments,
         cache_preparation,
@@ -8425,6 +8805,7 @@ pub(crate) fn evaluate_animations(batch: ComputedAnimationBatch<'_>) -> Vec<(u32
         }
         if let Some(value) = result.value {
             previous_values.push((input.property_id, input.custom_name_id, value.clone()));
+            let value = snap_animated_border_width(input.property_id, value, device_pixels_per_css_pixel);
             overlay.set_owned(input.property_id, value, false, input.result_of_transition);
         } else {
             let value = RetainedStyleValueData::from_owned(StyleValueData::Keyword {

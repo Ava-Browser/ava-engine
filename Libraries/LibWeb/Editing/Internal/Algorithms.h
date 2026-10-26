@@ -8,6 +8,7 @@
 
 #include <AK/Utf16FlyString.h>
 #include <AK/Vector.h>
+#include <LibGC/RootVector.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Selection/Selection.h>
@@ -63,14 +64,19 @@ void canonicalize_collapsed_selection_for_editing(Selection&);
 void canonicalize_whitespace(DOM::BoundaryPoint, bool fix_collapsed_space = true);
 void canonicalize_whitespace_after_selection_replacement(DOM::BoundaryPoint);
 void canonicalize_whitespace_after_node_insertion(DOM::BoundaryPoint);
-Vector<GC::Ref<DOM::Node>> clear_the_value(Utf16FlyString const&, GC::Ref<DOM::Element>);
+void rebalance_whitespace_in_text_node(DOM::Text&, size_t offset);
+Vector<size_t> remove_collapsed_spaces_in_text_node(DOM::Text&, size_t offset);
+bool text_preserves_spaces(DOM::Text&);
+size_t offset_after_removing(Vector<size_t> const& removed_offsets, size_t offset);
+bool white_space_is_from_default_style(GC::Ref<DOM::Node>);
+GC::RootVector<GC::Ref<DOM::Node>> clear_the_value(Utf16FlyString const&, GC::Ref<DOM::Element>);
 void delete_the_selection(Selection&, bool block_merging = true, bool strip_wrappers = true, Selection::Direction = Selection::Direction::Forwards);
 Optional<Utf16String> effective_command_value(GC::Ptr<DOM::Node>, Utf16FlyString const& command);
 DOM::BoundaryPoint first_equivalent_point(DOM::BoundaryPoint);
 void fix_disallowed_ancestors_of_node(GC::Ref<DOM::Node>);
 bool follows_a_line_break(GC::Ref<DOM::Node>);
 void force_the_value(GC::Ref<DOM::Node>, Utf16FlyString const&, Optional<Utf16View>);
-void indent(Vector<GC::Ref<DOM::Node>>);
+void indent(GC::RootVector<GC::Ref<DOM::Node>>);
 bool is_allowed_child_of_node(Variant<GC::Ref<DOM::Node>, Utf16FlyString> child, Variant<GC::Ref<DOM::Node>, Utf16FlyString> parent);
 bool is_block_boundary_point(DOM::BoundaryPoint);
 bool is_block_end_point(DOM::BoundaryPoint);
@@ -82,6 +88,12 @@ struct ParagraphBounds {
     WebIDL::UnsignedLong end_offset { 0 };
 };
 ParagraphBounds paragraph_bounds_containing(DOM::Text&, WebIDL::UnsignedLong offset);
+struct CaretTextPosition {
+    GC::Ref<DOM::Text> text;
+    size_t offset { 0 };
+    bool is_collapsed { false };
+};
+Optional<CaretTextPosition> caret_text_position(DOM::Document&);
 GC::Ref<DOM::Range> paragraph_range_containing(DOM::Text&, WebIDL::UnsignedLong offset);
 bool is_block_start_point(DOM::BoundaryPoint);
 bool is_collapsed_block_prop(GC::Ref<DOM::Node>);
@@ -92,6 +104,7 @@ bool is_element_with_inline_contents(GC::Ref<DOM::Node>);
 bool is_extraneous_line_break(GC::Ref<DOM::Node>);
 Optional<Utf16FlyString const&> formattable_block_name_from_utf16(Utf16View);
 bool is_formattable_block_name(Utf16FlyString const&);
+bool is_additional_formattable_block_name(Utf16FlyString const&);
 bool is_formattable_node(GC::Ref<DOM::Node>);
 bool is_in_same_editing_host(GC::Ref<DOM::Node>, GC::Ref<DOM::Node>);
 bool is_indentation_element(GC::Ref<DOM::Node>);
@@ -120,6 +133,7 @@ bool precedes_a_line_break(GC::Ref<DOM::Node>);
 Optional<DOM::BoundaryPoint> previous_equivalent_point(DOM::BoundaryPoint);
 void push_down_values(Utf16FlyString const&, GC::Ref<DOM::Node>, Optional<Utf16View>);
 Vector<RecordedOverride> record_current_overrides(DOM::Document const&);
+void restore_overrides_that_add_formatting(DOM::Document&, Vector<RecordedOverride> const&);
 Vector<RecordedOverride> record_current_states_and_values(DOM::Document const&);
 GC::ConservativeVector<RecordedNodeValue> record_the_values_of_nodes(Vector<GC::Ref<DOM::Node>> const&);
 void remove_extraneous_line_breaks_at_the_end_of_node(GC::Ref<DOM::Node>);
@@ -139,7 +153,7 @@ Utf16String standard_inline_value(DOM::Document const&, Utf16FlyString const& co
 void toggle_lists(DOM::Document&, Utf16FlyString const&);
 bool values_are_equivalent(Utf16FlyString const&, Optional<Utf16View>, Optional<Utf16View>);
 bool values_are_loosely_equivalent(Utf16FlyString const&, Optional<Utf16View>, Optional<Utf16View>);
-GC::Ptr<DOM::Node> wrap(Vector<GC::Ref<DOM::Node>>, Function<bool(GC::Ref<DOM::Node>)> sibling_criteria, Function<GC::Ptr<DOM::Node>()> new_parent_instructions);
+GC::Ptr<DOM::Node> wrap(GC::RootVector<GC::Ref<DOM::Node>>, Function<bool(GC::Ref<DOM::Node>)> sibling_criteria, Function<GC::Ptr<DOM::Node>()> new_parent_instructions);
 
 // Utility methods:
 

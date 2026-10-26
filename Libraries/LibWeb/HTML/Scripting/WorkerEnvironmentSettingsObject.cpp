@@ -11,9 +11,11 @@
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
+#include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/Scripting/WorkerEnvironmentSettingsObject.h>
 #include <LibWeb/HTML/WorkerGlobalScope.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/UpgradeInsecureRequests/AbstractOperations.h>
 
 namespace Web::HTML {
 
@@ -30,12 +32,6 @@ GC::Ref<WorkerEnvironmentSettingsObject> WorkerEnvironmentSettingsObject::setup(
     auto* worker = Bindings::worker_global_scope_from_global_object(realm->global_object());
     VERIFY(worker);
 
-    // AD-HOC: The worker global scope's cross-origin isolated capability is inherited from the outside/creating
-    //         settings object. In our multi-process model, it arrives via the serialized outside settings; the spec
-    //         sets it while running the worker (before this algorithm), from the worker agent's agent cluster's
-    //         cross-origin isolation mode.
-    worker->set_cross_origin_isolated_capability(outside_settings.cross_origin_isolated_capability == CanUseCrossOriginIsolatedAPIs::Yes);
-
     // 3. Let origin be a unique opaque origin if worker global scope's url's scheme is "data"; otherwise outside settings's origin.
     // NB: The browser process determines it, as it holds the worker's environment too.
 
@@ -43,12 +39,16 @@ GC::Ref<WorkerEnvironmentSettingsObject> WorkerEnvironmentSettingsObject::setup(
     //         new one — which the spec settles while obtaining the agent, from outside settings' relevant agent. Here,
     //         the owner's cluster arrives with the serialized outside settings.
     auto agent_cluster_id = is<DedicatedWorkerGlobalScope>(*worker) ? outside_settings.agent_cluster_id : Optional<u64> { get_random<u64>() };
+    auto agent_cluster_cross_origin_isolation_mode = is<DedicatedWorkerGlobalScope>(*worker) ? outside_settings.agent_cluster_cross_origin_isolation_mode : CrossOriginIsolationMode::None;
 
     // 4. Let settings object be a new environment settings object whose algorithms are defined as follows:
     // NOTE: See the functions defined for this class.
     // FIXME: Is it enough to cache the has_cross_site_ancestor of outside_settings, or do we need to check the live object somehow?
-    auto settings_object = realm->create<WorkerEnvironmentSettingsObject>(move(execution_context), *worker, move(origin), outside_settings.has_cross_site_ancestor, unsafe_worker_creation_time, agent_cluster_id);
+    auto settings_object = realm->create<WorkerEnvironmentSettingsObject>(move(execution_context), *worker, move(origin), outside_settings.has_cross_site_ancestor, unsafe_worker_creation_time, agent_cluster_id, agent_cluster_cross_origin_isolation_mode);
     settings_object->target_browsing_context = nullptr;
+
+    // NB: Upgrade Insecure Requests has the worker inherit the insecure requests policy here.
+    UpgradeInsecureRequests::inherit_the_insecure_requests_policy_into_a_worker(settings_object, outside_settings.insecure_requests_policy, outside_settings.upgrade_insecure_navigations_set);
 
     // 5. Set settings object's id to a new unique opaque string, creation URL to worker global scope's url, top-level
     //    creation URL to null, target browsing context to null, and active service worker to null.
@@ -116,7 +116,7 @@ bool WorkerEnvironmentSettingsObject::has_cross_site_ancestor() const
 }
 
 // https://html.spec.whatwg.org/multipage/workers.html#script-settings-for-workers:concept-settings-object-policy-container
-GC::Ref<PolicyContainer> WorkerEnvironmentSettingsObject::policy_container() const
+NonnullRefPtr<PolicyContainer> WorkerEnvironmentSettingsObject::policy_container() const
 {
     // Return worker global scope's policy container.
     return m_global_scope->policy_container();

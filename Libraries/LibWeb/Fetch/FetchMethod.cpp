@@ -23,7 +23,7 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
-#include <LibWeb/Streams/ReadableStreamOperations.h>
+#include <LibWeb/Streams/ReadableStream.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/WebIDL/Promise.h>
@@ -161,18 +161,9 @@ GC::Ref<WebIDL::Promise> fetch(JS::Realm& realm, RequestInfo const& input, Bindi
             GC::Ref { *response_object_holder->response_object });
         WebIDL::resolve_promise(relevant_realm, promise_capability, response_value);
     };
-    controller_holder->set_controller(Fetching::fetch(
-        realm,
-        request,
-        Infrastructure::FetchAlgorithms::create(
-            {
-                .process_request_body_chunk_length = {},
-                .process_request_end_of_body = {},
-                .process_early_hints_response = {},
-                .process_response = move(process_response),
-                .process_response_end_of_body = {},
-                .process_response_consume_body = {},
-            })));
+    Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Engine::BodyIntent::DeliverStreamToConsumerAgent };
+    fetch_algorithms_input.process_response = move(process_response);
+    controller_holder->set_controller(Fetching::fetch(realm, request, Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input))));
 
     // 11. Add the following abort steps to requestObject’s signal:
     (void)request_object->signal()->add_abort_algorithm([locally_aborted, request, controller_holder, promise_capability, request_object, response_object_holder, &relevant_realm] {
@@ -201,7 +192,6 @@ GC::Ref<WebIDL::Promise> fetch(JS::Realm& realm, RequestInfo const& input, Bindi
 // https://fetch.spec.whatwg.org/#abort-fetch
 void abort_fetch(WebIDL::Promise const& promise, GC::Ref<Infrastructure::Request> request, GC::Ptr<Response> response_object, JS::Value error)
 {
-    auto& realm = WebIDL::promise_realm(promise);
     dbgln_if(WEB_FETCH_DEBUG, "Fetch: Aborting fetch with: request @ {}, error = {}", request.ptr(), error);
 
     // 1. Reject promise with error.
@@ -211,7 +201,7 @@ void abort_fetch(WebIDL::Promise const& promise, GC::Ref<Infrastructure::Request
     // 2. If request’s body is non-null and is readable, then cancel request’s body with error.
     if (auto* body = request->body().get_pointer<GC::Ref<Infrastructure::Body>>(); body != nullptr && (*body)->stream()->is_readable()) {
         // NOTE: Cancel here is different than the cancel method of stream and refers to https://streams.spec.whatwg.org/#readablestream-cancel
-        Streams::readable_stream_cancel(realm, (*body)->stream(), error);
+        (*body)->stream()->cancel(error);
     }
 
     // 3. If responseObject is null, then return.

@@ -238,14 +238,14 @@ WebIDL::ExceptionOr<JS::Value> XMLHttpRequest::response(JS::Realm& realm)
     auto wrapper = Bindings::wrap(wrapper_world, realm, GC::Ref { *this });
     m_cached_response_objects.remove_all_matching([](auto const& entry) { return !entry.wrapper; });
 
-    auto cached_response_object = [&]() -> GC::Ptr<JS::Object> {
+    auto cached_response_object = [&]() -> Optional<JS::Value> {
         auto cached = m_cached_response_objects.find_if([&](auto const& entry) { return entry.wrapper.ptr() == wrapper; });
         if (cached.is_end())
-            return nullptr;
+            return {};
         return cached->object;
     };
 
-    auto cache_response_object = [&](GC::Ref<JS::Object> object) {
+    auto cache_response_object = [&](JS::Value object) {
         m_cached_response_objects.append({ wrapper, object });
     };
 
@@ -275,8 +275,8 @@ WebIDL::ExceptionOr<JS::Value> XMLHttpRequest::response(JS::Realm& realm)
 
     // 5. If this’s response type is "arraybuffer",
     if (m_response_type == XMLHttpRequest::ResponseType::Arraybuffer) {
-        if (auto cached_object = cached_response_object())
-            return cached_object;
+        if (auto cached_object = cached_response_object(); cached_object.has_value())
+            return *cached_object;
 
         // then set this’s response object to a new ArrayBuffer object representing this’s received bytes. If this throws
         // an exception, then set this’s response object to failure and return null.
@@ -310,8 +310,8 @@ WebIDL::ExceptionOr<JS::Value> XMLHttpRequest::response(JS::Realm& realm)
     if (!m_response->body())
         return JS::js_null();
 
-    if (auto cached_object = cached_response_object())
-        return cached_object;
+    if (auto cached_object = cached_response_object(); cached_object.has_value())
+        return *cached_object;
 
     // 3. Let jsonObject be the result of running parse JSON from bytes on this’s received bytes. If that threw an
     // exception, then return null.
@@ -321,13 +321,10 @@ WebIDL::ExceptionOr<JS::Value> XMLHttpRequest::response(JS::Realm& realm)
 
     // 4. Set this’s response object to jsonObject.
     auto json_object = json_object_result.release_value();
-    if (json_object.is_object()) {
-        cache_response_object(GC::Ref<JS::Object> { json_object.as_object() });
-        return json_object;
-    }
+    cache_response_object(json_object);
 
     // 9. Return this’s response object.
-    return JS::js_null();
+    return json_object;
 }
 
 // https://xhr.spec.whatwg.org/#dom-xmlhttprequest-responsetype
@@ -384,7 +381,12 @@ Utf16String XMLHttpRequest::get_text_response() const
 
     // 3. If xhr’s response type is the empty string, charset is null, and the result of get a final MIME type for xhr is an XML MIME type,
     if (m_response_type == XMLHttpRequest::ResponseType::Empty && !charset.has_value() && get_final_mime_type().is_xml()) {
-        // FIXME: then use the rules set forth in the XML specifications to determine the encoding. Let charset be the determined encoding. [XML] [XML-NAMES]
+        // then use the rules set forth in the XML specifications to determine the encoding. Let charset be the determined encoding. [XML] [XML-NAMES]
+        // NB: The encoding declaration names the encoding, which this finds the way the HTML Standard does when
+        //     sniffing an encoding. Without one, charset stays null and is set to UTF-8 below, as the XML
+        //     specification requires.
+        if (auto xml_encoding = HTML::get_an_xml_encoding(m_received_bytes); xml_encoding.has_value())
+            charset = TextCodec::get_standardized_encoding(*xml_encoding);
     }
 
     // 4. If charset is null, then set charset to UTF-8.
@@ -460,7 +462,7 @@ void XMLHttpRequest::set_document_response()
     // 6. Otherwise, let document be a document that represents the result of running the XML parser with XML scripting support disabled on xhr’s received bytes. If that fails (unsupported character encoding, namespace well-formedness error, etc.), then return null.
     else {
         document = DOM::XMLDocument::create(page, *m_global_object, m_response->url().value_or({}));
-        if (!Web::build_xml_document(*document, m_received_bytes, {})) {
+        if (!Web::build_xml_document(*document, m_received_bytes, get_final_encoding())) {
             reset_response_object();
             return;
         }
@@ -556,19 +558,17 @@ WebIDL::ExceptionOr<void> XMLHttpRequest::set_request_header(String const& name,
     if (m_send)
         return WebIDL::InvalidStateError::create("XHR send() flag is already set"_utf16);
 
+    // NB: The ByteString arguments hold their bytes as code points, which have to be isomorphic encoded back into bytes.
+    auto header = HTTP::Header::isomorphic_encode(name, value);
+
     // 3. Normalize value.
-    auto normalized_value = HTTP::normalize_header_value(value);
+    header.value = HTTP::normalize_header_value(header.value);
 
     // 4. If name is not a header name or value is not a header value, then throw a "SyntaxError" DOMException.
-    if (!HTTP::is_header_name(name))
+    if (!HTTP::is_header_name(header.name))
         return WebIDL::SyntaxError::create("Header name contains invalid characters."_utf16);
-    if (!HTTP::is_header_value(normalized_value))
+    if (!HTTP::is_header_value(header.value))
         return WebIDL::SyntaxError::create("Header value contains invalid characters."_utf16);
-
-    auto header = HTTP::Header {
-        .name = name.to_byte_string(),
-        .value = move(normalized_value),
-    };
 
     // 5. If (name, value) is a forbidden request-header, then return.
     if (HTTP::is_forbidden_request_header(header))
@@ -706,7 +706,7 @@ WebIDL::ExceptionOr<void> XMLHttpRequest::send(NullableDocumentOrXMLHttpRequestB
         // 2. If body is a Document, then set this’s request body to body, serialized, converted, and UTF-8 encoded.
         if (body.has<GC::Ref<DOM::Document>>()) {
             auto string_serialized_document = TRY(body.get<GC::Ref<DOM::Document>>()->serialize_fragment(HTML::RequireWellFormed::No));
-            auto string_serialized_document_utf8 = string_serialized_document.to_utf8();
+            auto string_serialized_document_utf8 = string_serialized_document.to_well_formed_utf8();
             m_request_body = Fetch::Infrastructure::byte_sequence_as_body(associated_realm, string_serialized_document_utf8.bytes());
         }
         // 3. Otherwise:
@@ -726,8 +726,8 @@ WebIDL::ExceptionOr<void> XMLHttpRequest::send(NullableDocumentOrXMLHttpRequestB
 
         // 5. If originalAuthorContentType is non-null, then:
         if (original_author_content_type.has_value()) {
-            // 1. If body is a Document or a USVString, then:
-            if (body.has<GC::Ref<DOM::Document>>() || body.has<Utf16String>()) {
+            // 1. If body is a Document object, a URLSearchParams object, or a string:
+            if (body.has<GC::Ref<DOM::Document>>() || body.has<GC::Ref<DOMURL::URLSearchParams>>() || body.has<Utf16String>()) {
                 // 1. Let contentTypeRecord be the result of parsing originalAuthorContentType.
                 auto content_type_record = MimeSniff::MimeType::parse(original_author_content_type.value());
 
@@ -875,6 +875,12 @@ WebIDL::ExceptionOr<void> XMLHttpRequest::send(NullableDocumentOrXMLHttpRequestB
         // NOTE: request_body_length is captured by copy as to not UAF it when we leave `send()` and the callback gets called.
         // NOTE: `this` is kept alive by FetchAlgorithms using GC::HeapFunction.
         auto process_request_body_chunk_length = [this, request_body_length](u64 bytes_length) {
+            // AD-HOC: Fetch transmits the body again for each redirect, and runs process request end-of-body for a
+            //         null body, so ignore everything after the upload completed.
+            //         Spec issue: https://github.com/whatwg/xhr/issues/242
+            if (m_upload_complete)
+                return;
+
             // 1. Increase requestBodyTransmitted by bytesLength.
             m_request_body_transmitted += bytes_length;
 
@@ -895,6 +901,12 @@ WebIDL::ExceptionOr<void> XMLHttpRequest::send(NullableDocumentOrXMLHttpRequestB
         // NOTE: request_body_length is captured by copy as to not UAF it when we leave `send()` and the callback gets called.
         // NOTE: `this` is kept alive by FetchAlgorithms using GC::HeapFunction.
         auto process_request_end_of_body = [this, request_body_length]() {
+            // AD-HOC: Fetch transmits the body again for each redirect, and runs process request end-of-body for a
+            //         null body, so ignore everything after the upload completed.
+            //         Spec issue: https://github.com/whatwg/xhr/issues/242
+            if (m_upload_complete)
+                return;
+
             // 1. Set this’s upload complete flag.
             m_upload_complete = true;
 
@@ -1007,18 +1019,22 @@ WebIDL::ExceptionOr<void> XMLHttpRequest::send(NullableDocumentOrXMLHttpRequestB
         };
 
         // 10. Set this’s fetch controller to the result of fetching req with processRequestBodyChunkLength set to processRequestBodyChunkLength, processRequestEndOfBody set to processRequestEndOfBody, and processResponse set to processResponse.
-        m_fetch_controller = Fetch::Fetching::fetch(
-            associated_realm,
-            request,
-            Fetch::Infrastructure::FetchAlgorithms::create(
-                {
-                    .process_request_body_chunk_length = move(process_request_body_chunk_length),
-                    .process_request_end_of_body = move(process_request_end_of_body),
-                    .process_early_hints_response = {},
-                    .process_response = move(process_response),
-                    .process_response_end_of_body = {},
-                    .process_response_consume_body = {},
-                }));
+        Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DeliverStreamToConsumerAgent };
+        fetch_algorithms_input.process_request_body_chunk_length = move(process_request_body_chunk_length);
+        fetch_algorithms_input.process_request_end_of_body = move(process_request_end_of_body);
+        fetch_algorithms_input.process_response = move(process_response);
+        m_fetch_controller = Fetch::Fetching::fetch(associated_realm, request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
+
+        // AD-HOC: Stopping the fetch, as aborting the document does, discards it without a response. Hand this an
+        //         aborted network error instead, so that it fires abort as for a canceled fetch.
+        m_fetch_controller->set_stop_steps(GC::create_function(heap(), [this, fetch_controller = m_fetch_controller] {
+            HTML::queue_global_task(HTML::Task::Source::Networking, relevant_global_object(), GC::create_function(heap(), [this, fetch_controller] {
+                if (m_fetch_controller != fetch_controller)
+                    return;
+                m_response = Fetch::Infrastructure::Response::aborted_network_error();
+                MUST(handle_errors());
+            }));
+        }));
 
         // 11. Let now be the present time.
         // 12. Run these steps in parallel:
@@ -1067,19 +1083,9 @@ WebIDL::ExceptionOr<void> XMLHttpRequest::send(NullableDocumentOrXMLHttpRequestB
         };
 
         // 3. Set this’s fetch controller to the result of fetching req with processResponseConsumeBody set to processResponseConsumeBody and useParallelQueue set to true.
-        m_fetch_controller = Fetch::Fetching::fetch(
-            associated_realm,
-            request,
-            Fetch::Infrastructure::FetchAlgorithms::create(
-                {
-                    .process_request_body_chunk_length = {},
-                    .process_request_end_of_body = {},
-                    .process_early_hints_response = {},
-                    .process_response = {},
-                    .process_response_end_of_body = {},
-                    .process_response_consume_body = move(process_response_consume_body),
-                }),
-            Fetch::Fetching::UseParallelQueue::Yes);
+        Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::SyncAccumulate };
+        fetch_algorithms_input.process_response_consume_body = move(process_response_consume_body);
+        m_fetch_controller = Fetch::Fetching::fetch(associated_realm, request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)), Fetch::Fetching::UseParallelQueue::Yes);
 
         // 4. Let now be the present time.
         // 5. Pause until either processedResponse is true or this’s timeout is not 0 and this’s timeout milliseconds have passed since now.
@@ -1098,8 +1104,8 @@ WebIDL::ExceptionOr<void> XMLHttpRequest::send(NullableDocumentOrXMLHttpRequestB
             //     (https://html.spec.whatwg.org/multipage/webappapis.html#pause). The fetch above runs on a parallel
             //     queue, and progresses on the platform event loop (deferred invocations, IPC, timers) — all that's
             //     pumped here. So, the response arrives and is read to completion while the HTML event loop stays
-            //     paused; see the parallel-queue path in fetch_response_handover(), and the direct delivery in
-            //     FetchedDataReceiver::queue_delivery_task(). Blink/WebKit block the thread outright for a sync load:
+            //     paused; see the sync XHR body path in fetch_response_handover(), and the direct delivery in
+            //     BodyStreamPullSource::deliver_while_paused(). Blink/WebKit block the thread outright for a sync load:
             //     Blink on a WaitableEvent (ResourceRequestSender::SendSync), WebKit on a sync IPC reply
             //     (WebLoaderStrategy::loadResourceSynchronously). Gecko instead spins a nested event loop
             //     (XMLHttpRequestMainThread::SendInternal), with the top window suspended and its documents' microtasks

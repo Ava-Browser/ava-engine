@@ -1,0 +1,9 @@
+Harness status: OK
+
+Found 4 tests
+
+4 Pass
+Pass	nonzero linethickness, displaystyle=false
+Pass	nonzero linethickness, displaystyle=true
+Pass	linethickness=0, displaystyle=false
+Pass	linethickness=0, displaystyle=true

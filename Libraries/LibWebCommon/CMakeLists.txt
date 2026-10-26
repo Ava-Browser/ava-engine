@@ -5,7 +5,9 @@ set(SOURCES
     CSS/PreferredColorScheme.cpp
     CSS/StyleSheetIdentifier.cpp
     CSS/SystemColor.cpp
+    Fetch/Infrastructure/DataURL.cpp
     Fetch/Infrastructure/HTTP/Statuses.cpp
+    Fetch/Infrastructure/URL.cpp
     FileAPI/BlobURLStore.cpp
     FileAPI/SerializedBlobURLEntry.cpp
     Gamepad/GamepadSharedState.cpp
@@ -14,6 +16,7 @@ set(SOURCES
     HTML/AutoplayPolicy.cpp
     HTML/BroadcastChannelMessage.cpp
     HTML/BrowsingContext.cpp
+    HTML/CrossOrigin/OpenerPolicy.cpp
     HTML/CrossOrigin/OpenerPolicyEnforcement.cpp
     HTML/CrossProcessId.cpp
     HTML/EmbedderPolicy.cpp
@@ -52,13 +55,19 @@ set(SOURCES
     Page/InputTrace.cpp
     Page/MediaContextMenu.cpp
     Page/SpellingError.cpp
+    Page/WritingSuggestion.cpp
+    PermissionsPolicy/PermissionsPolicy.cpp
     PixelUnits.cpp
     ReferrerPolicy/ReferrerPolicy.cpp
+    SecureContexts/AbstractOperations.cpp
     StorageAPI/StorageEndpoint.cpp
     StorageAPI/StorageKey.cpp
+    UpgradeInsecureRequests/InsecureRequestsPolicy.cpp
+    WebDriver/BiDi.cpp
     WebDriver/Capabilities.cpp
     WebDriver/Client.cpp
     WebDriver/Error.cpp
+    WebDriver/Input.cpp
     WebDriver/Proxy.cpp
     WebDriver/Response.cpp
     WebDriver/TimeoutsConfiguration.cpp
@@ -104,6 +113,7 @@ compile_ipc(Page/TextEditingCommand.ipc Page/TextEditingCommandCodecs.h)
 compile_ipc(PixelUnits.ipc PixelUnitsCodecs.h)
 compile_ipc(WebView/AccessibilityNodeData.ipc WebView/AccessibilityNodeDataCodecs.h)
 compile_ipc(WebView/DictionaryLookup.ipc WebView/DictionaryLookupCodecs.h)
+compile_ipc(WebDriver/BiDi.ipc WebDriver/BiDiCodecs.h)
 
 # NB: The protocols between the UI process and the processes it hosts web content in only use LibWebCommon types, so
 #     both sides generate their endpoints from here.
@@ -147,8 +157,9 @@ target_link_libraries(LibWebCommon PRIVATE LibCore LibCrypto LibFileSystem LibGf
 
 import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libwebcommon_rust FEATURES allocator FFI_HEADER RustFFI.h)
 target_link_libraries(LibWebCommon PRIVATE libwebcommon_rust)
+target_link_libraries(libwebcommon_rust INTERFACE LibUnicode LibRegex)
 get_target_property(_libwebcommon_rust_lib libwebcommon_rust IMPORTED_LOCATION)
-set_property(SOURCE MimeSniff/MimeType.cpp MimeSniff/Resource.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libwebcommon_rust_lib})
+set_property(SOURCE Fetch/Infrastructure/DataURL.cpp MimeSniff/MimeType.cpp MimeSniff/Resource.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libwebcommon_rust_lib})
 test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libwebcommon_rust)
 
 if (ENABLE_INSTALL_HEADERS)

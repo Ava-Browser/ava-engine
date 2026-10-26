@@ -14,9 +14,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/Streams/ReadableByteStreamController.h>
 #include <LibWeb/Streams/ReadableStream.h>
-#include <LibWeb/Streams/ReadableStreamOperations.h>
 #include <LibWeb/WebIDL/ExceptionOrUtils.h>
 
 namespace Web::Fetch::Fetching {
@@ -80,9 +78,6 @@ void FetchedDataReceiver::handle_network_data(JS::Realm& realm, Requests::Respon
         return;
     }
 
-    if (state == NetworkState::Error)
-        return;
-
     // 1. If one or more bytes have been transmitted from response’s message body, then:
     auto bytes = data.bytes();
     if (bytes.is_empty())
@@ -98,8 +93,8 @@ void FetchedDataReceiver::handle_network_data(JS::Realm& realm, Requests::Respon
 
     // Capture bytes for MIME sniffing
     if (m_body) {
-        if (auto const& immutable_bytes = data.immutable_bytes(); immutable_bytes.has_value() && immutable_bytes->is_file_backed() && m_body->source().has<Empty>() && bytes.size() == immutable_bytes->size())
-            m_body->set_source(*immutable_bytes, static_cast<u64>(immutable_bytes->size()));
+        if (auto const* file_backed = data.file_backed_slice(); file_backed && !m_body->source().has_value())
+            m_body->set_source(file_backed->payload, static_cast<u64>(file_backed->payload.size()));
         m_body->append_sniff_bytes(bytes);
     } else if (m_pre_body_sniff_buffer.size() < Infrastructure::MAX_SNIFF_BYTES) {
         auto space_remaining = Infrastructure::MAX_SNIFF_BYTES - m_pre_body_sniff_buffer.size();
@@ -107,8 +102,9 @@ void FetchedDataReceiver::handle_network_data(JS::Realm& realm, Requests::Respon
     }
 
     if (m_http_cache && !m_cache_body_replaces_network_buffer) {
-        if (auto const& immutable_bytes = data.immutable_bytes(); immutable_bytes.has_value() && immutable_bytes->is_file_backed() && m_cache_buffer.is_empty() && !m_cache_body.has_value()) {
-            m_cache_body = *immutable_bytes;
+        if (auto const* file_backed = data.file_backed_slice(); file_backed && m_cache_buffer.is_empty()) {
+            if (!m_cache_body.has_value())
+                m_cache_body = file_backed->payload;
         } else {
             if (m_cache_body.has_value()) {
                 m_cache_buffer.append(m_cache_body->bytes());
@@ -211,16 +207,13 @@ void FetchedDataReceiver::enqueue_into_stream(JS::Realm& realm, ReadonlyBytes by
     if (!m_stream->is_readable())
         return;
 
-    auto& controller = m_stream->controller()->get<GC::Ref<Streams::ReadableByteStreamController>>();
     HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
     // 1. Pull from bytes buffer into stream.
-    auto byte_buffer = MUST(ByteBuffer::copy(bytes));
-
-    if (auto result = Streams::readable_byte_stream_controller_enqueue_native_bytes(realm, *controller, move(byte_buffer)); result.is_error()) {
+    if (auto result = m_stream->enqueue_bytes(bytes); result.is_error()) {
         auto throw_completion = WebIDL::exception_to_throw_completion(realm.vm(), realm, result.release_error());
         // 2. If stream is errored, then terminate fetchParams’s controller.
-        Streams::readable_byte_stream_controller_error(*controller, throw_completion.value());
+        m_stream->error(throw_completion.value());
         if (m_fetch_params)
             m_fetch_params->controller()->terminate();
     }

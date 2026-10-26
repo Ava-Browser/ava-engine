@@ -15,8 +15,11 @@
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Display.h>
 #include <LibWeb/CSS/LengthBox.h>
+#include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
+#include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
+#include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 #include <LibWeb/CSS/ValueType.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/CommitMessages.h>
@@ -36,6 +39,7 @@
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/MathML/AttributeNames.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/Painting/ScrollSnap.h>
 #include <LibWeb/SVG/FragmentIdentifier.h>
@@ -353,25 +357,35 @@ void publish_element_scroll_offset(DOM::Element const& element)
     RustFFI::render_state_set_element_scroll_offset(document.layout_node_arena().host(), element.style_node_id().value(), offset);
 }
 
+void publish_writing_suggestion(DOM::Document& document, DOM::Text const* text, size_t offset, Utf16View remainder)
+{
+    // A text node without a style node identity has no box to show a suggestion in, so it publishes that none shows.
+    auto identity = text ? text->style_node_id().value() : 0;
+    // Nothing is published before a layout tree exists, so there's nothing to withdraw.
+    if (identity == 0 && !document.layout_node_arena_if_created())
+        return;
+    Vector<u16> code_units;
+    code_units.ensure_capacity(remainder.length_in_code_units());
+    for (size_t i = 0; i < remainder.length_in_code_units(); ++i)
+        code_units.unchecked_append(remainder.code_unit_at(i));
+    RustFFI::render_state_set_writing_suggestion(document.layout_node_arena().host(), identity, offset, code_units.data(), code_units.size());
+}
+
 void publish_table_spans(DOM::Element const& element)
 {
     if (element.style_node_id().value() == 0)
         return;
     u16 column_span = 1;
     u16 row_span = 1;
-    u32 raw_column_span = 1;
     if (auto const* cell = as_if<HTML::HTMLTableCellElement>(element)) {
         column_span = static_cast<u16>(cell->col_span());
         row_span = static_cast<u16>(cell->row_span());
     } else if (auto const* column = as_if<HTML::HTMLTableColElement>(element)) {
         column_span = static_cast<u16>(column->span());
-        // The raw span keeps the unclamped attribute value; its only consumer is the table formatting context's column
-        // handling, so other elements' span attributes stay out of the mirror.
-        raw_column_span = column->get_attribute_value(HTML::AttributeNames::span).to_number<u32>().value_or(1);
     } else {
         return;
     }
-    CSS::StyleEngineFFI::style_engine_set_element_table_spans(const_cast<DOM::Document&>(element.document()).style_computer().style_engine().host(), element.style_node_id(), column_span, row_span, raw_column_span);
+    CSS::StyleEngineFFI::style_engine_set_element_table_spans(const_cast<DOM::Document&>(element.document()).style_computer().style_engine().host(), element.style_node_id(), column_span, row_span);
 }
 
 // The publication is keyed by the element's style node rather than by a row, because an element that draws nothing
@@ -385,8 +399,102 @@ void publish_svg_attribute_facts(DOM::Element& element)
         element.document().layout_node_arena().host(),
         element.style_node_id().value(),
         build_svg_attribute_facts(element),
-        reinterpret_cast<RustFFI::FfiFloatPoint const*>(points.data()),
-        points.size());
+        ReadonlySpan<RustFFI::FfiFloatPoint> { reinterpret_cast<RustFFI::FfiFloatPoint const*>(points.data()), points.size() });
+}
+
+// The unit of a published MathML length. Mirrors Rust `math_length_unit`.
+enum class MathLengthUnit : u8 {
+    Absent,
+    Px,
+    Em,
+    Ex,
+    Percentage,
+};
+
+// The value of a published MathML boolean attribute. Mirrors Rust `math_boolean`.
+enum class MathBoolean : u8 {
+    Absent,
+    True,
+    False,
+};
+
+static RustFFI::FfiMathLength math_length_attribute(DOM::Element const& element, Utf16FlyString const& name)
+{
+    auto value = element.attribute(name);
+    if (!value.has_value())
+        return {};
+    auto style_value = parse_css_type(CSS::Parser::ParsingParams { element.document() }, value->utf16_view(), CSS::ValueType::LengthPercentage);
+    if (!style_value)
+        return {};
+    if (style_value->is_percentage())
+        return { to_underlying(MathLengthUnit::Percentage), static_cast<float>(style_value->as_percentage().percentage().value()) };
+    if (!style_value->is_length())
+        return {};
+    auto const& length = style_value->as_length().length();
+    if (length.is_absolute())
+        return { to_underlying(MathLengthUnit::Px), static_cast<float>(length.absolute_length_to_px_without_rounding()) };
+    if (length.unit() == CSS::LengthUnit::Em)
+        return { to_underlying(MathLengthUnit::Em), static_cast<float>(length.raw_value()) };
+    if (length.unit() == CSS::LengthUnit::Ex)
+        return { to_underlying(MathLengthUnit::Ex), static_cast<float>(length.raw_value()) };
+    // FIXME: Publish the other relative lengths, which resolve against the box that reads them.
+    return {};
+}
+
+static u8 math_boolean_attribute(DOM::Element const& element, Utf16FlyString const& name)
+{
+    auto value = element.attribute(name);
+    if (!value.has_value())
+        return to_underlying(MathBoolean::Absent);
+    if (value->equals_ignoring_ascii_case("true"sv))
+        return to_underlying(MathBoolean::True);
+    if (value->equals_ignoring_ascii_case("false"sv))
+        return to_underlying(MathBoolean::False);
+    return to_underlying(MathBoolean::Absent);
+}
+
+// https://w3c.github.io/mathml-core/#dfn-form
+static u8 math_form_attribute(DOM::Element const& element)
+{
+    auto value = element.attribute(MathML::AttributeNames::form);
+    if (!value.has_value())
+        return 0;
+    // The corresponding form attribute on the <mo> element, if present, must be an ASCII case-insensitive match to
+    // one of these values.
+    // NB: The published form is one plus Rust's `OperatorForm`.
+    if (value->equals_ignoring_ascii_case("infix"sv))
+        return 1;
+    if (value->equals_ignoring_ascii_case("prefix"sv))
+        return 2;
+    if (value->equals_ignoring_ascii_case("postfix"sv))
+        return 3;
+    return 0;
+}
+
+void publish_math_attribute_facts(DOM::Element const& element)
+{
+    if (element.style_node_id().value() == 0)
+        return;
+    namespace AttributeNames = MathML::AttributeNames;
+    RustFFI::FfiMathAttributeFacts facts {
+        .width = math_length_attribute(element, AttributeNames::width),
+        .height = math_length_attribute(element, AttributeNames::height),
+        .depth = math_length_attribute(element, AttributeNames::depth),
+        .lspace = math_length_attribute(element, AttributeNames::lspace),
+        .rspace = math_length_attribute(element, AttributeNames::rspace),
+        .voffset = math_length_attribute(element, AttributeNames::voffset),
+        .linethickness = math_length_attribute(element, AttributeNames::linethickness),
+        .minsize = math_length_attribute(element, AttributeNames::minsize),
+        .maxsize = math_length_attribute(element, AttributeNames::maxsize),
+        .form = math_form_attribute(element),
+        .stretchy = math_boolean_attribute(element, AttributeNames::stretchy),
+        .symmetric = math_boolean_attribute(element, AttributeNames::symmetric),
+        .largeop = math_boolean_attribute(element, AttributeNames::largeop),
+        .movablelimits = math_boolean_attribute(element, AttributeNames::movablelimits),
+        .accent = math_boolean_attribute(element, AttributeNames::accent),
+        .accentunder = math_boolean_attribute(element, AttributeNames::accentunder),
+    };
+    RustFFI::render_state_set_math_attribute_facts(const_cast<DOM::Document&>(element.document()).layout_node_arena().host(), element.style_node_id().value(), facts);
 }
 
 // Republished on its own when an element's style record is replaced: the presentation attributes it sits beside are
@@ -434,9 +542,22 @@ void register_layout_host(NodeArena& arena, DOM::Document& document)
             auto element = document.style_computer().element_for_style_node(style_node);
             VERIFY(element);
             auto context = CSS::Length::ResolutionContext::for_element(DOM::AbstractElement { *element });
+            // Layout writes nothing on the DOM side: the marks these lengths make reach the document as commit
+            // messages, once the layout that resolved them is committed.
+            CSS::Length::DeferredContainerQueryMarks marks;
+            context.defer_container_query_marks(marks);
+            auto width = CSS::Length(100, CSS::LengthUnit::Cqw).to_px_without_rounding(context);
+            auto height = CSS::Length(100, CSS::LengthUnit::Cqh).to_px_without_rounding(context);
+            auto style_node_of = [](GC::Ptr<DOM::Element const> container) -> u32 {
+                return container ? container->style_node_id().value() : 0;
+            };
             return {
-                .width = CSS::Length(100, CSS::LengthUnit::Cqw).to_px_without_rounding(context),
-                .height = CSS::Length(100, CSS::LengthUnit::Cqh).to_px_without_rounding(context),
+                .width = width,
+                .height = height,
+                .width_query_container = style_node_of(marks.width_query_container),
+                .height_query_container = style_node_of(marks.height_query_container),
+                .width_query_container_awaits_layout = marks.width_query_container_awaits_layout,
+                .height_query_container_awaits_layout = marks.height_query_container_awaits_layout,
             }; },
         .take_built_scroll_containers = [](void* context, BegunRead const* read, RustFFI::FfiBuiltScrollContainer const* built, size_t count) {
             auto& document = *static_cast<DOM::Document*>(context);

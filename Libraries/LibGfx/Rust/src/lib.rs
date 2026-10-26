@@ -21,6 +21,7 @@ pub mod font;
 pub mod font_catalog;
 pub mod geometry;
 pub mod image_frame;
+pub mod math_table;
 pub mod matrix;
 pub mod paint_enums;
 pub mod path;
@@ -57,7 +58,7 @@ unsafe extern "C" {
 const _: () = {
     const fn assert_send_and_sync<T: Send + Sync>() {}
     assert_send_and_sync::<font::FontHandle>();
-    assert_send_and_sync::<path::OwnedPath>();
+    assert_send_and_sync::<path::Path>();
     assert_send_and_sync::<image_frame::ImageFrameHandle>();
     assert_send_and_sync::<text_layout::GlyphBuffer>();
 };

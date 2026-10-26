@@ -46,6 +46,8 @@ namespace Ladybird {
 class TabPreviewPopup;
 class TabWidget;
 
+static constexpr int TAB_ICON_SIZE = 16;
+
 enum class TabLayout : u8 {
     Horizontal,
     VerticalCollapsed,
@@ -64,9 +66,13 @@ public:
 
     TabLayout tab_layout() const { return m_tab_layout; }
     void set_tab_layout(TabLayout);
+    // While collapsed vertical tabs only peek open on hover, the pinned tabs keep their rows, one tab each, rather than
+    // forming the grid, so no tab moves out from under the pointer.
+    void set_pinned_tabs_in_rows(bool);
     void set_vertical_tabs_position(WebView::VerticalTabsPosition);
     void refresh_tab_layout();
     void recreate_icons();
+    int pinned_tab_count() const;
 
     void play_load_sheen(Tab&);
     void update_loading_swirl_animation();
@@ -98,17 +104,22 @@ private:
     virtual void mouseReleaseEvent(QMouseEvent*) override;
     virtual void wheelEvent(QWheelEvent*) override;
 
+    // How far a tab moves, and how much it grows, while tabs make way for a dragged tab.
     struct TabShift {
-        qreal offset { 0 };
-        qreal extent_delta { 0 };
+        qreal x_offset { 0 };
+        qreal y_offset { 0 };
+        qreal width_delta { 0 };
+        qreal height_delta { 0 };
     };
     struct DropPreview {
         Vector<TabShift> tab_shifts;
         qreal strip_growth { 0 };
+        qreal pinned_region_growth { 0 };
     };
 
     Optional<int> dragged_tab_index() const;
-    qreal drop_gap_extent() const;
+    bool dragging_pinned_tab() const;
+    QRect incoming_drop_layout_rect(int position) const;
     int drop_slot_at(QPoint const&) const;
     void set_drop_slot(Optional<int>);
     void clear_drop_preview();
@@ -116,6 +127,7 @@ private:
     DropPreview current_drop_preview() const;
     TabShift current_tab_shift(int index) const;
     qreal current_strip_growth() const;
+    qreal current_pinned_region_growth() const;
     QRect shifted_tab_rect(int index) const;
     QPixmap render_tab_drag_pixmap(int index) const;
     void toggle_window_maximized();
@@ -126,6 +138,26 @@ private:
     void show_tab_preview();
     void hide_tab_preview();
     QPoint tab_preview_position_for(int index, QSize const& popup_size) const;
+
+    // Where the pinned tabs sit in vertical tabs: a grid of tiles when expanded, one icon column when collapsed, and a
+    // separator below. Its height is 0 when there's no pinned tab.
+    struct PinnedRegion {
+        int count { 0 };
+        int columns { 1 };
+        int tile_width { 0 };
+        int height { 0 };
+        // The pinned tabs stay in place only while they fit in half the bar's height. Past that, they scroll with the
+        // unpinned tabs, so every tab stays within reach.
+        bool scrolls { false };
+
+        int fixed_height() const { return scrolls ? 0 : height; }
+    };
+    PinnedRegion pinned_region() const;
+    PinnedRegion pinned_region_for(int pinned_count) const;
+    QRect vertical_tab_rect(int index, PinnedRegion const&) const;
+    bool pinned_tabs_are_tiles() const;
+    int vertical_bar_width() const;
+    int vertical_tabs_left() const;
 
     QRect visual_tab_rect(int index) const;
     int tab_index_at(QPoint const&) const;
@@ -144,6 +176,7 @@ private:
     QPointer<TabWidget> m_tab_widget;
 
     TabLayout m_tab_layout { TabLayout::Horizontal };
+    bool m_pinned_tabs_in_rows { false };
     WebView::VerticalTabsPosition m_vertical_tabs_position { WebView::VerticalTabsPosition::Left };
     int m_available_width { 0 };
     int m_hovered_tab_index { -1 };
@@ -217,6 +250,7 @@ public:
     void set_vertical_tabs_position(WebView::VerticalTabsPosition);
     bool can_expand_vertical_tabs_on_hover() const;
     void update_tab_button_visibility();
+    void update_tab_layout();
 
 signals:
     void current_tab_changed(int index);
@@ -239,11 +273,16 @@ private:
     bool vertical_tabs_are_on_right() const;
     int vertical_tabs_layout_width() const;
     bool should_show_window_controls_in_tab_toolbar() const;
+    bool vertical_tabs_hold_window_controls() const;
+    int vertical_tabs_column_top_margin() const;
 
     void rebuild_layout();
     void rebuild_layout_for_horizontal_tabs();
+    void place_horizontal_new_tab_button();
     void rebuild_layout_for_vertical_tabs();
     void rebuild_page_column();
+    void update_vertical_tabs_column_margins();
+    void paint_collapsed_vertical_tabs_column();
     void update_toolbar_placement();
     void update_tab_toolbar_window_controls_visibility();
     int current_vertical_tabs_width() const;
@@ -257,12 +296,12 @@ private:
     QRect vertical_tabs_chrome_rect() const;
     int vertical_tabs_tab_width() const;
     void update_vertical_tabs_button_layout();
-    void update_tab_layout();
     void update_tab_chrome_visibility();
 #ifdef AK_OS_MACOS
     void update_web_view_frame(Tab&);
 #endif
     void recreate_icons();
+    void update_vertical_tabs_toggle_icon();
     void update_chrome_style();
     void update_vertical_tabs_overlay_geometry();
     void update_vertical_tabs_content_overlay();
@@ -279,6 +318,7 @@ private:
 
     QStackedWidget* m_stacked_widget { nullptr };
     QToolButton* m_new_tab_button { nullptr };
+    QToolButton* m_vertical_tabs_toggle_button { nullptr };
     QToolButton* m_minimize_window_button { nullptr };
     QToolButton* m_maximize_window_button { nullptr };
     QToolButton* m_close_window_button { nullptr };
@@ -322,10 +362,17 @@ public:
 
     explicit TabBarButton(QIcon const& icon, QWidget* parent = nullptr);
     void set_collapsed_vertical_overlay(bool);
+    // Shrinks the icon by this much on each side, within the same button.
+    void set_icon_inset(int);
 
 protected:
     virtual bool event(QEvent* event) override;
     virtual void paintEvent(QPaintEvent*) override;
+
+private:
+    void update_icon_size();
+
+    int m_icon_inset { 0 };
 };
 
 }

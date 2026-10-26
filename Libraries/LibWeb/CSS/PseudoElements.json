@@ -93,6 +93,11 @@
     ],
     "implementation": "synthetic"
   },
+  "highlight": {
+    "spec": "https://drafts.csswg.org/css-pseudo-4/#selectordef-highlight",
+    "type": "function",
+    "function-syntax": "<highlight-name-selector>"
+  },
   "marker": {
     "spec": "https://drafts.csswg.org/css-pseudo-4/#selectordef-marker",
     "is-tree-abiding": true,
@@ -203,21 +208,21 @@
   "view-transition-group": {
     "spec": "https://drafts.csswg.org/css-view-transitions-1/#selectordef-view-transition-group",
     "type": "function",
-    "function-syntax": "<pt-name-selector>"
+    "function-syntax": "<pt-name-and-class-selector>"
   },
   "view-transition-image-pair": {
     "spec": "https://drafts.csswg.org/css-view-transitions-1/#selectordef-view-transition-image-pair",
     "type": "function",
-    "function-syntax": "<pt-name-selector>"
+    "function-syntax": "<pt-name-and-class-selector>"
   },
   "view-transition-new": {
     "spec": "https://drafts.csswg.org/css-view-transitions-1/#selectordef-view-transition-new",
     "type": "function",
-    "function-syntax": "<pt-name-selector>"
+    "function-syntax": "<pt-name-and-class-selector>"
   },
   "view-transition-old": {
     "spec": "https://drafts.csswg.org/css-view-transitions-1/#selectordef-view-transition-old",
     "type": "function",
-    "function-syntax": "<pt-name-selector>"
+    "function-syntax": "<pt-name-and-class-selector>"
   }
 }

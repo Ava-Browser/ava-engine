@@ -73,10 +73,8 @@
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
-#include <LibWeb/CSS/StyleValues/OpenTypeTaggedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PendingSubstitutionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
-#include <LibWeb/CSS/StyleValues/PositionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RatioStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ShorthandStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StringStyleValue.h>
@@ -99,6 +97,7 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/MathML/MathMLElement.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
@@ -263,6 +262,8 @@ void StyleComputer::register_style_node(StyleNodeID style_node_id, DOM::Node& no
     // had one published nothing.
     if (auto* svg_element = as_if<SVG::SVGElement>(node))
         Layout::publish_svg_attribute_facts(*svg_element);
+    else if (auto* mathml_element = as_if<MathML::MathMLElement>(node))
+        Layout::publish_math_attribute_facts(*mathml_element);
 }
 
 static void ensure_slot(auto& nodes, u32 index)
@@ -573,13 +574,8 @@ struct StyleComputer::AnimationSample {
     ComputedValuesFFI::FfiHostAnimationSample input {};
 };
 
-void StyleComputer::collect_animations_into(Layout::BegunRead const& read, DOM::AbstractElement abstract_element, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>> effects, ComputedStyleWorkingSet& computed_properties, AnimationRefresh refresh) const
+void StyleComputer::collect_animations_into(Layout::BegunRead const& read, DOM::AbstractElement abstract_element, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>> effects, ComputedStyleWorkingSet& computed_properties) const
 {
-    if (refresh == AnimationRefresh::No) {
-        collect_animation_effects_into(read, abstract_element, effects, computed_properties, {});
-        publish_animated_custom_properties(read, computed_properties, abstract_element);
-        return;
-    }
     m_keyframes_inherited_non_inherited_style_groups = 0;
     // A refresh samples over the record the element holds, which the working set was reconstructed from.
     collect_animation_effects_into(read, abstract_element, effects, computed_properties, abstract_element.style_record_identity());
@@ -1310,7 +1306,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
             return Animations::KeyframeEffect::composite_order(a, b) < 0;
         });
         if (!remaining_effects.is_empty())
-            collect_animations_into(read, abstract_element, remaining_effects.span(), *new_style, AnimationRefresh::Yes);
+            collect_animations_into(read, abstract_element, remaining_effects.span(), *new_style);
     }
 
     if (!newly_started_transition_effects.is_empty()) {

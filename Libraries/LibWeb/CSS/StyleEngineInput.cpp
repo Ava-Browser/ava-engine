@@ -49,6 +49,7 @@
 #include <LibWeb/Layout/ImageProvider.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/RenderDocument.h>
+#include <LibWeb/MathML/TagNames.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
@@ -901,6 +902,17 @@ void record_element_associated_with_animation(DOM::Element& element)
         note_waiting_children_may_arrive(*style_engine, element.document());
 }
 
+// The box the element asks layout for.
+static CSS::ElementBoxKind box_kind_for_layout(DOM::Element const& element)
+{
+    // https://svgwg.org/svg2-draft/struct.html#ConditionalProcessing
+    // NB: An element whose conditional processing attributes evaluate to false, and its children, are skipped and thus
+    //     will not be rendered.
+    if (auto const* svg_graphics_element = as_if<SVG::SVGGraphicsElement>(element); svg_graphics_element && !svg_graphics_element->conditional_processing_attributes_evaluate_to_true())
+        return CSS::ElementBoxKind::NoBox;
+    return element.box_kind();
+}
+
 void record_waiting_children_may_be_revealed(DOM::Element& element)
 {
     if (auto* style_engine = style_engine_for(element))
@@ -1018,7 +1030,7 @@ static void publish_element_selector_features(StyleEngine& style_engine, DOM::El
                                             .heading_level = heading_level,
                                             .is_slot = is_slot,
                                             .associated_pseudo_kind_plus_one = associated_pseudo_kind_plus_one(element),
-                                            .box_kind = to_underlying(element.box_kind()),
+                                            .box_kind = to_underlying(box_kind_for_layout(element)),
                                             .adjustment_facts = element_style_adjustment_facts(element),
                                             .construction_facts = element_construction_facts(element),
                                         },
@@ -1135,7 +1147,82 @@ enum ElementConstructionFact : u32 {
     ConstructedAsDocumentElement = 1 << 6,
     IsSvgResourceElement = 1 << 7,
     IsSvgGeometryElement = 1 << 8,
+    // The layout algorithm a MathML element's tag name selects, as a MathMLLayoutKind in these bits.
+    MathMLLayoutKindShift = 16,
+    MathMLLayoutKindMask = 0x1f << MathMLLayoutKindShift,
 };
+
+// The layout algorithm a MathML element's tag name selects when its display is block math or inline math.
+// Mirrors Rust `MathLayoutKind`.
+enum class MathMLLayoutKind : u32 {
+    NotMathML,
+    Mrow,
+    Math,
+    Token,
+    Mo,
+    Mspace,
+    Mfrac,
+    Msqrt,
+    Mroot,
+    Msub,
+    Msup,
+    Msubsup,
+    Munder,
+    Mover,
+    Munderover,
+    Mmultiscripts,
+    Mprescripts,
+    None,
+    Mpadded,
+    Mtext,
+};
+
+static MathMLLayoutKind mathml_layout_kind(DOM::Element const& element)
+{
+    if (element.namespace_uri() != Namespace::MathML)
+        return MathMLLayoutKind::NotMathML;
+    namespace TagNames = MathML::TagNames;
+    auto const& name = element.local_name();
+    if (name == TagNames::math)
+        return MathMLLayoutKind::Math;
+    if (name == TagNames::mtext)
+        return MathMLLayoutKind::Mtext;
+    if (first_is_one_of(name, TagNames::mi, TagNames::mn, TagNames::ms, TagNames::annotation, TagNames::annotation_xml))
+        return MathMLLayoutKind::Token;
+    if (name == TagNames::mo)
+        return MathMLLayoutKind::Mo;
+    if (name == TagNames::mspace)
+        return MathMLLayoutKind::Mspace;
+    if (name == TagNames::mfrac)
+        return MathMLLayoutKind::Mfrac;
+    if (name == TagNames::msqrt)
+        return MathMLLayoutKind::Msqrt;
+    if (name == TagNames::mroot)
+        return MathMLLayoutKind::Mroot;
+    if (name == TagNames::msub)
+        return MathMLLayoutKind::Msub;
+    if (name == TagNames::msup)
+        return MathMLLayoutKind::Msup;
+    if (name == TagNames::msubsup)
+        return MathMLLayoutKind::Msubsup;
+    if (name == TagNames::munder)
+        return MathMLLayoutKind::Munder;
+    if (name == TagNames::mover)
+        return MathMLLayoutKind::Mover;
+    if (name == TagNames::munderover)
+        return MathMLLayoutKind::Munderover;
+    if (name == TagNames::mmultiscripts)
+        return MathMLLayoutKind::Mmultiscripts;
+    if (name == TagNames::mprescripts)
+        return MathMLLayoutKind::Mprescripts;
+    if (name == "none"sv)
+        return MathMLLayoutKind::None;
+    if (name == TagNames::mpadded)
+        return MathMLLayoutKind::Mpadded;
+    // https://w3c.github.io/mathml-core/#new-display-math-value
+    // Unknown MathML elements behave the same as the <mrow> element.
+    return MathMLLayoutKind::Mrow;
+}
 u32 element_box_type_adjustment_facts(DOM::Element const& element)
 {
     bool is_html_element = element.namespace_uri() == Namespace::HTML;
@@ -1251,6 +1338,7 @@ static u32 element_construction_facts(DOM::Element const& element)
     set(element.is_document_element(), ElementConstructionFact::ConstructedAsDocumentElement);
     set(svg_element && svg_element->is_resource_element(), ElementConstructionFact::IsSvgResourceElement);
     set(element.is_svg_geometry_element(), ElementConstructionFact::IsSvgGeometryElement);
+    facts |= to_underlying(mathml_layout_kind(element)) << ElementConstructionFact::MathMLLayoutKindShift;
     return facts;
 }
 
@@ -1289,7 +1377,7 @@ void record_element_adjustment_facts(DOM::Element& element)
         return;
     StyleEngineFFI::style_engine_set_element_adjustment_facts(style_engine->host(), element.style_node_id(), element_style_adjustment_facts(element));
     StyleEngineFFI::style_engine_set_element_construction_facts(style_engine->host(), element.style_node_id(), element_construction_facts(element));
-    StyleEngineFFI::style_engine_set_element_box_kind(style_engine->host(), element.style_node_id(), to_underlying(element.box_kind()));
+    StyleEngineFFI::style_engine_set_element_box_kind(style_engine->host(), element.style_node_id(), to_underlying(box_kind_for_layout(element)));
     StyleEngineFFI::style_engine_set_element_associated_pseudo_kind(style_engine->host(), element.style_node_id(), associated_pseudo_kind_plus_one(element));
 }
 
@@ -1305,7 +1393,7 @@ void record_element_box_kind(DOM::Element& element)
     auto* style_engine = style_engine_for_identified(element);
     if (!style_engine)
         return;
-    StyleEngineFFI::style_engine_set_element_box_kind(style_engine->host(), element.style_node_id(), to_underlying(element.box_kind()));
+    StyleEngineFFI::style_engine_set_element_box_kind(style_engine->host(), element.style_node_id(), to_underlying(box_kind_for_layout(element)));
 }
 
 static void set_replaced_content_input(StyleEngine& style_engine, StyleNodeID node, StyleEngineFFI::FfiReplacedContentInputKind kind, u8 present, u32 first, u32 second = 0, u32 third = 0, u32 fourth = 0)
@@ -1456,8 +1544,7 @@ static void record_element_initial_features(DOM::Element& element)
 
     if (!element.part_names().is_empty())
         record_element_parts_changed(element);
-    // NB: Asking the block itself does not build the views of its declarations.
-    if (auto const inline_style = element.inline_style(); inline_style && !inline_style->declaration_block().is_empty())
+    if (element.has_inline_style_declarations())
         record_element_inline_style_properties(element);
     if (element_has_presentational_hints_to_publish(element))
         StyleComputer::collect_presentational_hint_properties({ element });
@@ -1769,7 +1856,7 @@ void record_element_animation_effect_descriptions(DOM::Element& element, u8 slot
     versions.ensure_capacity(effects.size());
     for (auto const& effect : effects)
         versions.unchecked_append({ .identity = effect->animation_preparation_identity(), .generation = effect->animation_preparation_generation() });
-    if (StyleEngineFFI::style_engine_describes_animation_effects(style_engine->host(), element.style_node_id().value(), slot, versions.data(), versions.size()))
+    if (StyleEngineFFI::style_engine_describes_animation_effects(style_engine->host(), element.style_node_id().value(), slot, versions.span()))
         return;
 
     Vector<StyleEngineFFI::FfiPublishedAnimationEffect> ffi_effects;
@@ -2081,8 +2168,7 @@ static void record_element_inline_style_properties(DOM::Element& element)
     auto* style_engine = style_engine_for_published(element);
     if (!style_engine)
         return;
-    auto const inline_style = element.inline_style();
-    style_engine->set_element_inline_style_properties(element.style_node_id(), inline_style ? &inline_style->declaration_block() : nullptr);
+    style_engine->set_element_inline_style_properties(element.style_node_id(), element.inline_style_declarations());
 }
 
 // The hints an element's attributes map to, published at its arrival, wherever what they are mapped

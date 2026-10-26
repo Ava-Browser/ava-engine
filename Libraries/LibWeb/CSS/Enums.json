@@ -685,6 +685,11 @@
     "extra-expanded",
     "ultra-expanded"
   ],
+  "forced-color-adjust": [
+    "auto",
+    "none",
+    "preserve-parent-color"
+  ],
   "generic-font-family": [
     "serif",
     "sans-serif",
@@ -1163,6 +1168,11 @@
     "none",
     "inter-word",
     "inter-character"
+  ],
+  "text-orientation": [
+    "mixed",
+    "upright",
+    "sideways"
   ],
   "text-overflow": [
     "clip",

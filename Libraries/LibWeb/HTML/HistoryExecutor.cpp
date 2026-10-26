@@ -98,7 +98,7 @@ CrossProcessId HistoryExecutor::request_history_operation(HistoryOperationParame
     return request_history_operation(move(parameters), {});
 }
 
-CrossProcessId HistoryExecutor::request_history_operation(HistoryOperationParameters parameters, HistoryOperationState state)
+CrossProcessId HistoryExecutor::request_history_operation(HistoryOperationParameters parameters, HistoryOperationState&& state)
 {
     auto operation_id = m_page->client().allocate_cross_process_id();
     m_history_operations.set(operation_id, move(state));
@@ -341,7 +341,7 @@ void HistoryExecutor::run_ui_changing_navigable_history_job(CrossProcessId opera
 
     operation.changing_navigable_jobs.ensure(navigable_id);
 
-    queue_apply_history_step_task(*navigable, GC::create_function(heap(), [this, operation_id, navigation_type, user_involvement, population = move(population), source_snapshot_params, pending_document, claimed_target_entry = move(claimed_target_entry), navigable, on_complete]() mutable {
+    queue_apply_history_step_task(*navigable, GC::create_function(heap(), [this, operation_id, navigation_type, finalized_navigation_id, user_involvement, population = move(population), source_snapshot_params, pending_document, claimed_target_entry = move(claimed_target_entry), navigable, on_complete]() mutable {
         // 1. Let displayedEntry be navigable's active session history entry.
         auto displayed_entry = navigable->active_session_history_entry();
 
@@ -492,7 +492,7 @@ void HistoryExecutor::run_ui_changing_navigable_history_job(CrossProcessId opera
                     : Optional<URL::Origin> {};
                 navigable->queue_navigation_and_traversal_task_for_session_history_entry_population(
                     request.history_entry.url, request.source_snapshot_params.allows_downloading, move(fetch_client_origin),
-                    request.user_involvement, {}, params.release_value(), request.csp_navigation_type,
+                    request.user_involvement, request.navigation_id.is_empty() ? Optional<Utf16String> {} : Optional<Utf16String> { request.navigation_id }, params.release_value(), request.csp_navigation_type,
                     request.history_entry.document_state.reload_pending ? Bindings::NavigationTimingType::Reload : Bindings::NavigationTimingType::BackForward,
                     output, GC::create_function(heap(), [navigable, after_document_populated](GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> output) {
                         queue_apply_history_step_task(*navigable, GC::create_function(navigable->heap(), [after_document_populated, output] {
@@ -525,7 +525,9 @@ void HistoryExecutor::run_ui_changing_navigable_history_job(CrossProcessId opera
             // AD-HOC: Preserve reload pending for steps 6 and 7 before step 5 clears it.
             // See https://github.com/whatwg/html/issues/12760.
             auto input_reload_pending = target_entry->document_state()->reload_pending();
+            auto input_reload_bypasses_cache = target_entry->document_state()->reload_bypasses_cache();
             target_entry->document_state()->set_reload_pending(false);
+            target_entry->document_state()->set_reload_bypasses_cache(false);
             m_page->client().page_did_set_session_history_entry_document_state_reload_pending(
                 navigable->id(), target_entry->navigation_api_key(), false);
 
@@ -544,9 +546,10 @@ void HistoryExecutor::run_ui_changing_navigable_history_job(CrossProcessId opera
                 .csp_navigation_type = ContentSecurityPolicy::Directives::Directive::NavigationType::Other,
                 .history_handling = Bindings::NavigationHistoryBehavior::Replace,
                 .user_involvement = user_involvement,
-                .navigation_id = {},
+                .navigation_id = finalized_navigation_id.value_or(Utf16String {}),
             };
             request.history_entry.document_state.reload_pending = input_reload_pending;
+            request.history_entry.document_state.reload_bypasses_cache = input_reload_bypasses_cache;
 
             // 7. In parallel, attempt to populate the history entry's document for targetEntry, given navigable, potentiallyTargetSpecificSourceSnapshotParams,
             //    targetSnapshotParams, userInvolvement, with allowPOST set to allowPOST and completionSteps set to

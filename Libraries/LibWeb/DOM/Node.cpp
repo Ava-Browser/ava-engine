@@ -20,6 +20,7 @@
 #include <LibJS/Runtime/ExternalMemory.h>
 #include <LibWeb/Animations/Animation.h>
 #include <LibWeb/Bindings/Node.h>
+#include <LibWeb/Bindings/Sanitizer.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/GeneratedContent.h>
@@ -32,6 +33,7 @@
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/DOM/AccessibilityTreeNode.h>
 #include <LibWeb/DOM/Attr.h>
+#include <LibWeb/DOM/BindingsGlue.h>
 #include <LibWeb/DOM/CDATASection.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Comment.h>
@@ -64,10 +66,12 @@
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLDocument.h>
+#include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/HTMLFieldSetElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
+#include <LibWeb/HTML/HTMLInsertion.h>
 #include <LibWeb/HTML/HTMLLegendElement.h>
 #include <LibWeb/HTML/HTMLOptGroupElement.h>
 #include <LibWeb/HTML/HTMLOptionElement.h>
@@ -97,9 +101,12 @@
 #include <LibWeb/MathML/MathMLElement.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/PaintTiming/PaintTiming.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGTitleElement.h>
+#include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
+#include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 #include <LibWeb/VisualLines.h>
 #include <LibWeb/XLink/AttributeNames.h>
 #include <LibWebCommon/Infra/CharacterTypes.h>
@@ -1559,7 +1566,7 @@ void Node::detach_remaining_layout_nodes_for_removal()
     if (style_nodes.is_empty())
         return;
     // The detach is queued for the render state, and the host pays what it owes once the job that applies it is done.
-    Layout::RustFFI::render_state_detach_remaining_rows_for_removal(arena->host(), style_nodes.data(), style_nodes.size());
+    Layout::RustFFI::render_state_detach_remaining_rows_for_removal(arena->host(), style_nodes.span());
 }
 
 GC::RootVector<GC::Ref<HTML::HTMLSlotElement>> Node::descendant_slots_before_removal(Node& parent_root)
@@ -1855,7 +1862,10 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::replace_child(GC::Ref<Node> node, GC::R
     // 10. Let removedNodes be the empty set.
     GC::RootVector<GC::Ref<Node>> removed_nodes;
 
-    // 11. If child’s parent is non-null:
+    // 11. Adopt node into parent's node document.
+    document().adopt_node_steps(node);
+
+    // 12. If child’s parent is non-null:
     // NOTE: The above can only be false if child is node.
     if (child->parent()) {
         // 1. Set removedNodes to « child ».
@@ -1865,7 +1875,7 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::replace_child(GC::Ref<Node> node, GC::R
         child->remove(true);
     }
 
-    // 12. Let nodes be node’s children if node is a DocumentFragment node; otherwise « node ».
+    // 13. Let nodes be node’s children if node is a DocumentFragment node; otherwise « node ».
     GC::RootVector<GC::Ref<Node>> nodes;
     if (is<DocumentFragment>(*node))
         nodes = node->children_as_vector();
@@ -1876,14 +1886,14 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::replace_child(GC::Ref<Node> node, GC::R
     //         the sanity of inserting `node` before `reference_child` again, as well as
     //         `child` not being reinserted elsewhere.
     if (!reference_child || (reference_child->parent() == this && !child->parent_node())) {
-        // 13. Insert node into parent before referenceChild with suppressObservers set to true.
+        // 14. Insert node into parent before referenceChild with suppressObservers set to true.
         insert_before(node, reference_child, true);
     }
 
-    // 14. Queue a tree mutation record for parent with nodes, removedNodes, previousSibling, and referenceChild.
+    // 15. Queue a tree mutation record for parent with nodes, removedNodes, previousSibling, and referenceChild.
     queue_tree_mutation_record(nodes, removed_nodes, previous_sibling.ptr(), reference_child.ptr());
 
-    // 15. Return child.
+    // 16. Return child.
     return child;
 }
 
@@ -1944,11 +1954,10 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_node(GC::Ptr<Document> document, 
         //    registry null.
         copy_element.shadow_root()->set_keep_custom_element_registry_null(node_element->shadow_root()->keep_custom_element_registry_null());
 
-        // 7. For each child of node’s shadow root’s children, in tree order:
-        //    clone a node given child with document set to document, subtree set to subtree, and parent set to copy’s
-        //    shadow root.
+        // 7. For each child of node’s shadow root’s children, in tree order: clone a node given child with document set
+        //    to document, subtree set to true, and parent set to copy’s shadow root.
         for (auto child = node_element->shadow_root()->first_child(); child; child = child->next_sibling()) {
-            TRY(child->clone_node(document, subtree, copy_element.shadow_root()));
+            TRY(child->clone_node(document, true, copy_element.shadow_root()));
         }
     }
 
@@ -2060,6 +2069,16 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
 
     auto& old_parent_root = old_parent->root();
     auto descendant_slots = descendant_slots_before_removal(old_parent_root);
+
+    // A move into another tree scope keeps the style of the elements it takes along, so nothing unregisters the anchor
+    // names they registered in the old scope. The elements of shadow trees inside the moved subtree stay in their own
+    // scope. The moving steps register the names in the new scope.
+    if (is_connected() && &old_parent_root != &new_parent.root()) {
+        for_each_in_inclusive_subtree_of_type<Element>([&](Element& element) {
+            element.unregister_anchor_names_before_leaving_tree_scope({}, old_parent_root);
+            return TraversalDecision::Continue;
+        });
+    }
 
     // 13. Remove node from oldParent’s children.
     old_parent->remove_child_impl(*this);
@@ -2260,6 +2279,10 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_single_node(Document& document, G
             element_copy->append_attribute(name, Utf16String::from_utf16(value));
         });
 
+        // INTEROP: The copy takes the inline style declarations of node instead of having Content Security Policy
+        //          check the style attribute it was given again, so that styles set through CSSOM survive cloning.
+        element_copy->clone_inline_style_from(*element);
+
         copy = move(element_copy);
     }
 
@@ -2401,6 +2424,10 @@ void Node::set_document(Document& document)
         if (element->style_uses_if_css_function() || element->style_uses_custom_function() || element->style_depends_on_viewport_metrics())
             document.add_element_with_viewport_dependent_style(*element);
         element->on_document_changed(old_document, document);
+
+        // NB: The set of elements with rendered text is the old document's, and the element is not in the new
+        //     document's.
+        element->remove_from_set_of_elements_with_rendered_text();
     }
 }
 
@@ -2784,6 +2811,9 @@ void Node::inserted()
     // subtree arrival either, so it waits to arrive from here.
     if (auto* text = as_if<Text>(*this); text && text->style_node_id() == 0)
         CSS::record_text_connected(*text);
+
+    if (auto* text = as_if<Text>(*this); text && is_connected())
+        PaintTiming::text_node_may_be_painted_for_the_first_time(*text);
 
     if (auto* element = as_if<Element>(*this)) {
         // The content an element clones into its shadow tree from its own insertion steps lands under
@@ -3519,20 +3549,46 @@ WebIDL::ExceptionOr<Utf16String> Node::serialize_fragment(HTML::RequireWellForme
     return HTML::serialize_node_to_xml_string(*this, require_well_formed);
 }
 
-// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#unsafely-set-html
-WebIDL::ExceptionOr<void> Node::unsafely_set_html(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target, Utf16View html)
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-nondocumenttypechildnode-beforehtml
+WebIDL::ExceptionOr<void> Node::before_html(Utf16String const& html, Bindings::SetHTMLOptions const& options)
 {
-    // FIXME: Update for sanitizer API.
-    // 7. Let fragment be the result of invoking the HTML fragment parsing algorithm given target, html, true, and scriptingMode.
-    auto fragment = TRY(HTML::HTMLParser::parse_html_fragment(target, html, HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes));
+    // 1. Let parent be the parent for HTML insertion given this.
+    auto parent = TRY(HTML::parent_for_html_insertion(*this));
 
-    // 2. Let fragment be a new DocumentFragment whose node document is contextElement’s node document.
-    // The parser already produced the fragment.
+    // 2. If parent is null, then return.
+    if (!parent.has_value())
+        return {};
 
-    // Replace all with fragment within target.
-    target.visit([&](auto node) { node->replace_all(fragment); });
+    // 3. Filter and pre-insert HTML given parent, this, html, options, and Safe.
+    return HTML::filter_and_pre_insert_html(*parent, this, html.utf16_view(), &options, HTML::FragmentParserMode::Safe);
+}
 
-    return {};
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-nondocumenttypechildnode-afterhtml
+WebIDL::ExceptionOr<void> Node::after_html(Utf16String const& html, Bindings::SetHTMLOptions const& options)
+{
+    // 1. Let parent be the parent for HTML insertion given this.
+    auto parent = TRY(HTML::parent_for_html_insertion(*this));
+
+    // 2. If parent is null, then return.
+    if (!parent.has_value())
+        return {};
+
+    // 3. Filter and pre-insert HTML given parent, this's next sibling, html, options, and Safe.
+    return HTML::filter_and_pre_insert_html(*parent, next_sibling(), html.utf16_view(), &options, HTML::FragmentParserMode::Safe);
+}
+
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-nondocumenttypechildnode-replacewithhtml
+WebIDL::ExceptionOr<void> Node::replace_with_html(Utf16String const& html, Bindings::SetHTMLOptions const& options)
+{
+    // 1. Let parent be the parent for HTML insertion given this.
+    auto parent = TRY(HTML::parent_for_html_insertion(*this));
+
+    // 2. If parent is null, then return.
+    if (!parent.has_value())
+        return {};
+
+    // 3. Filter and replace with HTML given parent, this, html, options, and Safe.
+    return HTML::filter_and_replace_with_html(*parent, *this, html.utf16_view(), &options, HTML::FragmentParserMode::Safe);
 }
 
 // https://dom.spec.whatwg.org/#dom-node-issamenode
@@ -4373,6 +4429,17 @@ static void for_each_ascii_whitespace_separated_token(Utf16View input, Function<
     }
 }
 
+// The elements that the given element's aria-labelledby or aria-describedby refers to: its attr-associated elements if
+// it has the attribute, and otherwise those given by its default ARIA state and property semantics.
+static Optional<GC::RootVector<GC::Ref<Element>>> elements_referenced_for_name_or_description(Element const& element, Utf16FlyString const& attribute, Optional<Vector<GC::Weak<Element>> const&> explicitly_set_elements)
+{
+    if (element.has_attribute(attribute))
+        return element.get_the_attribute_associated_elements(attribute, explicitly_set_elements);
+    if (auto const* html_element = as_if<HTML::HTMLElement>(element))
+        return html_element->default_aria_state_or_property_elements(attribute);
+    return {};
+}
+
 ErrorOr<Utf16String> Node::name_or_description(Layout::BegunRead const& read, NameOrDescription target, Document const& document, HashTable<UniqueNodeID>& visited_nodes, IsDescendant is_descendant, ShouldComputeRole should_compute_role) const
 {
     // The text alternative for a given element is computed as follows:
@@ -4431,40 +4498,26 @@ ErrorOr<Utf16String> Node::name_or_description(Layout::BegunRead const& read, Na
         // - or, if computing a description, and the current node has an aria-describedby attribute that contains at least
         //   one valid IDREF, and the current node is not already part of an aria-describedby traversal, process its IDREFs
         //   in the order they occur:
-        auto aria_labelled_by = element->aria_labelled_by();
-        auto aria_described_by = element->aria_described_by();
+        // NB: We take the elements an IDREF refers to as the attr-associated elements of the attribute, so that the
+        //     elements set through ariaLabelledByElements, ariaDescribedByElements and ElementInternals count too.
+        auto referenced_elements = target == NameOrDescription::Name
+            ? elements_referenced_for_name_or_description(*element, ARIA::AttributeNames::aria_labelled_by, element->aria_labelled_by_elements())
+            : elements_referenced_for_name_or_description(*element, ARIA::AttributeNames::aria_described_by, element->aria_described_by_elements());
 
-        if ((target == NameOrDescription::Name && aria_labelled_by.has_value() && Node::first_valid_id(*aria_labelled_by, document).has_value())
-            || (target == NameOrDescription::Description && aria_described_by.has_value() && Node::first_valid_id(*aria_described_by, document).has_value())) {
+        if (referenced_elements.has_value() && !referenced_elements->is_empty()) {
 
             // i. Set the accumulated text to the empty string.
             total_accumulated_text.clear();
 
-            Vector<Utf16View> id_list;
-            if (target == NameOrDescription::Name) {
-                for_each_ascii_whitespace_separated_token(aria_labelled_by->utf16_view(), [&](auto id) {
-                    id_list.append(id);
-                    return IterationDecision::Continue;
-                });
-            } else {
-                for_each_ascii_whitespace_separated_token(aria_described_by->utf16_view(), [&](auto id) {
-                    id_list.append(id);
-                    return IterationDecision::Continue;
-                });
-            }
-
             // ii. For each IDREF:
-            for (auto const& id_ref : id_list) {
-                auto node = document.get_element_by_id(id_ref);
-                if (!node)
-                    continue;
+            for (auto node : *referenced_elements) {
                 // AD-HOC: The “For each IDREF” substep in the spec doesn’t seem to explicitly require the following
                 // check for an aria-label value; but the “div group explicitly labelledby self and heading” subtest at
                 // https://wpt.fyi/results/accname/name/comp_labelledby.html won’t pass unless we do this check.
                 // https://github.com/w3c/aria/issues/2388
-                if (target == NameOrDescription::Name && node->aria_label().has_value() && !node->aria_label()->is_empty() && !node->aria_label()->is_ascii_whitespace()) {
+                if (target == NameOrDescription::Name && node->aria_label_or_default_semantics().has_value() && !node->aria_label_or_default_semantics()->is_empty() && !node->aria_label_or_default_semantics()->is_ascii_whitespace()) {
                     total_accumulated_text.append_ascii(' ');
-                    total_accumulated_text.append(node->aria_label().value());
+                    total_accumulated_text.append(node->aria_label_or_default_semantics().value());
                 }
                 if (visited_nodes.contains(node->unique_id()))
                     continue;
@@ -4489,8 +4542,8 @@ ErrorOr<Utf16String> Node::name_or_description(Layout::BegunRead const& read, Na
             // falls back to aria-label” subtest at https://wpt.fyi/results/accname/name/comp_labelledby.html won’t pass
             // unless we do this check.
             // https://github.com/w3c/aria/issues/2388
-            if (total_accumulated_text.view().is_ascii_whitespace() && target == NameOrDescription::Name && element->aria_label().has_value() && !element->aria_label()->is_empty() && !element->aria_label()->is_ascii_whitespace())
-                return element->aria_label().release_value();
+            if (total_accumulated_text.view().is_ascii_whitespace() && target == NameOrDescription::Name && element->aria_label_or_default_semantics().has_value() && !element->aria_label_or_default_semantics()->is_empty() && !element->aria_label_or_default_semantics()->is_ascii_whitespace())
+                return element->aria_label_or_default_semantics().release_value();
             return total_accumulated_text.to_string();
         }
 
@@ -4502,11 +4555,11 @@ ErrorOr<Utf16String> Node::name_or_description(Layout::BegunRead const& read, Na
         // necessitate doing so, and the “input with label for association is superceded by aria-label” subtest at
         // https://wpt.fyi/results/accname/name/comp_label.html won’t pass unless we do this reordering.
         // Spec PR: https://github.com/w3c/aria/pull/2377
-        if (target == NameOrDescription::Name && element->aria_label().has_value() && !element->aria_label()->is_empty() && !element->aria_label()->is_ascii_whitespace()) {
+        if (target == NameOrDescription::Name && element->aria_label_or_default_semantics().has_value() && !element->aria_label_or_default_semantics()->is_empty() && !element->aria_label_or_default_semantics()->is_ascii_whitespace()) {
             // TODO: - If traversal of the current node is due to recursion and the current node is an embedded control as defined in step 2E, ignore aria-label and skip to rule 2E.
             // https://github.com/w3c/aria/pull/2385 and https://github.com/w3c/accname/issues/173
             if (!element->is_html_slot_element())
-                return element->aria_label().value();
+                return element->aria_label_or_default_semantics().value();
         }
 
         // C. Embedded Control: Otherwise, if the current node is a control embedded within the label (e.g. any element
@@ -4569,14 +4622,14 @@ ErrorOr<Utf16String> Node::name_or_description(Layout::BegunRead const& read, Na
                                 if (child->is_element()) {
                                     auto const& element = static_cast<DOM::Element const&>(*child);
                                     auto role = element.role_or_default();
-                                    auto aria_selected = element.aria_selected();
+                                    auto aria_selected = element.aria_selected_or_default_semantics();
                                     if (role == ARIA::Role::option && aria_selected.has_value() && aria_selected->utf16_view() == u"true"sv)
                                         builder.append(element.text_content().value());
                                 }
                             }
                         } else if (role == ARIA::Role::spinbutton || role == ARIA::Role::slider) {
-                            auto aria_valuenow = element.aria_value_now();
-                            auto aria_valuetext = element.aria_value_text();
+                            auto aria_valuenow = element.aria_value_now_or_default_semantics();
+                            auto aria_valuetext = element.aria_value_text_or_default_semantics();
 
                             // iii. Range: If the embedded control has role range (e.g., a spinbutton or slider):
                             // a. If the aria-valuetext property is present, return its value,
@@ -4778,7 +4831,7 @@ ErrorOr<Utf16String> Node::name_or_description(Layout::BegunRead const& read, Na
     // aria-labelledby or aria-describedby and/or un-hidden. See the comment for substep A above.
     if (is_text() && (!parent_element() || (parent_element()->is_referenced() || !parent_element()->is_hidden(read) || !parent_element()->has_hidden_ancestor(read) || parent_element()->has_referenced_and_hidden_ancestor(read)))) {
         if (auto const* text_node = as_if<Layout::TextNode>(layout_node(read))) {
-            auto text = text_node->rendered_text_for_dom(false);
+            auto text = text_node->rendered_text_for_dom();
             if (!text.is_empty())
                 return text;
         }
@@ -4845,33 +4898,26 @@ ErrorOr<Utf16String> Node::accessible_description(Document const& document) cons
         return Utf16String {};
 
     auto const* element = static_cast<Element const*>(this);
-    auto described_by = element->aria_described_by();
-    if (!described_by.has_value())
+    auto described_by_elements = elements_referenced_for_name_or_description(*element, ARIA::AttributeNames::aria_described_by, element->aria_described_by_elements());
+    if (!described_by_elements.has_value())
         return Utf16String {};
 
     HashTable<UniqueNodeID> visited_nodes;
     Utf16StringBuilder builder;
-    Vector<Utf16View> id_list;
-    for_each_ascii_whitespace_separated_token(described_by->utf16_view(), [&](auto id) {
-        id_list.append(id);
-        return IterationDecision::Continue;
-    });
-    for (auto id : id_list) {
-        if (auto description_element = document.get_element_by_id(id)) {
-            // Compute the text alternative (name) of the referenced element — not its description. The spec says to use
-            // the "text alternative computation" for referenced elements. IsDescendant::Yes marks this as an
-            // aria-describedby traversal, so step 2F takes the referenced element's content whatever its role — see the
-            // notes at step 2B and step 2F in name_or_description().
-            auto description = TRY(
-                description_element->name_or_description(read, NameOrDescription::Name, document,
-                    visited_nodes, IsDescendant::Yes));
-            if (!description.is_empty()) {
-                if (builder.is_empty()) {
-                    builder.append(description);
-                } else {
-                    builder.append_ascii(" "sv);
-                    builder.append(description);
-                }
+    for (auto description_element : *described_by_elements) {
+        // Compute the text alternative (name) of the referenced element — not its description. The spec says to use
+        // the "text alternative computation" for referenced elements. IsDescendant::Yes marks this as an
+        // aria-describedby traversal, so step 2F takes the referenced element's content whatever its role — see the
+        // notes at step 2B and step 2F in name_or_description().
+        auto description = TRY(
+            description_element->name_or_description(read, NameOrDescription::Name, document,
+                visited_nodes, IsDescendant::Yes));
+        if (!description.is_empty()) {
+            if (builder.is_empty()) {
+                builder.append(description);
+            } else {
+                builder.append_ascii(" "sv);
+                builder.append(description);
             }
         }
     }
@@ -4971,6 +5017,76 @@ GC::Ptr<ShadowRoot> Node::containing_shadow_root()
     if (auto* shadow_root = as_if<ShadowRoot>(root()))
         return shadow_root;
     return nullptr;
+}
+
+}
+
+namespace Web::Bindings {
+
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-nondocumenttypechildnode-beforehtmlunsafe
+WebIDL::ExceptionOr<void> before_html_unsafe(DOM::Node& node, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const& options)
+{
+    // 1. Let (compliantHTML, compliantOptions) be the result of invoking the get trusted type compliant input algorithm
+    //    with this's relevant global object, html, options, and "Node beforeHTMLUnsafe".
+    auto const [compliant_html, compliant_options] = TRY(TrustedTypes::get_trusted_type_compliant_input(
+        HTML::relevant_global_object(node),
+        html,
+        options,
+        TrustedTypes::InjectionSink::Node_beforeHTMLUnsafe));
+
+    // 2. Let parent be the parent for HTML insertion given this.
+    auto parent = TRY(HTML::parent_for_html_insertion(node));
+
+    // 3. If parent is null, then return.
+    if (!parent.has_value())
+        return {};
+
+    // 4. Filter and pre-insert HTML given parent, this, compliantHTML, compliantOptions, and Unsafe.
+    return HTML::filter_and_pre_insert_html(*parent, node, compliant_html.utf16_view(), HTML::to_sanitizer_options(compliant_options), HTML::FragmentParserMode::Unsafe);
+}
+
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-nondocumenttypechildnode-afterhtmlunsafe
+WebIDL::ExceptionOr<void> after_html_unsafe(DOM::Node& node, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const& options)
+{
+    // 1. Let (compliantHTML, compliantOptions) be the result of invoking the get trusted type compliant input algorithm
+    //    with this's relevant global object, html, options, and "Node afterHTMLUnsafe".
+    auto const [compliant_html, compliant_options] = TRY(TrustedTypes::get_trusted_type_compliant_input(
+        HTML::relevant_global_object(node),
+        html,
+        options,
+        TrustedTypes::InjectionSink::Node_afterHTMLUnsafe));
+
+    // 2. Let parent be the parent for HTML insertion given this.
+    auto parent = TRY(HTML::parent_for_html_insertion(node));
+
+    // 3. If parent is null, then return.
+    if (!parent.has_value())
+        return {};
+
+    // 4. Filter and pre-insert HTML given parent, this's next sibling, compliantHTML, compliantOptions, and Unsafe.
+    return HTML::filter_and_pre_insert_html(*parent, node.next_sibling(), compliant_html.utf16_view(), HTML::to_sanitizer_options(compliant_options), HTML::FragmentParserMode::Unsafe);
+}
+
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-nondocumenttypechildnode-replacewithhtmlunsafe
+WebIDL::ExceptionOr<void> replace_with_html_unsafe(DOM::Node& node, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const& options)
+{
+    // 1. Let (compliantHTML, compliantOptions) be the result of invoking the get trusted type compliant input algorithm
+    //    with this's relevant global object, html, options, and "Node replaceWithHTMLUnsafe".
+    auto const [compliant_html, compliant_options] = TRY(TrustedTypes::get_trusted_type_compliant_input(
+        HTML::relevant_global_object(node),
+        html,
+        options,
+        TrustedTypes::InjectionSink::Node_replaceWithHTMLUnsafe));
+
+    // 2. Let parent be the parent for HTML insertion given this.
+    auto parent = TRY(HTML::parent_for_html_insertion(node));
+
+    // 3. If parent is null, then return.
+    if (!parent.has_value())
+        return {};
+
+    // 4. Filter and replace with HTML given parent, this, compliantHTML, compliantOptions, and Unsafe.
+    return HTML::filter_and_replace_with_html(*parent, node, compliant_html.utf16_view(), HTML::to_sanitizer_options(compliant_options), HTML::FragmentParserMode::Unsafe);
 }
 
 }

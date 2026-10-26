@@ -12,14 +12,20 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ak::Utf16String;
+use libcompositing_rust::display_list::canvas_2d_recorder::ColorSpace;
 use libcompositing_rust::filter_bytes::FfiFilterFunction;
 use libgfx_rust::Color;
 use libgfx_rust::font::FontCascadeListHandle;
 use libgfx_rust::image_frame::ImageFrameHandle;
 use libjs_rust::api::{Gc, Object, Realm};
 
+use super::drawing_state::{CanvasColor, DrawingState};
 use super::host::CppTransport;
 use crate::bindings::conversions::CppInterface;
+use crate::html::canvas_text_drawing_styles::{
+    CanvasFontKerning, CanvasFontStretch, CanvasFontVariantCaps, CanvasTextRendering,
+};
+use crate::html::predefined_color_space::PredefinedColorSpace;
 
 unsafe extern "C" {
     fn web_canvas_2d_canvas_did_change_content(canvas_host: *mut c_void);
@@ -28,17 +34,21 @@ unsafe extern "C" {
     fn web_canvas_2d_canvas_wrapper(canvas: *mut c_void, canvas_is_offscreen: bool, realm: *mut c_void) -> *mut c_void;
     fn web_canvas_2d_canvas_relevant_realm(canvas_host: *mut c_void) -> *mut c_void;
     fn web_canvas_2d_canvas_font_environment_generation(canvas_host: *mut c_void) -> u64;
+    fn web_canvas_2d_canvas_directionality_is_rtl(canvas: *mut c_void, canvas_is_offscreen: bool) -> bool;
     fn web_canvas_2d_canvas_resolve_font(
         canvas: *mut c_void,
         canvas_is_offscreen: bool,
         font: usize,
+        font_selection: FontSelection,
         out_font: *mut ResolvedFontAbi,
     ) -> bool;
     fn web_canvas_2d_canvas_resolve_color(
         canvas_host: *mut c_void,
         color: *const c_void,
         font: FontMetricsSource,
+        color_space: ColorSpace,
         out_color: *mut Color,
+        out_color_in_color_space: *mut Color,
     );
     fn web_canvas_2d_canvas_resolve_length(
         canvas_host: *mut c_void,
@@ -61,6 +71,7 @@ unsafe extern "C" {
         pitch: usize,
         width: i32,
         height: i32,
+        color_space: ColorSpace,
     ) -> *mut c_void;
 
     fn web_canvas_2d_check_usability_of_image(
@@ -124,6 +135,28 @@ struct ResolvedFontAbi {
     font_size: i32,
     /// An AK::Utf16String that the caller takes over.
     serialized: usize,
+}
+
+/// `CanvasFontSelection` of Canvas2DContextBase.cpp: the text drawing styles of a context that select the fonts of
+/// its text beside its font, by the values of their enumerations.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct FontSelection {
+    font_kerning: CanvasFontKerning,
+    font_stretch: CanvasFontStretch,
+    font_variant_caps: CanvasFontVariantCaps,
+    text_rendering: CanvasTextRendering,
+}
+
+impl FontSelection {
+    pub(crate) fn of(state: &DrawingState) -> Self {
+        Self {
+            font_kerning: state.font_kerning,
+            font_stretch: state.font_stretch,
+            font_variant_caps: state.font_variant_caps,
+            text_rendering: state.text_rendering,
+        }
+    }
 }
 
 /// The font of a context: the cascade of fonts that its text is drawn with, the font environment that chose them, and
@@ -263,9 +296,14 @@ impl Canvas {
         unsafe { web_canvas_2d_canvas_font_environment_generation(self.host.as_ptr()) }
     }
 
+    /// Whether the directionality of a canvas element, or the inherited direction of an OffscreenCanvas, is 'rtl'.
+    pub(crate) fn directionality_is_rtl(self) -> bool {
+        unsafe { web_canvas_2d_canvas_directionality_is_rtl(self.cell.as_ptr(), self.is_offscreen) }
+    }
+
     /// The font that a value of the font attribute describes, resolved against the canvas, unless the value is not a
     /// CSS font.
-    pub(crate) fn resolve_font(self, font: &Utf16String) -> Option<ResolvedFont> {
+    pub(crate) fn resolve_font(self, font: &Utf16String, font_selection: FontSelection) -> Option<ResolvedFont> {
         let mut resolved = ResolvedFontAbi {
             cascade: core::ptr::null(),
             environment_generation: 0,
@@ -277,6 +315,7 @@ impl Canvas {
                 self.cell.as_ptr(),
                 self.is_offscreen,
                 font.raw_identity(),
+                font_selection,
                 &raw mut resolved,
             )
         };
@@ -293,11 +332,26 @@ impl Canvas {
         })
     }
 
-    /// The used color of a parsed CSS color, resolved against the canvas.
-    pub(crate) fn resolve_color(self, color: &StyleValue, font: FontMetricsSource) -> Color {
-        let mut resolved = Color::default();
-        unsafe { web_canvas_2d_canvas_resolve_color(self.host.as_ptr(), color.0.as_ptr(), font, &raw mut resolved) };
-        resolved
+    /// The used color of a parsed CSS color, resolved against the canvas, in sRGB and in the color space.
+    pub(crate) fn resolve_color(
+        self,
+        color: &StyleValue,
+        font: FontMetricsSource,
+        color_space: PredefinedColorSpace,
+    ) -> CanvasColor {
+        let mut srgb = Color::default();
+        let mut in_color_space = Color::default();
+        unsafe {
+            web_canvas_2d_canvas_resolve_color(
+                self.host.as_ptr(),
+                color.0.as_ptr(),
+                font,
+                color_space.into(),
+                &raw mut srgb,
+                &raw mut in_color_space,
+            );
+        };
+        CanvasColor { srgb, in_color_space }
     }
 
     /// A parsed CSS length in CSS pixels, resolved against the canvas.
@@ -343,8 +397,8 @@ pub(crate) fn parse_length(length: &Utf16String) -> Option<(StyleValue, Utf16Str
     Some((style_value, unsafe { Utf16String::from_raw_owned(serialized) }))
 }
 
-/// A frame of a copy of `height` rows of `width` RGBA8888 pixels that are unpremultiplied, `pitch` bytes apart, or
-/// None if there is no memory for it.
+/// A frame of a copy of `height` rows of `width` RGBA8888 pixels that are unpremultiplied, `pitch` bytes apart and in
+/// the color space, or None if there is no memory for it.
 ///
 /// # Safety
 ///
@@ -354,9 +408,10 @@ pub(crate) unsafe fn image_frame_from_pixels(
     pitch: usize,
     width: i32,
     height: i32,
+    color_space: ColorSpace,
 ) -> Option<ImageFrameHandle> {
     // SAFETY: The caller passes readable rows.
-    let frame = unsafe { web_canvas_2d_image_frame_from_pixels(first_row.as_ptr(), pitch, width, height) };
+    let frame = unsafe { web_canvas_2d_image_frame_from_pixels(first_row.as_ptr(), pitch, width, height, color_space) };
     // SAFETY: LibWeb hands over a frame that it allocated with new, or null.
     (!frame.is_null()).then(|| unsafe { ImageFrameHandle::adopt(frame) })
 }

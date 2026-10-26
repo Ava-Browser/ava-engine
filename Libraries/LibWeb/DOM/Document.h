@@ -53,10 +53,12 @@
 #include <LibWeb/HTML/PreloadEntry.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
+#include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HTML/TextDirective.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/PaintTiming/DocumentPaintTimingState.h>
 #include <LibWeb/Painting/DisplayListRecording.h>
 #include <LibWeb/Painting/FlexboxInspectorOverlay.h>
 #include <LibWeb/Painting/Forward.h>
@@ -75,6 +77,7 @@
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebCommon/HTML/UserNavigationInvolvement.h>
 #include <LibWebCommon/HTML/VisibilityState.h>
+#include <LibWebCommon/PermissionsPolicy/PermissionsPolicy.h>
 
 namespace Web {
 
@@ -180,6 +183,7 @@ enum class InvalidateLayoutTreeReason {
     X(HTMLInputElementHeight, true)                 \
     X(HTMLInputElementWidth, true)                  \
     X(HTMLLabelElementActivationBehavior, false)    \
+    X(HighlightRegistryHighlightsFromPoint, false)  \
     X(InspectAccessibilityTree, false)              \
     X(InspectDOMTree, false)                        \
     X(InspectDevToolsLayoutData, false)             \
@@ -266,17 +270,7 @@ struct DocumentUnloadTimingInfo {
     HighResolutionTime::DOMHighResTimeStamp unload_event_end_time { 0 };
 };
 
-enum class PolicyControlledFeature : u8 {
-    Autoplay,
-    Camera,
-    EncryptedMedia,
-    FocusWithoutUserActivation,
-    Fullscreen,
-    Gamepad,
-    Microphone,
-    PictureInPicture,
-    WindowManagement,
-};
+using PolicyControlledFeature = PermissionsPolicy::PolicyControlledFeature;
 
 struct PendingFullscreenEvent {
     enum class Type {
@@ -348,12 +342,15 @@ public:
     void set_find_in_page_active_match(GC::Ptr<Range>);
     void collapse_find_in_page_active_match_if_its_text_changed();
     Vector<GC::Ref<Range>> const& find_in_page_highlighted_matches() const { return m_find_in_page_highlighted_matches; }
-    void set_find_in_page_highlighted_matches(Vector<GC::Ref<Range>>);
+    void set_find_in_page_highlighted_matches(GC::RootVector<GC::Ref<Range>>);
     void remove_find_in_page_highlighted_matches_whose_text_changed();
 
     Editing::SpellingMarkers& spelling_markers();
     Editing::SpellCheckController& spell_check_controller();
     Editing::SpellCheckController* spell_check_controller_if_exists() { return m_spell_check_controller.ptr(); }
+    Editing::WritingSuggestionController& writing_suggestion_controller();
+    Editing::WritingSuggestionController* writing_suggestion_controller_if_exists() { return m_writing_suggestion_controller.ptr(); }
+    Editing::WritingSuggestionController const* writing_suggestion_controller_if_exists() const { return m_writing_suggestion_controller.ptr(); }
     bool has_spelling_markers() const;
     void recompute_search_text_paint_states(Layout::BegunRead const&);
     void note_spelling_markers_changed();
@@ -645,6 +642,9 @@ public:
     // Whether the last layout committed a box whose `content-visibility` is `auto`.
     bool has_boxes_with_auto_content_visibility() const;
     Compositing::AccumulatedVisualContextTree visual_context_tree() const;
+
+    PaintTiming::DocumentPaintTimingState& paint_timing_state() { return m_paint_timing_state; }
+
     Compositing::ScrollStateSnapshot const& scroll_state_snapshot() const;
 
     GC::Ref<NodeList> get_elements_by_name(Utf16View);
@@ -661,6 +661,7 @@ public:
 
     // https://drafts.csswg.org/css-font-loading/#font-source
     GC::Ref<CSS::FontFaceSet> fonts();
+    GC::Ref<CSS::HighlightRegistry> highlight_registry();
 
     void clear();
     void capture_events();
@@ -834,6 +835,12 @@ public:
     bool ready_for_post_load_tasks() const { return m_ready_for_post_load_tasks; }
     void set_ready_for_post_load_tasks(bool ready);
 
+    // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#print-when-loaded
+    bool print_when_loaded() const { return m_print_when_loaded; }
+    void set_print_when_loaded() { m_print_when_loaded = true; }
+
+    void run_the_printing_steps();
+
     void completely_finish_loading();
     bool completely_loaded_deferred() const { return m_completely_loaded_deferred; }
     void queue_navigation_timing_entry();
@@ -853,6 +860,11 @@ public:
     bool browsing_context_group_has_multiple_contexts() const;
     bool browsing_context_group_has_remote_contexts() const { return m_browsing_context_group_has_remote_contexts; }
     void set_browsing_context_group_has_remote_contexts(bool value) { m_browsing_context_group_has_remote_contexts = value; }
+
+    // AD-HOC: Whether this document is still loading after a navigation that bypassed the HTTP cache: a reload that
+    //         bypasses it, or a child navigable's navigation while its container document loaded that way. Until it
+    //         has completely loaded, the requests it makes without a cache mode of their own bypass the cache too.
+    bool is_loading_bypassing_cache() const { return m_navigation_bypassed_cache && !is_completely_loaded(); }
 
     GC::Ptr<HTML::HTMLScriptElement> current_script() const { return m_current_script.ptr(); }
     void set_current_script(Badge<HTML::HTMLScriptElement>, GC::Ptr<HTML::HTMLScriptElement> script) { m_current_script = move(script); }
@@ -1023,6 +1035,10 @@ public:
 
     // https://html.spec.whatwg.org/multipage/dom.html#is-initial-about:blank
     bool is_initial_about_blank() const { return m_is_initial_about_blank; }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#concept-document-navigation-id
+    Optional<Utf16String> const& during_loading_navigation_id_for_webdriver_bidi() const { return m_navigation_id; }
+    void set_during_loading_navigation_id_for_webdriver_bidi(Optional<Utf16String> navigation_id) { m_navigation_id = move(navigation_id); }
     void set_is_initial_about_blank(bool b) { m_is_initial_about_blank = b; }
 
     bool iframe_load_in_progress() const { return m_iframe_load_in_progress; }
@@ -1067,9 +1083,13 @@ public:
     HTML::SandboxingFlagSet active_sandboxing_flag_set() const;
     void set_active_sandboxing_flag_set(HTML::SandboxingFlagSet);
 
+    // https://html.spec.whatwg.org/multipage/dom.html#concept-document-permissions-policy
+    PermissionsPolicy::PermissionsPolicy const& permissions_policy() const { return m_permissions_policy; }
+    void set_permissions_policy(PermissionsPolicy::PermissionsPolicy policy) { m_permissions_policy = move(policy); }
+
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-policy-container
-    GC::Ref<HTML::PolicyContainer> policy_container() const;
-    void set_policy_container(GC::Ref<HTML::PolicyContainer>);
+    NonnullRefPtr<HTML::PolicyContainer> policy_container() const;
+    void set_policy_container(NonnullRefPtr<HTML::PolicyContainer>);
 
     Vector<GC::Root<HTML::Navigable>> descendant_navigables();
     Vector<GC::Root<HTML::Navigable>> const descendant_navigables() const;
@@ -1187,8 +1207,8 @@ public:
 
     void update_for_history_step_application(NonnullRefPtr<HTML::SessionHistoryEntry>, bool do_not_reactivate, size_t script_history_length, size_t script_history_index, Optional<HTML::NavigationType> navigation_type, Optional<Vector<NonnullRefPtr<HTML::SessionHistoryEntry>>> entries_for_navigation_api = {}, RefPtr<HTML::SessionHistoryEntry> previous_entry_for_activation = {}, bool previous_entry_for_activation_document_is_initial_about_blank = false, bool allow_text_directive_scroll = false, Optional<URL::Origin> initiator_origin = {}, Optional<HTML::UserNavigationInvolvement> user_involvement = {});
 
-    HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>>& shared_resource_requests();
-    HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>> const& shared_resource_requests() const;
+    HashMap<HTML::SharedResourceRequest::Key, GC::Ptr<HTML::SharedResourceRequest>>& shared_resource_requests();
+    HashMap<HTML::SharedResourceRequest::Key, GC::Ptr<HTML::SharedResourceRequest>> const& shared_resource_requests() const;
     CSS::ImageStyleValueResource* css_image_resource(URL::URL const&);
     CSS::ImageStyleValueResource& create_css_image_resource(GC::Ref<HTML::SharedResourceRequest>);
     void remove_css_image_resource_if_unused(URL::URL const&);
@@ -1483,7 +1503,7 @@ public:
 
     Vector<GC::Root<Range>> find_matching_text(Utf16View, CaseSensitivity);
 
-    void parse_html_from_a_string(Utf16View);
+    void parse_html_from_a_string(Utf16View, HTML::SanitizerConfiguration const* = nullptr);
 
     void set_console_client(GC::Ptr<JS::ConsoleClient> console_client) { m_console_client = console_client; }
     GC::Ptr<JS::ConsoleClient> console_client() const { return m_console_client; }
@@ -1947,6 +1967,7 @@ private:
     Optional<Utf16String> m_encoding;
 
     bool m_ready_for_post_load_tasks { false };
+    bool m_print_when_loaded { false };
 
     GC::Ptr<DOMImplementation> m_implementation;
     GC::Ptr<FragmentDirective> m_fragment_directive;
@@ -1959,6 +1980,7 @@ private:
     // Each Document has a text directive user activation, which is a boolean, initially false.
     bool m_text_directive_user_activation { false };
     bool m_browsing_context_group_has_remote_contexts { false };
+    bool m_navigation_bypassed_cache { false };
     GC::Ptr<HTML::HTMLScriptElement> m_current_script;
 
     u32 m_ignore_destructive_writes_counter { 0 };
@@ -2090,6 +2112,9 @@ private:
     // https://drafts.csswg.org/css-font-loading/#font-source
     GC::Ref<CSS::FontFaceSet> m_fonts;
 
+    // https://drafts.csswg.org/css-highlight-api-1/#highlight-registry
+    GC::Ptr<CSS::HighlightRegistry> m_highlight_registry;
+
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#completely-loaded-time
     Optional<AK::UnixDateTime> m_completely_loaded_time;
     bool m_completely_loaded_deferred { false };
@@ -2104,8 +2129,11 @@ private:
     // https://html.spec.whatwg.org/multipage/origin.html#active-sandboxing-flag-set
     HTML::SandboxingFlagSet m_active_sandboxing_flag_set;
 
+    // https://html.spec.whatwg.org/multipage/dom.html#concept-document-permissions-policy
+    PermissionsPolicy::PermissionsPolicy m_permissions_policy { PermissionsPolicy::PermissionsPolicy::empty_permissions_policy() };
+
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-policy-container
-    mutable GC::Ptr<HTML::PolicyContainer> m_policy_container;
+    mutable RefPtr<HTML::PolicyContainer> m_policy_container;
 
     // https://html.spec.whatwg.org/multipage/interaction.html#visibility-state
     HTML::VisibilityState m_visibility_state { HTML::VisibilityState::Hidden };
@@ -2134,6 +2162,7 @@ private:
     Vector<GC::Ref<Range>> m_find_in_page_highlighted_matches;
     OwnPtr<Editing::SpellingMarkers> m_spelling_markers;
     OwnPtr<Editing::SpellCheckController> m_spell_check_controller;
+    OwnPtr<Editing::WritingSuggestionController> m_writing_suggestion_controller;
     Vector<Utf16String> m_find_in_page_highlighted_match_texts;
     u64 m_find_in_page_highlighted_matches_dom_tree_version { 0 };
     u64 m_find_in_page_highlighted_matches_character_data_version { 0 };
@@ -2162,6 +2191,8 @@ private:
     HashTable<URL::URL> m_list_of_speculative_fetch_urls;
 
     GC::Ptr<CSS::VisualViewport> m_visual_viewport;
+
+    PaintTiming::DocumentPaintTimingState m_paint_timing_state;
 
     // NOTE: Not in the spec per se, but Document must be able to access all IntersectionObservers whose root is in the document.
     GC::WeakHashSet<IntersectionObserver::IntersectionObserver> m_intersection_observers;
@@ -2195,7 +2226,7 @@ private:
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#latest-entry
     RefPtr<HTML::SessionHistoryEntry> m_latest_entry;
 
-    HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>> m_shared_resource_requests;
+    HashMap<HTML::SharedResourceRequest::Key, GC::Ptr<HTML::SharedResourceRequest>> m_shared_resource_requests;
     HashMap<URL::URL, OwnPtr<CSS::ImageStyleValueResource>> m_css_image_resources;
 
     // https://www.w3.org/TR/web-animations-1/#timeline-associated-with-a-document
@@ -2352,6 +2383,7 @@ private:
     GC::Ptr<Editing::EditingHistory> m_editing_history;
 
     bool m_inside_exec_command { false };
+    bool m_inside_clipboard_exec_command { false };
     bool m_running_editing_command_action { false };
     bool m_preserve_selection_offsets_during_identical_character_data_replacement { false };
 

@@ -257,6 +257,18 @@
       "align-self"
     ]
   },
+  "alignment-baseline": {
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "baseline",
+    "requires-computation": "never",
+    "valid-types": [
+      "baseline-metric"
+    ],
+    "valid-identifiers": [
+      "baseline"
+    ]
+  },
   "all": {
     "affects-layout": true,
     "affects-stacking-context": true,
@@ -720,6 +732,35 @@
       "contain"
     ],
     "percentages-resolve-to": "length"
+  },
+  "baseline-shift": {
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "percentages-resolve-to": "length",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [-∞,∞]",
+      "percentage [-∞,∞]"
+    ],
+    "valid-identifiers": [
+      "sub",
+      "super",
+      "top",
+      "center",
+      "bottom"
+    ]
+  },
+  "baseline-source": {
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "first",
+      "last"
+    ]
   },
   "block-ellipsis": {
     "style-group": "InheritedTextValues",
@@ -2465,6 +2506,22 @@
       "font-optical-sizing"
     ]
   },
+  "font-palette": {
+    "__comment": "FIXME: Select the COLR palette when the font API supports palette selection. INTEROP: Animate discretely until palette-mix() is supported by multiple engines.",
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "normal",
+    "requires-computation": "never",
+    "valid-types": [
+      "dashed-ident"
+    ],
+    "valid-identifiers": [
+      "normal",
+      "light",
+      "dark"
+    ]
+  },
   "font-size": {
     "style-group": "FontValues",
     "animation-type": "by-computed-value",
@@ -2508,6 +2565,47 @@
     "requires-computation": "cascaded-value",
     "valid-types": [
       "font-style"
+    ]
+  },
+  "font-synthesis-position": {
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "none"
+    ]
+  },
+  "font-synthesis-small-caps": {
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "none"
+    ]
+  },
+  "font-synthesis-style": {
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "none",
+      "oblique-only"
+    ]
+  },
+  "font-synthesis-weight": {
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "none"
     ]
   },
   "font-variant": {
@@ -2641,6 +2739,17 @@
     "valid-types": [
       "percentage [0,∞]",
       "font-width"
+    ]
+  },
+  "forced-color-adjust": {
+    "style-group": "InheritedUIValues",
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-types": [
+      "forced-color-adjust"
     ]
   },
   "gap": {
@@ -2910,6 +3019,19 @@
       "unitless-length"
     ],
     "needs-layout-for-getcomputedstyle": true
+  },
+  "hyphenate-character": {
+    "__comment": "FIXME: Use this string when hyphenation is implemented.",
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-types": [
+      "string"
+    ],
+    "valid-identifiers": [
+      "auto"
+    ]
   },
   "image-rendering": {
     "style-group": "InheritedBoxValues",
@@ -5068,6 +5190,22 @@
       "text-align"
     ]
   },
+  "text-align-last": {
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "start",
+      "end",
+      "left",
+      "right",
+      "center",
+      "justify",
+      "match-parent"
+    ]
+  },
   "text-anchor": {
     "style-group": "InheritedSVGValues",
     "animation-type": "discrete",
@@ -5150,6 +5288,19 @@
     ],
     "percentages-resolve-to": "length"
   },
+  "text-emphasis-position": {
+    "__comment": "FIXME: Use this position when text emphasis rendering is implemented.",
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "over right",
+    "requires-computation": "non-inherited-value",
+    "valid-identifiers": [
+      "over",
+      "under",
+      "left",
+      "right"
+    ]
+  },
   "text-indent": {
     "style-group": "InheritedTextValues",
     "animation-type": "by-computed-value",
@@ -5180,6 +5331,16 @@
     ],
     "valid-identifiers": [
       "distribute>inter-character"
+    ]
+  },
+  "text-orientation": {
+    "style-group": "InheritedBoxValues",
+    "animation-type": "none",
+    "inherited": true,
+    "initial": "mixed",
+    "requires-computation": "never",
+    "valid-types": [
+      "text-orientation"
     ]
   },
   "text-overflow": {
@@ -5579,6 +5740,21 @@
       "dashed-ident"
     ],
     "multiplicity": "coordinating-list"
+  },
+  "view-transition-class": {
+    "style-group": "MiscResetValues",
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "none",
+    "multiplicity": "list",
+    "requires-computation": "never",
+    "valid-types": [
+      "custom-ident ![none]"
+    ],
+    "valid-identifiers": [
+      "none"
+    ]
   },
   "view-transition-name": {
     "style-group": "MiscResetValues",

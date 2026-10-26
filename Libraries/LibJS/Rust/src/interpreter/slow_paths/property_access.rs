@@ -43,7 +43,7 @@ use crate::runtime::error_types::ErrorType;
 use crate::runtime::object::{IndexedStorageKind, Object};
 use crate::runtime::private_environment::{PrivateEnvironment, PrivateName};
 use crate::runtime::property_attributes::{Attribute, DEFAULT_ATTRIBUTES, PropertyAttributes};
-use crate::runtime::property_key::PropertyKey;
+use crate::runtime::property_key::{NonSymbolPropertyKey, PropertyKey};
 use crate::runtime::reference::Reference;
 use crate::runtime::typed_array::{Kind, is_valid_integer_index, typed_array_of_object};
 
@@ -177,7 +177,7 @@ pub fn get_by_id_cached_accessor(
             let completed_holder = completed.prototype.unwrap_or(object);
             let completed_value = completed_holder.get_direct(completed.property_offset);
             if completed_value.is_accessor() && completed_value.as_accessor().getter() == Some(getter) {
-                completed_entry.direct_getter_validated.set(true);
+                completed_entry.getter.set(Some(getter));
             }
         }
     }
@@ -1000,11 +1000,10 @@ impl<'vm> SeenObjects<'vm> {
     }
 }
 
-/// The keys a for-in has already decided about while it walks up the prototype chain. The keys are never symbols,
-/// so a plain set may hold them.
+/// The keys a for-in has already decided about while it walks up the prototype chain.
 struct ShadowingState {
-    seen_non_enumerable_properties: HashSet<PropertyKey>,
-    seen_properties: Option<HashSet<PropertyKey>>,
+    seen_non_enumerable_properties: HashSet<NonSymbolPropertyKey>,
+    seen_properties: Option<HashSet<NonSymbolPropertyKey>>,
 }
 
 impl ShadowingState {
@@ -1015,14 +1014,21 @@ impl ShadowingState {
         }
     }
 
-    fn ensure_seen_properties(&mut self, properties: &MarkedVec<'_, PropertyKey>) -> &mut HashSet<PropertyKey> {
+    fn key(property_key: &PropertyKey) -> NonSymbolPropertyKey {
+        NonSymbolPropertyKey::new(property_key.clone()).expect("a for-in visits no symbols")
+    }
+
+    fn ensure_seen_properties(
+        &mut self,
+        properties: &MarkedVec<'_, PropertyKey>,
+    ) -> &mut HashSet<NonSymbolPropertyKey> {
         self.seen_properties.get_or_insert_with(|| {
             // Prototype shadowing ignores enumerability, so once we start looking
             // above the receiver we need an explicit visited set for names we have
             // already decided to expose from lower objects.
             let mut seen_properties = HashSet::with_capacity(properties.len());
             for index in 0..properties.len() {
-                seen_properties.insert(properties.get(index).expect("the index is in bounds"));
+                seen_properties.insert(Self::key(&properties.get(index).expect("the index is in bounds")));
             }
             seen_properties
         })
@@ -1037,7 +1043,7 @@ impl ShadowingState {
         in_prototype_chain: bool,
     ) {
         if !enumerable {
-            self.seen_non_enumerable_properties.insert(property_key.clone());
+            self.seen_non_enumerable_properties.insert(Self::key(property_key));
         }
         if in_prototype_chain && enumerable {
             if self.seen_non_enumerable_properties.contains(property_key) {
@@ -1051,7 +1057,7 @@ impl ShadowingState {
             properties.push(property_key.clone());
         }
         if let Some(seen_properties) = &mut self.seen_properties {
-            seen_properties.insert(property_key.clone());
+            seen_properties.insert(Self::key(property_key));
         }
     }
 }
@@ -1145,7 +1151,9 @@ fn try_get_fast_property_name_iterator_data(
         // table, but it still shadows enumerable `length` properties higher up the
         // prototype chain during for-in.
         if current.has_magical_length_property() {
-            shadowing.seen_non_enumerable_properties.insert(vm.names.length.clone());
+            shadowing
+                .seen_non_enumerable_properties
+                .insert(ShadowingState::key(&vm.names.length));
         }
 
         current
@@ -1404,15 +1412,16 @@ pub fn try_inline_get_by_id_accessor(vm: &Vm, pc: u32, instruction: &op::GetById
     let holder = entry.prototype.unwrap_or(object);
     let value = holder.get_direct(entry.property_offset);
     assert!(value.is_accessor());
-    if entry.prototype.is_none()
-        && let Some(slot) = cache.first_entry_slot()
-    {
-        slot.accessor.set(Some(value.as_accessor()));
-    }
-
     let Some(getter) = value.as_accessor().getter() else {
         return false;
     };
+    if entry.prototype.is_none()
+        && !function_object_as_object(getter).is_direct_getter_function()
+        && let Some(slot) = cache.first_entry_slot()
+    {
+        slot.getter.set(Some(getter));
+    }
+
     let Some(getter_function) = as_ecmascript_function_object(getter) else {
         return false;
     };

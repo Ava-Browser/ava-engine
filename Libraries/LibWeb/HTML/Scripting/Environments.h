@@ -23,6 +23,7 @@
 #include <LibWeb/ServiceWorker/Registration.h>
 #include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
 #include <LibWebCommon/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
+#include <LibWebCommon/UpgradeInsecureRequests/InsecureRequestsPolicy.h>
 
 namespace Web::HTML {
 
@@ -103,7 +104,7 @@ public:
     virtual bool has_cross_site_ancestor() const = 0;
 
     // A policy container https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-policy-container
-    virtual GC::Ref<PolicyContainer> policy_container() const = 0;
+    virtual NonnullRefPtr<PolicyContainer> policy_container() const = 0;
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-cross-origin-isolated-capability
     virtual CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability() const = 0;
@@ -114,6 +115,10 @@ public:
     //         a dedicated worker's or a worklet's is its owner's; and a shared or service worker agent names a cluster
     //         of its own. An empty value names no cluster at all, and so matches none.
     virtual Optional<u64> agent_cluster_id() const = 0;
+
+    // https://html.spec.whatwg.org/multipage/webappapis.html#agent-cluster-cross-origin-isolation
+    // Of the agent cluster agent_cluster_id names.
+    virtual CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode() const = 0;
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-time-origin
     virtual double time_origin() const = 0;
@@ -130,6 +135,14 @@ public:
 
     // https://fetch.spec.whatwg.org/#concept-fetch-group
     auto& fetch_group() { return m_fetch_group; }
+
+    // https://w3c.github.io/webappsec-upgrade-insecure-requests/#insecure-requests-policy
+    UpgradeInsecureRequests::InsecureRequestsPolicy insecure_requests_policy() const;
+    void set_insecure_requests_policy(UpgradeInsecureRequests::InsecureRequestsPolicy policy) { m_insecure_requests_policy = policy; }
+
+    // https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-navigations-set
+    UpgradeInsecureRequests::UpgradeInsecureNavigationsSet upgrade_insecure_navigations_set() const;
+    void add_to_upgrade_insecure_navigations_set(UpgradeInsecureRequests::HostAndPort tuple) { m_upgrade_insecure_navigations_set.insert(move(tuple)); }
 
     SerializedEnvironmentSettingsObject serialize();
 
@@ -207,6 +220,15 @@ private:
     bool m_discarded { false };
 
     Vector<GC::Ref<WorkerAgentParent>> m_owned_worker_agents;
+
+    // https://w3c.github.io/webappsec-upgrade-insecure-requests/#insecure-requests-policy
+    // It is set to Do Not Upgrade unless otherwise specified.
+    // NB: These hold what the settings object inherited. See insecure_requests_policy() for its own policies.
+    UpgradeInsecureRequests::InsecureRequestsPolicy m_insecure_requests_policy { UpgradeInsecureRequests::InsecureRequestsPolicy::DoNotUpgrade };
+
+    // https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-navigations-set
+    // Its value is the empty set unless otherwise specified.
+    UpgradeInsecureRequests::UpgradeInsecureNavigationsSet m_upgrade_insecure_navigations_set;
 };
 
 RunScriptDecision can_run_script(EnvironmentSettingsObject const&);
