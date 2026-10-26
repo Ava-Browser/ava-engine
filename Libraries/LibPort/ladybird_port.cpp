@@ -18,6 +18,7 @@
 #include <LibCore/EventLoop.h>
 #include <LibCore/StandardPaths.h>
 #include <LibFileSystem/FileSystem.h>
+#include <LibGfx/ImageFormats/PNGWriter.h>
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibMain/Main.h>
@@ -26,6 +27,7 @@
 #include <LibWebCommon/UIEvents/KeyCode.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/FaviconStore.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/SearchEngine.h>
@@ -188,6 +190,64 @@ Tab* find_tab(LbApp* app, uint64_t tab)
     return nullptr;
 }
 
+void dispatch_title(LbApp& app, uint64_t tab, Utf16String const& title)
+{
+    if (!app.callbacks.on_title_change)
+        return;
+    auto narrow = title.to_byte_string();
+    app.callbacks.on_title_change(app.callbacks.context, tab, narrow.characters(), narrow.length());
+}
+
+void dispatch_loading_state(LbApp& app, uint64_t tab, bool is_loading)
+{
+    if (!app.callbacks.on_loading_state_change)
+        return;
+    app.callbacks.on_loading_state_change(app.callbacks.context, tab, is_loading ? 1 : 0);
+}
+
+void dispatch_favicon(LbApp& app, uint64_t tab, Optional<Gfx::Bitmap const&> bitmap)
+{
+    if (!app.callbacks.on_favicon_change)
+        return;
+
+    auto* target = find_tab(&app, tab);
+    if (!target)
+        return;
+
+    if (!bitmap.has_value()) {
+        app.callbacks.on_favicon_change(app.callbacks.context, tab, nullptr, 0, nullptr, 0);
+        return;
+    }
+
+    auto* view = target->view.ptr();
+    auto const& hash = view->favicon_hash();
+    ByteBuffer png_bytes;
+    if (view->session().favicon_store && hash.has_value()) {
+        if (auto stored_png = view->session().favicon_store->favicon_png(*hash); stored_png.has_value())
+            png_bytes = stored_png.release_value();
+    }
+
+    if (png_bytes.is_empty()) {
+        if (auto encoded = Gfx::PNGWriter::encode(*bitmap); !encoded.is_error())
+            png_bytes = encoded.release_value();
+    }
+
+    if (png_bytes.is_empty()) {
+        app.callbacks.on_favicon_change(app.callbacks.context, tab, nullptr, 0, nullptr, 0);
+        return;
+    }
+
+    ByteString narrow_hash;
+    if (hash.has_value())
+        narrow_hash = hash->to_byte_string();
+
+    app.callbacks.on_favicon_change(
+        app.callbacks.context, tab,
+        png_bytes.data(), png_bytes.size(),
+        narrow_hash.characters(), narrow_hash.length()
+    );
+}
+
 }
 
 extern "C" {
@@ -302,6 +362,15 @@ uint64_t LbTabCreate(LbApp* app)
     };
     view->on_load_finish = [app, id](auto const& url) {
         dispatch_url(*app, id, url, app->callbacks.on_load_finish);
+    };
+    view->on_title_change = [app, id](Utf16String const& title) {
+        dispatch_title(*app, id, title);
+    };
+    view->on_loading_state_change = [app, id](bool is_loading) {
+        dispatch_loading_state(*app, id, is_loading);
+    };
+    view->on_favicon_change = [app, id](Optional<Gfx::Bitmap const&> bitmap) {
+        dispatch_favicon(*app, id, bitmap);
     };
 
     // The four blocking dialogs. Installed only when the host supplied the matching callback: an absent callback makes
