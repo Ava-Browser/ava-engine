@@ -40,6 +40,17 @@ typedef struct LbCallbacks {
     // A navigation in `tab` finished loading. Same `url`/`len` lifetime rules as above.
     void (*on_load_finish)(void* context, uint64_t tab, const char* url, size_t len);
 
+    // The tab's document title changed. `title` is UTF-8 encoded and not NUL-terminated; `len` gives its length. Valid for this call only.
+    void (*on_title_change)(void* context, uint64_t tab, const char* title, size_t len);
+
+    // The tab's loading state changed: 1 if loading, 0 if idle/finished.
+    void (*on_loading_state_change)(void* context, uint64_t tab, int is_loading);
+
+    // The tab's favicon changed. If `data` is NULL or `len` is 0, the favicon was cleared.
+    // When present, `data` points to PNG encoded bytes, and `hash` is an ASCII hex SHA-256 string (not NUL-terminated; `hash_len` gives its length).
+    // Valid for this call only.
+    void (*on_favicon_change)(void* context, uint64_t tab, const uint8_t* data, size_t len, const char* hash, size_t hash_len);
+
     // ---------------------------------------------------------------------------------------------------------------
     // Modal dialogs. These are the only callbacks the engine BLOCKS on: the page's script stops until one is answered,
     // and the freeze is in WebContent, so a host that renders correctly but never answers looks alive while the page is
