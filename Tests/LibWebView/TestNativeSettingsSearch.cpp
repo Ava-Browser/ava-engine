@@ -77,6 +77,9 @@ bool write_test_settings_json(StringView directory, StringView json_content)
 
 int run_migration_subtest(StringView test_name, StringView json_content, LbSearchProvenance expected_provenance, StringView expected_provider, bool expected_suggestions, bool expected_autocomplete)
 {
+    auto dir = ByteString::formatted("{}/Ladybird-Migration-{}-{}", Core::StandardPaths::tempfile_directory(), test_name, generate_random_uuid());
+    ScopeGuard dir_cleanup = [&] { (void)FileSystem::remove(dir, FileSystem::RecursionMode::Allowed); };
+
     fflush(stdout);
     pid_t pid = fork();
     if (pid < 0) {
@@ -86,10 +89,8 @@ int run_migration_subtest(StringView test_name, StringView json_content, LbSearc
 
     if (pid == 0) {
         // Child process
-        auto dir = ByteString::formatted("{}/Ladybird-Migration-{}-{}", Core::StandardPaths::tempfile_directory(), test_name, generate_random_uuid());
         if (Core::Directory::create(dir, Core::Directory::CreateDirectories::Yes).is_error())
             exit(10);
-        ScopeGuard dir_cleanup = [&] { (void)FileSystem::remove(dir, FileSystem::RecursionMode::Allowed); };
 
         if (!json_content.is_empty()) {
             if (!write_test_settings_json(dir, json_content))
@@ -154,6 +155,9 @@ int run_migration_subtest(StringView test_name, StringView json_content, LbSearc
 
 int run_custom_catalog_subtest()
 {
+    auto dir = ByteString::formatted("{}/Ladybird-CustomCatalog-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
+    ScopeGuard dir_cleanup = [&] { (void)FileSystem::remove(dir, FileSystem::RecursionMode::Allowed); };
+
     fflush(stdout);
     pid_t pid = fork();
     if (pid < 0) {
@@ -162,10 +166,8 @@ int run_custom_catalog_subtest()
     }
 
     if (pid == 0) {
-        auto dir = ByteString::formatted("{}/Ladybird-CustomCatalog-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
         if (Core::Directory::create(dir, Core::Directory::CreateDirectories::Yes).is_error())
             exit(10);
-        ScopeGuard dir_cleanup = [&] { (void)FileSystem::remove(dir, FileSystem::RecursionMode::Allowed); };
 
         // Genuine Settings.json schema with custom search engine array
         static constexpr auto custom_json =
