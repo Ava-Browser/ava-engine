@@ -224,6 +224,11 @@ typedef enum LbSearchPolicy {
 } LbSearchPolicy;
 
 // Search engine descriptor passed to catalog visitor callback.
+// Fields 'struct_size' and 'api_version' are caller/callee-checked version headers.
+// String fields ('name', 'query_url', 'suggestions_url') are borrowed length-delimited
+// UTF-8 byte buffers, valid strictly during the visitor callback turn.
+// Callee must copy any data it needs synchronously; string pointers do not outlive the callback.
+// The string buffers are not guaranteed to have trailing NUL bytes (rely on *_len).
 typedef struct LbSearchEngineDescriptor {
     uint32_t struct_size;       // sizeof(LbSearchEngineDescriptor)
     uint32_t api_version;       // LB_PORT_API_VERSION
@@ -245,6 +250,8 @@ typedef int (*LbSearchCatalogVisitor)(void* context, const LbSearchEngineDescrip
 LbResult LbSearchVisitCatalog(LbApp* app, void* context, LbSearchCatalogVisitor visitor);
 
 // Sets the active provider by name. Transitions policy to LbSearchPolicyEnabled.
+// The 'name' parameter is a length-delimited UTF-8 byte buffer of length 'name_len'.
+// It must be valid UTF-8 and must not contain embedded NUL bytes (does not require trailing NUL).
 // If provider name is not found in builtins or custom catalog, returns LbResultErrorNotFound
 // and transitions policy to LbSearchPolicyUnavailable (fail closed: blocking prose queries, no fallback).
 LbResult LbSearchSetProvider(LbApp* app, const char* name, size_t name_len);
@@ -254,25 +261,35 @@ LbResult LbSearchSetProvider(LbApp* app, const char* name, size_t name_len);
 LbResult LbSearchSetDisabled(LbApp* app);
 
 // Resets search policy to LbSearchPolicyUnconfiguredFallback (first-run Bing fallback).
+// Clears configured provider state in engine and persistence so that subsequent prose
+// queries route to builtins[0] (Bing) and persistence agrees with unconfigured fallback state.
 LbResult LbSearchSetUnconfiguredFallback(LbApp* app);
 
 // Gets the current search policy and active provider name.
-// If policy is Enabled, fills *out_name with a malloc-allocated string (caller frees with LbStringFree).
-// Output pointers are reset to NULL/0 on entry.
+// Output pointers 'out_name' and 'out_len' are reset to NULL and 0 on entry.
+// Only when policy is LbSearchPolicyEnabled, fills *out_name with a malloc-allocated
+// byte buffer of length *out_len (caller frees with LbStringFree). For all other policies
+// (UnconfiguredFallback, Disabled, Unavailable), *out_name remains NULL and *out_len is 0.
 LbResult LbSearchGetStatus(LbApp* app, LbSearchPolicy* out_policy, char** out_name, size_t* out_len);
 
 // Migration snapshot provenance of raw Settings.json
 typedef enum LbSearchProvenance {
-    LbSearchProvenanceUnconfiguredAbsent = 0,   // File or search_engine key absent
-    LbSearchProvenanceConfiguredCurrent = 1,    // search_engine.engine string present
-    LbSearchProvenanceConfiguredLegacy = 2,     // legacy search_engine.name string present
-    LbSearchProvenanceAmbiguousNull = 3,        // search_engine.engine is null (e.g. from unrelated save)
+    LbSearchProvenanceUnconfiguredAbsent = 0,   // File or searchEngine key absent
+    LbSearchProvenanceConfiguredCurrent = 1,    // searchEngine.engine string present
+    LbSearchProvenanceConfiguredLegacy = 2,     // legacy searchEngine.name string present
+    LbSearchProvenanceAmbiguousNull = 3,        // searchEngine.engine is null (e.g. from unrelated save)
     LbSearchProvenanceMalformed = 4,            // file exists but is malformed JSON or unexpected type
 } LbSearchProvenance;
 
+// Migration snapshot captured from engine profile Settings.json before any mutation occurred.
+// Caller MUST initialize struct_size = sizeof(LbSearchMigrationSnapshot) and
+// api_version = LB_PORT_API_VERSION prior to calling LbSearchReadMigrationSnapshot.
+// Output pointer selected_provider_name, if non-null, points to a malloc-allocated
+// length-delimited byte buffer of length selected_provider_name_len (caller frees with
+// LbSearchFreeMigrationSnapshot). Not guaranteed to be NUL-terminated.
 typedef struct LbSearchMigrationSnapshot {
-    uint32_t struct_size;           // sizeof(LbSearchMigrationSnapshot)
-    uint32_t api_version;           // LB_PORT_API_VERSION
+    uint32_t struct_size;           // Caller initializes to sizeof(LbSearchMigrationSnapshot)
+    uint32_t api_version;           // Caller initializes to LB_PORT_API_VERSION
     LbSearchProvenance provenance;
     char* selected_provider_name;   // Malloc buffer or NULL (caller frees with LbSearchFreeMigrationSnapshot)
     size_t selected_provider_name_len;

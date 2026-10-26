@@ -201,7 +201,7 @@ static void capture_migration_snapshot(LbApp& app)
     }
 
     auto const& obj = json_result.value().as_object();
-    auto search_engine_val = obj.get("search_engine"sv);
+    auto search_engine_val = obj.get("searchEngine"sv);
     if (!search_engine_val.has_value()) {
         app.migration_snapshot.provenance = LbSearchProvenanceUnconfiguredAbsent;
         return;
@@ -219,7 +219,7 @@ static void capture_migration_snapshot(LbApp& app)
             app.migration_snapshot.has_legacy_autocomplete = 1;
     }
 
-    if (auto sugg_val = search_obj.get("search_suggestions_enabled"sv); sugg_val.has_value() && sugg_val->is_bool()) {
+    if (auto sugg_val = search_obj.get("suggestions"sv); sugg_val.has_value() && sugg_val->is_bool()) {
         app.migration_snapshot.suggestions_enabled = sugg_val->as_bool() ? 1 : 0;
     }
 
@@ -242,19 +242,36 @@ static void capture_migration_snapshot(LbApp& app)
                 }
                 return;
             }
+            app.migration_snapshot.provenance = LbSearchProvenanceAmbiguousNull;
+            return;
         }
+        app.migration_snapshot.provenance = LbSearchProvenanceMalformed;
+        return;
     }
 
-    auto legacy_name = search_obj.get_string("name"sv);
-    if (legacy_name.has_value() && !legacy_name->is_empty()) {
-        app.migration_snapshot.provenance = LbSearchProvenanceConfiguredLegacy;
-        auto bytes = legacy_name->bytes();
-        auto* buf = static_cast<char*>(malloc(bytes.size()));
-        if (buf) {
-            memcpy(buf, bytes.data(), bytes.size());
-            app.migration_snapshot.selected_provider_name = buf;
-            app.migration_snapshot.selected_provider_name_len = bytes.size();
+    auto legacy_name = search_obj.get("name"sv);
+    if (legacy_name.has_value()) {
+        if (legacy_name->is_null()) {
+            app.migration_snapshot.provenance = LbSearchProvenanceAmbiguousNull;
+            return;
         }
+        if (legacy_name->is_string()) {
+            auto name = legacy_name->as_string();
+            if (!name.is_empty()) {
+                app.migration_snapshot.provenance = LbSearchProvenanceConfiguredLegacy;
+                auto bytes = name.bytes();
+                auto* buf = static_cast<char*>(malloc(bytes.size()));
+                if (buf) {
+                    memcpy(buf, bytes.data(), bytes.size());
+                    app.migration_snapshot.selected_provider_name = buf;
+                    app.migration_snapshot.selected_provider_name_len = bytes.size();
+                }
+                return;
+            }
+            app.migration_snapshot.provenance = LbSearchProvenanceAmbiguousNull;
+            return;
+        }
+        app.migration_snapshot.provenance = LbSearchProvenanceMalformed;
         return;
     }
 
@@ -584,21 +601,13 @@ int LbResolveUserInput(char const* utf8, size_t len, char** out_url, size_t* out
             }
             break;
         case LbSearchPolicyUnconfiguredFallback:
-            if (WebView::Application::is_initialized())
-                search_engine = WebView::Application::settings().search_engine_settings().engine;
-            if (!search_engine.has_value()) {
-                if (auto builtins = WebView::builtin_search_engines(); !builtins.is_empty())
-                    search_engine = builtins[0];
-            }
+            if (auto builtins = WebView::builtin_search_engines(); !builtins.is_empty())
+                search_engine = builtins[0];
             break;
         }
     } else {
-        if (WebView::Application::is_initialized())
-            search_engine = WebView::Application::settings().search_engine_settings().engine;
-        if (!search_engine.has_value()) {
-            if (auto builtins = WebView::builtin_search_engines(); !builtins.is_empty())
-                search_engine = builtins[0];
-        }
+        if (auto builtins = WebView::builtin_search_engines(); !builtins.is_empty())
+            search_engine = builtins[0];
     }
 
     auto url = WebView::sanitize_url(StringView { utf8, len }, search_engine);
@@ -832,8 +841,8 @@ LbResult LbSearchVisitCatalog(LbApp* app, void* context, LbSearchCatalogVisitor 
     if (WebView::Application::is_initialized()) {
         auto serialized = WebView::Application::settings().serialize_json();
         if (serialized.is_object()) {
-            if (auto se_val = serialized.as_object().get("search_engine"sv); se_val.has_value() && se_val->is_object()) {
-                if (auto customs = se_val->as_object().get_array("custom_search_engines"sv); customs.has_value()) {
+            if (auto se_val = serialized.as_object().get_object("searchEngine"sv); se_val.has_value()) {
+                if (auto customs = se_val->get_array("custom"sv); customs.has_value()) {
                     for (size_t i = 0; i < customs->size(); ++i) {
                         auto const& custom_val = customs->at(i);
                         if (!custom_val.is_object())
@@ -841,7 +850,7 @@ LbResult LbSearchVisitCatalog(LbApp* app, void* context, LbSearchCatalogVisitor 
                         auto const& custom_obj = custom_val.as_object();
                         auto name = custom_obj.get_string("name"sv).value_or({});
                         auto url = custom_obj.get_string("url"sv).value_or({});
-                        auto sugg = custom_obj.get_string("suggestions_url"sv).value_or({});
+                        auto sugg = custom_obj.get_string("suggestionsUrl"sv).value_or({});
 
                         auto name_bytes = name.bytes();
                         auto url_bytes = url.bytes();
@@ -916,6 +925,8 @@ LbResult LbSearchSetUnconfiguredFallback(LbApp* app)
 
     app->search_policy = LbSearchPolicyUnconfiguredFallback;
     app->chosen_provider_name = {};
+    if (WebView::Application::is_initialized())
+        WebView::Application::settings().set_search_engine_settings({ .engine = {}, .suggestions = false });
     return LbResultOk;
 }
 
@@ -933,7 +944,7 @@ LbResult LbSearchGetStatus(LbApp* app, LbSearchPolicy* out_policy, char** out_na
 
     *out_policy = app->search_policy;
 
-    if (app->chosen_provider_name.has_value() && out_name && out_len) {
+    if (app->search_policy == LbSearchPolicyEnabled && app->chosen_provider_name.has_value() && out_name && out_len) {
         auto bytes = app->chosen_provider_name->bytes();
         auto* buf = static_cast<char*>(malloc(bytes.size()));
         if (!buf)
