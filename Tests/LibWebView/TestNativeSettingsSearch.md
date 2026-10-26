@@ -38,92 +38,37 @@ The initial Phase 0a submission contained critical discrepancies that led to an 
 
 - **Worktree:** `Extern/ladybird` (branch `review/search-settings-phase0a`)
 - **Compiler:** Apple clang version 17.0.0 (`/usr/bin/c++`), targeting `arm64-apple-macos14.4`
-- **Prebuilt Dependencies:** Read-only linkage from `/Users/ankitchouhan/Documents/browsers/ladybird/Build/release/lib`
-- **Zero Shared Build Tree Writes:** All compilation artifacts (`ladybird_port.o`, `liblagom-port.0.1.0.dylib`, `TestNativeSettingsSearch.o`, and `TestNativeSettingsSearch`) were routed exclusively to `/tmp/ladybird-isolated-build/`.
-- **Loaded Shim Verification:** `dladdr` inside `TestNativeSettingsSearch` proved symbol `LbSearchSetProvider` was loaded directly from the isolated test build: `/private/tmp/ladybird-isolated-build/liblagom-port.0.1.0.dylib`.
+- **Prebuilt Dependencies:** Read-only linkage from a source-matching cached engine build.
+- **Zero Shared Build Tree Writes:** All compilation artifacts were routed to an isolated scratch directory.
+- **Loaded Shim Verification:** `dladdr` inside `TestNativeSettingsSearch` proved `LbSearchSetProvider` was loaded from the newly linked scratch shim, not the cached library.
 
 ---
 
 ## 3. Exact Reproducible Build & Test Commands
 
+Set `repo` to this checkout, `engine_build` to a source-matching configured build, and
+`scratch` to an empty temporary directory. Extract the exact compiler/linker flags from the
+configured build rather than copying machine-specific SDK or dependency paths.
+
 ```bash
-mkdir -p /tmp/ladybird-isolated-build
+repo="$(pwd -P)"
+engine_build="<source-matching-engine-build>"
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/ladybird-search-probe.XXXXXX")"
+trap 'rm -rf "${scratch}"' EXIT
 
-# 1. Pure C11 Header Syntax Check
-tmp_c="$(mktemp /tmp/lb-c11-XXXXXX.c)"
+tmp_c="${scratch}/header-check.c"
 printf '#include "ladybird_port.h"\nint main(void){return 0;}\n' > "${tmp_c}"
-clang -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror -I Libraries/LibPort "${tmp_c}"
-rm -f "${tmp_c}"
+clang -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror \
+  -I "${repo}/Libraries/LibPort" "${tmp_c}"
 
-# 2. Compile isolated liblagom-port object
-/usr/bin/c++ \
-  -DENABLE_COMPILETIME_FORMAT_CHECK \
-  -DLibPort_EXPORTS \
-  -I/Users/ankitchouhan/orca/workspaces/ava/settings-tdd/Extern/ladybird \
-  -I/Users/ankitchouhan/orca/workspaces/ava/settings-tdd/Extern/ladybird/Libraries \
-  -I/Users/ankitchouhan/orca/workspaces/ava/settings-tdd/Extern/ladybird/Services \
-  -I/Users/ankitchouhan/Documents/browsers/ladybird/Build/release \
-  -I/Users/ankitchouhan/Documents/browsers/ladybird/Build/release/Libraries \
-  -I/Users/ankitchouhan/Documents/browsers/ladybird/Build/release/Services \
-  -I/Users/ankitchouhan/Documents/browsers/ladybird/Build/release/vcpkg_installed/arm64-osx-dynamic/include \
-  -O2 -g -DNDEBUG -std=c++23 -arch arm64 \
-  -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk \
-  -mmacosx-version-min=14.4 -fPIC -march=native \
-  -Wno-unknown-warning-option -Wno-unused-command-line-argument -Wno-unqualified-std-cast-call \
-  -fno-exceptions -fsigned-char \
-  -o /tmp/ladybird-isolated-build/ladybird_port.o \
-  -c /Users/ankitchouhan/orca/workspaces/ava/settings-tdd/Extern/ladybird/Libraries/LibPort/ladybird_port.cpp
-
-# 3. Link isolated liblagom-port shared library
-/usr/bin/c++ \
-  -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk -mmacosx-version-min=14.4 \
-  -dynamiclib -Wl,-headerpad_max_install_names -fstack-protector-strong -Xlinker -dead_strip \
-  -install_name @rpath/liblagom-port.0.dylib \
-  -o /tmp/ladybird-isolated-build/liblagom-port.0.1.0.dylib \
-  /tmp/ladybird-isolated-build/ladybird_port.o \
-  -L/Users/ankitchouhan/Documents/browsers/ladybird/Build/release/lib \
-  -llagom-web -llagom-webview -llagom-compositing -llagom-sandbox -llagom-webcommon \
-  -llagom-gfx -llagom-requests -llagom-ipc -llagom-url -llagom-core -llagom-unicode -llagom-ak \
-  -framework CoreFoundation -framework CoreGraphics -framework CoreLocation -framework CoreServices -framework Foundation -framework IOSurface
-ln -sf liblagom-port.0.1.0.dylib /tmp/ladybird-isolated-build/liblagom-port.dylib
-ln -sf liblagom-port.0.1.0.dylib /tmp/ladybird-isolated-build/liblagom-port.0.dylib
-
-# 4. Compile TestNativeSettingsSearch object
-/usr/bin/c++ \
-  -DENABLE_COMPILETIME_FORMAT_CHECK \
-  -DLADYBIRD_BINARY_PATH=\"/Users/ankitchouhan/Documents/browsers/ladybird/Build/release/bin/Ladybird.app/Contents/MacOS\" \
-  -I/Users/ankitchouhan/orca/workspaces/ava/settings-tdd/Extern/ladybird \
-  -I/Users/ankitchouhan/orca/workspaces/ava/settings-tdd/Extern/ladybird/Libraries \
-  -I/Users/ankitchouhan/orca/workspaces/ava/settings-tdd/Extern/ladybird/Services \
-  -I/Users/ankitchouhan/Documents/browsers/ladybird/Build/release \
-  -I/Users/ankitchouhan/Documents/browsers/ladybird/Build/release/Libraries \
-  -I/Users/ankitchouhan/Documents/browsers/ladybird/Build/release/Services \
-  -I/Users/ankitchouhan/Documents/browsers/ladybird/Build/release/vcpkg_installed/arm64-osx-dynamic/include \
-  -O2 -g -DNDEBUG -std=c++23 -arch arm64 \
-  -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk \
-  -mmacosx-version-min=14.4 -fPIE -march=native \
-  -Wno-unknown-warning-option -Wno-unused-command-line-argument -Wno-unqualified-std-cast-call \
-  -fno-exceptions -fsigned-char \
-  -o /tmp/ladybird-isolated-build/TestNativeSettingsSearch.o \
-  -c /Users/ankitchouhan/orca/workspaces/ava/settings-tdd/Extern/ladybird/Tests/LibWebView/TestNativeSettingsSearch.cpp
-
-# 5. Link TestNativeSettingsSearch probe executable
-/usr/bin/c++ \
-  -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk -mmacosx-version-min=14.4 \
-  -fPIE -Wl,-dead_strip \
-  -Wl,-rpath,/tmp/ladybird-isolated-build \
-  -Wl,-rpath,/Users/ankitchouhan/Documents/browsers/ladybird/Build/release/lib \
-  -Wl,-rpath,/Users/ankitchouhan/Documents/browsers/ladybird/Build/release/vcpkg_installed/arm64-osx-dynamic/lib \
-  -o /tmp/ladybird-isolated-build/TestNativeSettingsSearch \
-  /tmp/ladybird-isolated-build/TestNativeSettingsSearch.o \
-  /tmp/ladybird-isolated-build/liblagom-port.dylib \
-  -L/Users/ankitchouhan/Documents/browsers/ladybird/Build/release/lib \
-  -llagom-diff -llagom-imagedecoders -llagom-main -llagom-web -llagom-webview -llagom-imagedecoderclient -llagom-compositing -llagom-sandbox -llagom-webcommon -llagom-gfx -llagom-requests -llagom-ipc -llagom-url -llagom-filesystem -llagom-core -llagom-unicode -llagom-ak \
-  -framework CoreFoundation -framework CoreGraphics -framework CoreLocation -framework CoreServices -framework Foundation -framework IOSurface
-
-# 6. Execute probe
-DYLD_LIBRARY_PATH=/tmp/ladybird-isolated-build /tmp/ladybird-isolated-build/TestNativeSettingsSearch
+# Recompile ladybird_port.cpp and TestNativeSettingsSearch.cpp with the configured
+# build's exact compile flags. Link a scratch liblagom-port and probe with the same
+# dependency list, but put the scratch directory first in the probe's rpath.
+DYLD_LIBRARY_PATH="${scratch}" "${scratch}/TestNativeSettingsSearch"
 ```
+
+The audited run used the configured build's emitted commands with only source/output/rpath
+locations redirected. No generated files or libraries in the cached build were modified.
 
 ---
 
@@ -131,7 +76,7 @@ DYLD_LIBRARY_PATH=/tmp/ladybird-isolated-build /tmp/ladybird-isolated-build/Test
 
 ```
 === TestNativeSettingsSearch starting ===
-SHIM PROVENANCE: loaded from '/private/tmp/ladybird-isolated-build/liblagom-port.0.1.0.dylib'
+SHIM PROVENANCE: loaded from '<scratch>/liblagom-port.0.1.0.dylib'
 CHECK: Bad argument handling before engine creation
 PASS: pre-engine bad args handled safely
 CHECK: Migration snapshot provenance capture with genuine schema
