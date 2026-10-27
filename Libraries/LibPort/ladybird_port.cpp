@@ -748,14 +748,6 @@ bool accepts_group(T const* callbacks)
     return callbacks && callbacks->struct_size >= sizeof(T) && callbacks->version == LB_CALLBACKS_VERSION;
 }
 
-// SelectItem is a Variant of three shapes, so it crosses as JSON (the header documents the schema). Built by hand
-// rather than via JsonObject so the child ordering is stable and the encoder cannot reorder fields.
-void dispatch_load_start(LbApp& app, uint64_t tab)
-{
-    if (app.page_callbacks.on_load_start)
-        app.page_callbacks.on_load_start(app.callbacks.context, tab);
-}
-
 // A tab id for a view the engine created for the page (a popup), registered exactly like a real tab so the host can call
 // LbTabGetSurface/LbTabSetViewport on it. Ids are never reused.
 uint64_t register_existing_view(LbApp& app, PortWebView* view);
