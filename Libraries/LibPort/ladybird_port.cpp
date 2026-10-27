@@ -397,7 +397,7 @@ void dispatch_favicon(LbApp& app, uint64_t tab, Optional<Gfx::Bitmap const&> bit
         return;
     }
 
-    auto* view = target->view()->ptr();
+    auto* view = target->view();
     auto const& hash = view->favicon_hash();
     ByteBuffer png_bytes;
     if (view->session().favicon_store && hash.has_value()) {
@@ -460,7 +460,7 @@ void install_core_callbacks(LbApp& app, uint64_t id, PortWebView& view)
     // any subset of the four.
     view.on_request_alert = [&app, id](Utf16String const& message) {
         if (!app.callbacks.on_request_alert) {
-            if (auto* target = find_tab(app, id))
+            if (auto* target = find_tab(&app, id))
                 target->view()->alert_closed();
             return;
         }
@@ -468,7 +468,7 @@ void install_core_callbacks(LbApp& app, uint64_t id, PortWebView& view)
     };
     view.on_request_confirm = [&app, id](Utf16String const& message) {
         if (!app.callbacks.on_request_confirm) {
-            if (auto* target = find_tab(app, id))
+            if (auto* target = find_tab(&app, id))
                 target->view()->confirm_closed(false);
             return;
         }
@@ -476,7 +476,7 @@ void install_core_callbacks(LbApp& app, uint64_t id, PortWebView& view)
     };
     view.on_request_prompt = [&app, id](Utf16String const& message, Utf16String const& default_text) {
         if (!app.callbacks.on_request_prompt) {
-            if (auto* target = find_tab(app, id))
+            if (auto* target = find_tab(&app, id))
                 target->view()->prompt_closed(OptionalNone {});
             return;
         }
@@ -490,7 +490,7 @@ void install_core_callbacks(LbApp& app, uint64_t id, PortWebView& view)
     view.on_request_before_unload = [&app, id](String const& source, Function<void(bool)> on_complete) {
         // The closure is the engine's own completion; store it so LbTabAnswerBeforeUnload can invoke it. A second
         // request replaces the first, which is what the engine does too (one pending dialog per page).
-        auto* target = find_tab(app, id);
+        auto* target = find_tab(&app, id);
         if (!app.callbacks.on_request_before_unload) {
             // Allowing the navigation is the answer the header documents as safe.
             on_complete(true);
@@ -610,7 +610,7 @@ void install_group_callbacks(LbApp& app, uint64_t id, PortWebView& view)
             return String::formatted("port-tab-{}", id).release_value();
 
         // Owned by the parent's view, but listed as its own tab so the host can present it.
-        auto new_id = register_existing_view(app, PortWebView::create_child_for(*parent->view, traversable));
+        auto new_id = register_existing_view(app, PortWebView::create_child_for(*parent->view(), traversable));
         if (auto* callback = app.page_callbacks.on_new_tab)
             callback(app.callbacks.context, id, new_id, activate_tab == Web::HTML::ActivateTab::Yes ? 1 : 0, hints.popup ? 1 : 0);
         return String::formatted("port-tab-{}", new_id).release_value();
@@ -909,7 +909,10 @@ uint64_t LbTabCreate(LbApp* app)
 
     install_group_callbacks(*app, id, *view);
 
-    auto tab = adopt_own(*new Tab { id, move(view), 1.0, 0, nullptr, 0, 0, 0, {}, {} });
+    auto tab = adopt_own(*new Tab {});
+    tab->id = id;
+    tab->own_view = move(view);
+    tab->device_pixel_ratio = 1.0;
     app->tabs.append(move(tab));
     return id;
 }
