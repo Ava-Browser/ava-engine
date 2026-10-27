@@ -121,12 +121,16 @@ public:
 public:
     // A popup's view continues a traversable the engine already created for it. create_child and adopt_child_web_view are
     // protected on HeadlessWebView; this subclass is the sanctioned way in, the same one HeadlessWebView uses on itself.
-    static NonnullOwnPtr<PortWebView> create_child_for(PortWebView& parent, WebView::CanonicalTraversable& traversable)
+    static PortWebView* create_child_for(PortWebView& parent, WebView::CanonicalTraversable& traversable)
     {
+        // adopt_child_web_view takes ownership, and the engine relies on that for parent ownership, crash propagation and
+        // child cleanup. Returning an owning pointer here would be a second owner of the same object, so the *parent*
+        // keeps it and the caller only borrows.
         auto child = adopt_own(*new PortWebView(parent.m_theme, parent.m_viewport_size));
+        auto* child_pointer = child.ptr();
         child->initialize_tab(Web::HTML::VisibilityState::Visible, traversable);
         parent.adopt_child_web_view(move(child));
-        return adopt_own(*static_cast<PortWebView*>(parent.m_child_web_views.last().ptr()));
+        return child_pointer;
     }
 
 private:
@@ -141,7 +145,15 @@ struct Tab {
     AK_ALLOC_WITH_KMALLOC;
 
     uint64_t id { 0 };
-    NonnullOwnPtr<PortWebView> view;
+    // Owned here unless `borrowed`, in which case the parent view owns it (a popup) and this tab only points at it.
+    OwnPtr<PortWebView> own_view;
+    PortWebView* borrowed_view { nullptr };
+    bool borrowed { false };
+
+    PortWebView* view()
+    {
+        return borrowed ? borrowed_view : own_view.ptr();
+    }
 
     // The engine's input positions are in device pixels and the host speaks CSS pixels, so the ratio has to be kept
     // alongside the tab. LbTabSetViewport is the only thing that sets it.
@@ -369,7 +381,7 @@ void dispatch_loading_state(LbApp& app, uint64_t tab, bool is_loading)
     app.callbacks.on_loading_state_change(app.callbacks.context, tab, is_loading ? 1 : 0);
 }
 
-uint64_t register_existing_view(LbApp& app, NonnullOwnPtr<PortWebView> view);
+uint64_t register_existing_view(LbApp& app, PortWebView* view);
 
 void dispatch_favicon(LbApp& app, uint64_t tab, Optional<Gfx::Bitmap const&> bitmap)
 {
@@ -385,7 +397,7 @@ void dispatch_favicon(LbApp& app, uint64_t tab, Optional<Gfx::Bitmap const&> bit
         return;
     }
 
-    auto* view = target->view.ptr();
+    auto* view = target->view()->ptr();
     auto const& hash = view->favicon_hash();
     ByteBuffer png_bytes;
     if (view->session().favicon_store && hash.has_value()) {
@@ -416,6 +428,84 @@ void dispatch_favicon(LbApp& app, uint64_t tab, Optional<Gfx::Bitmap const&> bit
 
 // Everything the groups added after LbCallbacks observe, installed per view. Split out of LbTabCreate because a popup's
 // view is created by the engine, not by LbTabCreate, and must be wired identically.
+// The handlers every view needs, whether the host asked for it or the page opened it. Split out of LbTabCreate because
+// a popup's view is created by the engine: wiring only the newer groups there left popups without on_ready_to_paint (so
+// the host could not present them) and without the dialog answers (so an alert() in a popup wedged it forever).
+void install_core_callbacks(LbApp& app, uint64_t id, PortWebView& view)
+{
+    view.on_ready_to_paint = [&app, id] { dispatch_paint(app, id); };
+    view.on_url_change = [&app, id](auto const& url) {
+        dispatch_url(app, id, url, app.callbacks.on_url_change);
+    };
+    view.on_load_finish = [&app, id](auto const& url) {
+        dispatch_url(app, id, url, app.callbacks.on_load_finish);
+    };
+    view.on_title_change = [&app, id](Utf16String const& title) {
+        dispatch_title(app, id, title);
+    };
+    view.on_loading_state_change = [&app, id](bool is_loading) {
+        dispatch_loading_state(app, id, is_loading);
+    };
+    view.on_favicon_change = [&app, id](Optional<Gfx::Bitmap const&> bitmap) {
+        dispatch_favicon(app, id, bitmap);
+    };
+
+    // The four blocking dialogs, ALWAYS installed, whether or not the host supplied a callback.
+    //
+    // This used to be guarded by "if (app.callbacks.on_request_alert) { ... }", on the header's claim that an absent
+    // callback makes the engine answer itself. It does not: PortWebView derives from HeadlessWebView, whose constructor
+    // already installed handlers that only record Web::PendingDialog, so leaving them in place parks the page in
+    // spin_event_loop_until_dialog_closed forever (Traps.md, "An absent dialog callback does NOT make the engine answer
+    // itself"). Answering immediately with the safe outcome is what the header always promised, so the host may install
+    // any subset of the four.
+    view.on_request_alert = [&app, id](Utf16String const& message) {
+        if (!app.callbacks.on_request_alert) {
+            if (auto* target = find_tab(app, id))
+                target->view()->alert_closed();
+            return;
+        }
+        dispatch_dialog_text(app.callbacks.on_request_alert, app.callbacks.context, id, message);
+    };
+    view.on_request_confirm = [&app, id](Utf16String const& message) {
+        if (!app.callbacks.on_request_confirm) {
+            if (auto* target = find_tab(app, id))
+                target->view()->confirm_closed(false);
+            return;
+        }
+        dispatch_dialog_text(app.callbacks.on_request_confirm, app.callbacks.context, id, message);
+    };
+    view.on_request_prompt = [&app, id](Utf16String const& message, Utf16String const& default_text) {
+        if (!app.callbacks.on_request_prompt) {
+            if (auto* target = find_tab(app, id))
+                target->view()->prompt_closed(OptionalNone {});
+            return;
+        }
+        auto narrow_message = message.to_byte_string();
+        auto narrow_default = default_text.to_byte_string();
+        app.callbacks.on_request_prompt(
+            app.callbacks.context, id,
+            narrow_message.characters(), narrow_message.length(),
+            narrow_default.characters(), narrow_default.length());
+    };
+    view.on_request_before_unload = [&app, id](String const& source, Function<void(bool)> on_complete) {
+        // The closure is the engine's own completion; store it so LbTabAnswerBeforeUnload can invoke it. A second
+        // request replaces the first, which is what the engine does too (one pending dialog per page).
+        auto* target = find_tab(app, id);
+        if (!app.callbacks.on_request_before_unload) {
+            // Allowing the navigation is the answer the header documents as safe.
+            on_complete(true);
+            return;
+        }
+        if (target)
+            target->pending_before_unload = move(on_complete);
+        else
+            on_complete(true);
+        auto narrow_source = source.to_byte_string();
+        app.callbacks.on_request_before_unload(app.callbacks.context, id, narrow_source.characters(), narrow_source.length());
+    };
+
+}
+
 void install_group_callbacks(LbApp& app, uint64_t id, PortWebView& view)
 {
     view.on_cursor_change = [&app, id](Gfx::Cursor cursor) {
@@ -527,11 +617,18 @@ void install_group_callbacks(LbApp& app, uint64_t id, PortWebView& view)
     };
 
     view.on_close = [&app, id] {
-        auto* callback = app.page_callbacks.on_tab_closed;
-        // Unlink first: the host must not then call LbTabDestroy on an id that no longer exists.
-        app.tabs.remove_first_matching([&](auto const& entry) { return entry->id == id; });
-        if (callback)
-            callback(app.callbacks.context, id);
+        // This closure lives on the view, and unlinking destroys the Tab that owns the view. Deferring keeps the engine's
+        // stack (which may still use the view) and this closure alive; capturing by value rather than by reference
+        // because `app` outlives it and `id` is already a copy, but the *closure itself* does not.
+        auto* app_ptr = &app;
+        auto closed_id = id;
+        Core::deferred_invoke([app_ptr, closed_id] {
+            auto* callback = app_ptr->page_callbacks.on_tab_closed;
+            // Unlink before reporting: the host must not then call LbTabDestroy on an id that no longer exists.
+            app_ptr->tabs.remove_first_matching([&](auto const& entry) { return entry->id == closed_id; });
+            if (callback)
+                callback(app_ptr->callbacks.context, closed_id);
+        });
     };
 
     // Pickers and prompts. Same rule as the dialogs: the shim always installs a handler, and answers unavailable or
@@ -542,7 +639,7 @@ void install_group_callbacks(LbApp& app, uint64_t id, PortWebView& view)
             return;
         auto* callback = app.picker_callbacks.on_request_select_dropdown;
         if (!callback) {
-            target->view->select_dropdown_closed(OptionalNone {});
+            target->view()->select_dropdown_closed(OptionalNone {});
             return;
         }
         auto json = encode_select_items(items);
@@ -558,7 +655,7 @@ void install_group_callbacks(LbApp& app, uint64_t id, PortWebView& view)
             return;
         auto* callback = app.picker_callbacks.on_request_file_picker;
         if (!callback) {
-            target->view->file_picker_closed({});
+            target->view()->file_picker_closed({});
             return;
         }
         auto json = encode_file_filters(filters);
@@ -574,7 +671,7 @@ void install_group_callbacks(LbApp& app, uint64_t id, PortWebView& view)
             return;
         auto* callback = app.picker_callbacks.on_request_color_picker;
         if (!callback) {
-            target->view->color_picker_update(OptionalNone {}, Web::HTML::ColorPickerUpdateState::Closed);
+            target->view()->color_picker_update(OptionalNone {}, Web::HTML::ColorPickerUpdateState::Closed);
             return;
         }
         auto request_id = ++app.next_request_id;
@@ -625,12 +722,16 @@ void install_group_callbacks(LbApp& app, uint64_t id, PortWebView& view)
 
 // Registers a view the engine created for a page. Ownership is the caller's to hand over; this only learns the id and
 // wires the callbacks, so a popup behaves exactly like a tab the host asked for.
-uint64_t register_existing_view(LbApp& app, NonnullOwnPtr<PortWebView> view)
+uint64_t register_existing_view(LbApp& app, PortWebView* view)
 {
     auto id = app.next_tab_id++;
-    auto raw = view.ptr();
-    auto tab = adopt_own(*new Tab { id, move(view), 1.0, 0, nullptr, 0, 0, 0, {}, {} });
+    auto raw = view;
+    auto tab = adopt_own(*new Tab {});
+    tab->id = id;
+    tab->borrowed = true;
+    tab->borrowed_view = raw;
     app.tabs.append(move(tab));
+    install_core_callbacks(app, id, *raw);
     install_group_callbacks(app, id, *raw);
     return id;
 }
@@ -657,8 +758,9 @@ void dispatch_load_start(LbApp& app, uint64_t tab)
 
 // A tab id for a view the engine created for the page (a popup), registered exactly like a real tab so the host can call
 // LbTabGetSurface/LbTabSetViewport on it. Ids are never reused.
-uint64_t register_existing_view(LbApp& app, NonnullOwnPtr<PortWebView> view);
+uint64_t register_existing_view(LbApp& app, PortWebView* view);
 
+void install_core_callbacks(LbApp& app, uint64_t id, PortWebView& view);
 void install_group_callbacks(LbApp& app, uint64_t id, PortWebView& view);
 
 }
@@ -803,76 +905,7 @@ uint64_t LbTabCreate(LbApp* app)
     auto view = PortWebView::create(theme.release_value(), { 1024, 768 });
     auto id = app->next_tab_id++;
 
-    view->on_ready_to_paint = [app, id] { dispatch_paint(*app, id); };
-    view->on_url_change = [app, id](auto const& url) {
-        dispatch_url(*app, id, url, app->callbacks.on_url_change);
-    };
-    view->on_load_finish = [app, id](auto const& url) {
-        dispatch_url(*app, id, url, app->callbacks.on_load_finish);
-    };
-    view->on_title_change = [app, id](Utf16String const& title) {
-        dispatch_title(*app, id, title);
-    };
-    view->on_loading_state_change = [app, id](bool is_loading) {
-        dispatch_loading_state(*app, id, is_loading);
-    };
-    view->on_favicon_change = [app, id](Optional<Gfx::Bitmap const&> bitmap) {
-        dispatch_favicon(*app, id, bitmap);
-    };
-
-    // The four blocking dialogs, ALWAYS installed, whether or not the host supplied a callback.
-    //
-    // This used to be guarded by "if (app->callbacks.on_request_alert) { ... }", on the header's claim that an absent
-    // callback makes the engine answer itself. It does not: PortWebView derives from HeadlessWebView, whose constructor
-    // already installed handlers that only record Web::PendingDialog, so leaving them in place parks the page in
-    // spin_event_loop_until_dialog_closed forever (Traps.md, "An absent dialog callback does NOT make the engine answer
-    // itself"). Answering immediately with the safe outcome is what the header always promised, so the host may install
-    // any subset of the four.
-    view->on_request_alert = [app, id](Utf16String const& message) {
-        if (!app->callbacks.on_request_alert) {
-            if (auto* target = find_tab(app, id))
-                target->view->alert_closed();
-            return;
-        }
-        dispatch_dialog_text(app->callbacks.on_request_alert, app->callbacks.context, id, message);
-    };
-    view->on_request_confirm = [app, id](Utf16String const& message) {
-        if (!app->callbacks.on_request_confirm) {
-            if (auto* target = find_tab(app, id))
-                target->view->confirm_closed(false);
-            return;
-        }
-        dispatch_dialog_text(app->callbacks.on_request_confirm, app->callbacks.context, id, message);
-    };
-    view->on_request_prompt = [app, id](Utf16String const& message, Utf16String const& default_text) {
-        if (!app->callbacks.on_request_prompt) {
-            if (auto* target = find_tab(app, id))
-                target->view->prompt_closed(OptionalNone {});
-            return;
-        }
-        auto narrow_message = message.to_byte_string();
-        auto narrow_default = default_text.to_byte_string();
-        app->callbacks.on_request_prompt(
-            app->callbacks.context, id,
-            narrow_message.characters(), narrow_message.length(),
-            narrow_default.characters(), narrow_default.length());
-    };
-    view->on_request_before_unload = [app, id](String const& source, Function<void(bool)> on_complete) {
-        // The closure is the engine's own completion; store it so LbTabAnswerBeforeUnload can invoke it. A second
-        // request replaces the first, which is what the engine does too (one pending dialog per page).
-        auto* target = find_tab(app, id);
-        if (!app->callbacks.on_request_before_unload) {
-            // Allowing the navigation is the answer the header documents as safe.
-            on_complete(true);
-            return;
-        }
-        if (target)
-            target->pending_before_unload = move(on_complete);
-        else
-            on_complete(true);
-        auto narrow_source = source.to_byte_string();
-        app->callbacks.on_request_before_unload(app->callbacks.context, id, narrow_source.characters(), narrow_source.length());
-    };
+    install_core_callbacks(*app, id, *view);
 
     install_group_callbacks(*app, id, *view);
 
@@ -886,7 +919,7 @@ void LbTabAnswerAlert(LbApp* app, uint64_t tab)
     auto* target = find_tab(app, tab);
     if (!target)
         return;
-    target->view->alert_closed();
+    target->view()->alert_closed();
 }
 
 void LbTabAnswerConfirm(LbApp* app, uint64_t tab, int accept)
@@ -894,7 +927,7 @@ void LbTabAnswerConfirm(LbApp* app, uint64_t tab, int accept)
     auto* target = find_tab(app, tab);
     if (!target)
         return;
-    target->view->confirm_closed(accept != 0);
+    target->view()->confirm_closed(accept != 0);
 }
 
 void LbTabAnswerPrompt(LbApp* app, uint64_t tab, char const* response, size_t len)
@@ -905,11 +938,11 @@ void LbTabAnswerPrompt(LbApp* app, uint64_t tab, char const* response, size_t le
     // NULL means Cancel. An empty string means "accepted with no text" — a different outcome the engine distinguishes,
     // so it is not folded into the null case.
     if (!response) {
-        target->view->prompt_closed(OptionalNone {});
+        target->view()->prompt_closed(OptionalNone {});
         return;
     }
     auto text = Utf16String::from_utf8(StringView { response, len });
-    target->view->prompt_closed(text);
+    target->view()->prompt_closed(text);
 }
 
 void LbTabAnswerBeforeUnload(LbApp* app, uint64_t tab, int accept)
@@ -932,10 +965,10 @@ void LbTabAnswerSelectDropdown(LbApp* app, uint64_t tab, uint64_t request_id, in
         return;
     target->pending_select_dropdown = 0;
     if (!has_selection) {
-        target->view->select_dropdown_closed(OptionalNone {});
+        target->view()->select_dropdown_closed(OptionalNone {});
         return;
     }
-    target->view->select_dropdown_closed(selected_item_id);
+    target->view()->select_dropdown_closed(selected_item_id);
 }
 
 void LbTabAnswerFilePicker(LbApp* app, uint64_t tab, uint64_t request_id, char const* json_or_null, size_t len)
@@ -962,7 +995,7 @@ void LbTabAnswerFilePicker(LbApp* app, uint64_t tab, uint64_t request_id, char c
             });
         }
     }
-    target->view->file_picker_closed(move(files));
+    target->view()->file_picker_closed(move(files));
 }
 
 void LbTabAnswerColorPicker(LbApp* app, uint64_t tab, uint64_t request_id, int has_color, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
@@ -972,10 +1005,10 @@ void LbTabAnswerColorPicker(LbApp* app, uint64_t tab, uint64_t request_id, int h
         return;
     target->pending_color_picker = 0;
     if (!has_color) {
-        target->view->color_picker_update(OptionalNone {}, Web::HTML::ColorPickerUpdateState::Closed);
+        target->view()->color_picker_update(OptionalNone {}, Web::HTML::ColorPickerUpdateState::Closed);
         return;
     }
-    target->view->color_picker_update(Color::from_rgba((static_cast<u32>(a) << 24) | (static_cast<u32>(r) << 16) | (static_cast<u32>(g) << 8) | static_cast<u32>(b)), Web::HTML::ColorPickerUpdateState::Closed);
+    target->view()->color_picker_update(Color(r, g, b, a), Web::HTML::ColorPickerUpdateState::Closed);
 }
 
 void LbTabAnswerPermission(LbApp* app, uint64_t tab, uint64_t request_id, int granted)
@@ -1008,37 +1041,37 @@ void LbTabReload(LbApp* app, uint64_t tab, int bypass_cache)
     // NOTE: WebView::BypassCache was introduced upstream after the tree the cached local build tree uses. This is the
     // correct call for the pin this fork tracks; a local build against that older tree cannot compile it, so it is the
     // one line here that only the pinned engine (or CI) can verify.
-    target->view->reload(bypass_cache != 0 ? WebView::BypassCache::Yes : WebView::BypassCache::No);
+    target->view()->reload(bypass_cache != 0 ? WebView::BypassCache::Yes : WebView::BypassCache::No);
 }
 
 void LbTabStopLoading(LbApp* app, uint64_t tab)
 {
     if (auto* target = find_tab(app, tab))
-        target->view->stop_loading();
+        target->view()->stop_loading();
 }
 
 void LbTabSetZoom(LbApp* app, uint64_t tab, double zoom_level)
 {
     if (auto* target = find_tab(app, tab))
-        target->view->set_zoom(zoom_level);
+        target->view()->set_zoom(zoom_level);
 }
 
 void LbTabZoomIn(LbApp* app, uint64_t tab)
 {
     if (auto* target = find_tab(app, tab))
-        target->view->zoom_in();
+        target->view()->zoom_in();
 }
 
 void LbTabZoomOut(LbApp* app, uint64_t tab)
 {
     if (auto* target = find_tab(app, tab))
-        target->view->zoom_out();
+        target->view()->zoom_out();
 }
 
 double LbTabZoomLevel(LbApp* app, uint64_t tab)
 {
     auto* target = find_tab(app, tab);
-    return target ? target->view->zoom_level() : 1.0;
+    return target ? target->view()->zoom_level() : 1.0;
 }
 
 void LbTabSetColorScheme(LbApp* app, uint64_t tab, int32_t color_scheme)
@@ -1058,7 +1091,7 @@ void LbTabSetColorScheme(LbApp* app, uint64_t tab, int32_t color_scheme)
         scheme = Web::CSS::PreferredColorScheme::Auto;
         break;
     }
-    target->view->set_preferred_color_scheme(scheme);
+    target->view()->set_preferred_color_scheme(scheme);
 }
 
 void LbTabSetPreferredMotion(LbApp* app, uint64_t tab, int32_t motion)
@@ -1078,7 +1111,7 @@ void LbTabSetPreferredMotion(LbApp* app, uint64_t tab, int32_t motion)
         value = Web::CSS::PreferredMotion::Auto;
         break;
     }
-    target->view->set_preferred_motion(value);
+    target->view()->set_preferred_motion(value);
 }
 
 void LbTabSetPreferredContrast(LbApp* app, uint64_t tab, int32_t contrast)
@@ -1101,7 +1134,7 @@ void LbTabSetPreferredContrast(LbApp* app, uint64_t tab, int32_t contrast)
         value = Web::CSS::PreferredContrast::Auto;
         break;
     }
-    target->view->set_preferred_contrast(value);
+    target->view()->set_preferred_contrast(value);
 }
 
 void LbTabSetSystemVisibility(LbApp* app, uint64_t tab, int visible)
@@ -1109,19 +1142,19 @@ void LbTabSetSystemVisibility(LbApp* app, uint64_t tab, int visible)
     auto* target = find_tab(app, tab);
     if (!target)
         return;
-    target->view->set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
+    target->view()->set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
 }
 
 void LbTabSetSystemFocus(LbApp* app, uint64_t tab, int focused)
 {
     if (auto* target = find_tab(app, tab))
-        target->view->set_has_system_focus(focused != 0);
+        target->view()->set_has_system_focus(focused != 0);
 }
 
 void LbTabToggleMute(LbApp* app, uint64_t tab)
 {
     if (auto* target = find_tab(app, tab))
-        target->view->toggle_page_mute_state();
+        target->view()->toggle_page_mute_state();
 }
 
 int LbTabPageMuteState(LbApp* app, uint64_t tab)
@@ -1129,25 +1162,25 @@ int LbTabPageMuteState(LbApp* app, uint64_t tab)
     auto* target = find_tab(app, tab);
     if (!target)
         return 0;
-    return target->view->page_mute_state() == Web::HTML::MuteState::Muted ? 1 : 0;
+    return target->view()->page_mute_state() == Web::HTML::MuteState::Muted ? 1 : 0;
 }
 
 void LbTabSelectAll(LbApp* app, uint64_t tab)
 {
     if (auto* target = find_tab(app, tab))
-        target->view->select_all();
+        target->view()->select_all();
 }
 
 void LbTabUndo(LbApp* app, uint64_t tab)
 {
     if (auto* target = find_tab(app, tab))
-        target->view->undo();
+        target->view()->undo();
 }
 
 void LbTabRedo(LbApp* app, uint64_t tab)
 {
     if (auto* target = find_tab(app, tab))
-        target->view->redo();
+        target->view()->redo();
 }
 
 void LbTabFindInPage(LbApp* app, uint64_t tab, char const* utf8, size_t len, int match_case, int highlight_all)
@@ -1155,7 +1188,7 @@ void LbTabFindInPage(LbApp* app, uint64_t tab, char const* utf8, size_t len, int
     auto* target = find_tab(app, tab);
     if (!target || !utf8)
         return;
-    target->view->find_in_page(
+    target->view()->find_in_page(
         Utf16String::from_utf8(StringView { utf8, len }),
         match_case ? CaseSensitivity::CaseSensitive : CaseSensitivity::CaseInsensitive,
         highlight_all != 0);
@@ -1164,19 +1197,19 @@ void LbTabFindInPage(LbApp* app, uint64_t tab, char const* utf8, size_t len, int
 void LbTabFindNextMatch(LbApp* app, uint64_t tab)
 {
     if (auto* target = find_tab(app, tab))
-        target->view->find_in_page_next_match();
+        target->view()->find_in_page_next_match();
 }
 
 void LbTabFindPreviousMatch(LbApp* app, uint64_t tab)
 {
     if (auto* target = find_tab(app, tab))
-        target->view->find_in_page_previous_match();
+        target->view()->find_in_page_previous_match();
 }
 
 void LbTabFindEnd(LbApp* app, uint64_t tab)
 {
     if (auto* target = find_tab(app, tab))
-        target->view->find_in_page_end();
+        target->view()->find_in_page_end();
 }
 
 void LbTabDestroy(LbApp* app, uint64_t tab)
@@ -1205,7 +1238,7 @@ void LbTabLoad(LbApp* app, uint64_t tab, char const* url, size_t len)
             warnln("LbTabLoad: unable to parse the URL");
             return;
         }
-        candidate->view->load(parsed.release_value());
+        candidate->view()->load(parsed.release_value());
         return;
     }
 }
@@ -1261,7 +1294,7 @@ int LbTabGetSurface(LbApp* app, uint64_t tab, LbSurface* out)
         if (candidate->id != tab)
             continue;
 
-        auto frame = candidate->view->current_frame();
+        auto frame = candidate->view()->current_frame();
         if (!frame.has_value())
             return 0;
 
@@ -1294,12 +1327,12 @@ void LbTabSetViewport(LbApp* app, uint64_t tab, int32_t width, int32_t height, d
 
         // The ratio has to be in place before the resize, because the resize is what pushes the viewport. This is the
         // only public way to set it without touching Libraries/; a real port wants a non-testing setter here.
-        candidate->view->set_device_pixel_ratio_for_testing(candidate->view->page(), device_pixel_ratio);
+        candidate->view()->set_device_pixel_ratio_for_testing(candidate->view()->page(), device_pixel_ratio);
         // Kept for input: positions arrive in CSS pixels and the engine wants device pixels.
         candidate->device_pixel_ratio = device_pixel_ratio;
 
         // A headless viewport is in device pixels, the same way Qt's update_viewport_size() scales by the ratio.
-        candidate->view->reset_viewport_size({
+        candidate->view()->reset_viewport_size({
             static_cast<double>(width) * device_pixel_ratio,
             static_cast<double>(height) * device_pixel_ratio,
         });
@@ -1315,7 +1348,7 @@ void LbTabTraverseHistory(LbApp* app, uint64_t tab_id, int32_t delta)
 
     // The ABI is the two buttons a browser has, so anything else is one of them rather than an arbitrary jump.
     auto direction = delta < 0 ? -1 : 1;
-    tab->view->traverse_the_history_by_delta(direction);
+    tab->view()->traverse_the_history_by_delta(direction);
 }
 
 int LbTabCanTraverseHistory(LbApp* app, uint64_t tab_id, int32_t delta)
@@ -1326,7 +1359,7 @@ int LbTabCanTraverseHistory(LbApp* app, uint64_t tab_id, int32_t delta)
 
     // The engine's actions already encode whether there is anywhere to go, and LibWebView keeps them current as
     // navigation happens. Deriving this from history step counts instead would duplicate a rule that can drift.
-    auto& action = delta < 0 ? tab->view->navigate_back_action() : tab->view->navigate_forward_action();
+    auto& action = delta < 0 ? tab->view()->navigate_back_action() : tab->view()->navigate_forward_action();
     return action.enabled() ? 1 : 0;
 }
 
@@ -1380,7 +1413,7 @@ void LbTabSendMouse(LbApp* app, uint64_t tab_id, LbMouseEventType type, double x
             tab->click_count = click_count;
     }
 
-    tab->view->enqueue_input_event(move(event));
+    tab->view()->enqueue_input_event(move(event));
 }
 
 void LbTabSendKey(LbApp* app, uint64_t tab_id, int32_t key, uint32_t code_point, uint32_t modifiers, int is_key_down)
@@ -1402,7 +1435,7 @@ void LbTabSendKey(LbApp* app, uint64_t tab_id, int32_t key, uint32_t code_point,
         .browser_data = nullptr,
     };
 
-    tab->view->enqueue_input_event(move(event));
+    tab->view()->enqueue_input_event(move(event));
 }
 
 void LbTabTypeText(LbApp* app, uint64_t tab_id, char const* utf8, size_t len)
@@ -1424,7 +1457,7 @@ void LbTabTypeText(LbApp* app, uint64_t tab_id, char const* utf8, size_t len)
             .should_insert_text = true,
             .browser_data = nullptr,
         };
-        tab->view->enqueue_input_event(move(event));
+        tab->view()->enqueue_input_event(move(event));
     }
 }
 

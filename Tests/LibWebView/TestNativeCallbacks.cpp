@@ -31,31 +31,11 @@
 #include <LibCore/Timer.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibMain/Main.h>
-#include <LibWebView/Application.h>
 
 #include "../../Libraries/LibPort/ladybird_port.h"
 #include <stdlib.h>
 
 namespace {
-
-class TestApplication : public WebView::Application {
-    WEB_VIEW_APPLICATION(TestApplication)
-
-public:
-    explicit TestApplication(Optional<ByteString> ladybird_binary_path)
-        : WebView::Application(move(ladybird_binary_path))
-    {
-    }
-
-    virtual void create_platform_options(WebView::BrowserOptions& browser_options, WebView::RequestServerOptions&, WebView::WebContentOptions& web_content_options) override
-    {
-        browser_options.headless_mode.clear();
-        browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
-        web_content_options.is_test_mode = WebView::IsTestMode::Yes;
-    }
-
-    virtual bool should_coordinate_browser_process() const override { return false; }
-};
 
 int failures { 0 };
 
@@ -102,14 +82,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     MUST(Core::Directory::create(scratch_directory, Core::Directory::CreateDirectories::Yes));
     VERIFY(setenv("XDG_CONFIG_HOME", scratch_directory.characters(), 1) == 0);
 
-    auto app = TestApplication::create(arguments, OptionalNone {});
-    if (app.is_error()) {
-        outln("FAIL: unable to initialize the engine: {}", app.error());
-        return 1;
-    }
-    (void)app.value();
+    (void)arguments;
 
     // No host callbacks at all: every request the engine blocks on must still be answered by the shim.
+    // NB: LbAppCreate constructs the application itself, so this probe must not create one first -- Application's
+    // constructor VERIFYs that it is the only instance.
     auto* port = LbAppCreate("TestNativeCallbacks", nullptr);
     if (!port) {
         outln("FAIL: LbAppCreate returned null");
