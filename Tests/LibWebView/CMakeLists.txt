@@ -166,6 +166,14 @@ if (NOT WIN32)
         target_compile_definitions(TestNativeInput PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
+    add_executable(TestNativeCallbacks TestNativeCallbacks.cpp)
+    add_dependencies(TestNativeCallbacks ladybird_build_resource_files ${ladybird_helper_processes})
+    # LibPort, for the same reason as TestNativeInput: the contract under test is the shipped shim's, not a copy of it.
+    target_link_libraries(TestNativeCallbacks PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView LibPort)
+    if (APPLE)
+        target_compile_definitions(TestNativeCallbacks PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
     if (APPLE)
         add_executable(TestNativeEventLoop TestNativeEventLoop.mm)
         add_dependencies(TestNativeEventLoop ladybird_build_resource_files ${ladybird_helper_processes})
