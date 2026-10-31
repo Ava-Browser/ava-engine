@@ -761,9 +761,19 @@ Optional<WebView::ViewImplementation&> PortApplication::open_blank_new_tab(Web::
     auto* tab = find_tab(m_port_app, new_id);
     if (!tab)
         return {};
-    if (auto* callback = m_port_app->page_callbacks.on_new_tab)
-        callback(m_port_app->callbacks.context, m_port_app->active_tab_id, new_id,
-            activate_tab == Web::HTML::ActivateTab::Yes ? 1 : 0, 0);
+    // Reported on a later turn, not here. A host is allowed to answer an unmapped parent by destroying the new tab,
+    // and LbTabDestroy frees the Tab whose view is returned below: calling back first makes that return a
+    // use-after-free. Same reason as on_close.
+    auto* app_ptr = m_port_app;
+    auto parent_id = m_port_app->active_tab_id;
+    auto activate = activate_tab == Web::HTML::ActivateTab::Yes ? 1 : 0;
+    Core::deferred_invoke([app_ptr, parent_id, new_id, activate] {
+        // The engine may have discarded the tab before this ran; a stale id must not be reported.
+        if (!find_tab(app_ptr, new_id))
+            return;
+        if (auto* callback = app_ptr->page_callbacks.on_new_tab)
+            callback(app_ptr->callbacks.context, parent_id, new_id, activate, 0);
+    });
     return *tab->view();
 }
 

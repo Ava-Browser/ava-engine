@@ -38,6 +38,10 @@
 namespace {
 
 int failures { 0 };
+LbApp* port_for_callbacks { nullptr };
+// A host is allowed to answer an unmapped parent by destroying the new tab from inside on_new_tab. The shim must have
+// already handed the view to the engine by then, or the engine's use of it is a use-after-free.
+bool destroy_new_tab_in_callback { false };
 uint64_t opened_parent_tab { 0 };
 uint64_t opened_new_tab { 0 };
 int opened_activate_tab { -1 };
@@ -65,6 +69,8 @@ void did_open_new_tab(void*, uint64_t parent_tab, uint64_t new_tab, int activate
     opened_parent_tab = parent_tab;
     opened_new_tab = new_tab;
     opened_activate_tab = activate_tab;
+    if (destroy_new_tab_in_callback)
+        LbTabDestroy(port_for_callbacks, new_tab);
 }
 
 void check(bool condition, StringView what)
@@ -124,6 +130,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         outln("FAIL: LbAppCreate returned null");
         return 1;
     }
+    port_for_callbacks = port;
 
     outln("PHASE 1: registration accepts this dylib's struct_size and version");
     {
@@ -236,6 +243,37 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         check(opened_activate_tab == 0, "Command-click requests a background tab"sv);
         if (opened_new_tab != 0)
             LbTabDestroy(port, opened_new_tab);
+
+        outln("");
+        outln("PHASE 5: destroying the new tab from inside on_new_tab does not free the view the engine is using");
+        {
+            // The same page and tab, so this phase only adds the behaviour under test. Without the deferred report,
+            // this LbTabDestroy runs before open_blank_new_tab has returned its view and the next paint is a UAF.
+            destroy_new_tab_in_callback = true;
+            auto reports_before = opened_new_tab;
+            LbTabSendMouseWithModifiers(port, tab, LbMouseEventDown, 20, 20, LbMouseButtonPrimary, LbMouseButtonPrimary, 1, 0, platform_control_on_macos);
+            LbTabSendMouseWithModifiers(port, tab, LbMouseEventUp, 20, 20, LbMouseButtonPrimary, LbMouseButtonNone, 1, 0, platform_control_on_macos);
+            deadline = MonotonicTime::now() + AK::Duration::from_seconds(20);
+            while (MonotonicTime::now() < deadline && opened_new_tab == reports_before)
+                LbAppPump(port);
+            check(opened_new_tab != reports_before, "the new tab is still reported when the host destroys it"sv);
+
+            // Reload the parent, so the engine has to use its own view again after the tab it was handed was freed.
+            // A settled page paints once, so waiting for another frame on the old content would wait forever (R3).
+            auto reentrant_loads = loads_finished;
+            auto reentrant_paints = paints_ready;
+            auto reload_url = "data:text/html,%3Ctitle%3Eafter%3C%2Ftitle%3E%3Cbody%3Eafter%3C%2Fbody%3E"sv;
+            LbTabLoad(port, tab, reload_url.characters_without_null_termination(), reload_url.length());
+            deadline = MonotonicTime::now() + AK::Duration::from_seconds(20);
+            while (MonotonicTime::now() < deadline && (loads_finished == reentrant_loads || paints_ready == reentrant_paints))
+                LbAppPump(port);
+            check(loads_finished != reentrant_loads, "the parent still loads after a re-entrant destroy"sv);
+            check(paints_ready != reentrant_paints, "the parent still paints after a re-entrant destroy"sv);
+            LbSurface parent_surface {};
+            check(LbTabGetSurface(port, tab, &parent_surface) == 1, "the parent tab still has a surface"sv);
+            destroy_new_tab_in_callback = false;
+        }
+
         LbTabDestroy(port, tab);
     }
 
